@@ -1,0 +1,1 @@
+# opencode-server-adaptor
