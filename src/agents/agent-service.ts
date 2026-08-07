@@ -16,8 +16,8 @@ import type { AppConfig } from "../config/index.ts"
 import { SessionQueue } from "../runtime/session-queue.ts"
 import { SubtaskManager, type SubtaskResult } from "../agents/subtask-manager.ts"
 import { subagentSessionTitle } from "./subagents/subagent-session.ts"
-
-import type { DatabaseService } from "../db/index.ts"
+import type { PermissionRepository } from "../permission/index.ts"
+import { AssistantPartProjector } from "./assistant-part-projector.ts"
 
 interface RuntimeSubtask {
   parentSessionId: string
@@ -28,6 +28,28 @@ interface RuntimeSubtask {
   childPromptPartId: string
   childAssistantMessageId: string
   published: boolean
+}
+
+interface SubtaskPrompt {
+  prompt: string
+  description: string
+  agent: string
+  model?: AgentModel
+}
+
+interface SubtaskExecution {
+  request: SubtaskPrompt
+  toolPart: ToolPart
+  assistantMessageId: string
+  handle?: ReturnType<SubtaskManager["start"]>
+  startError?: string
+}
+
+interface SubtaskOutcome {
+  text: string
+  status: SubtaskResult["status"]
+  childSessionId: string | null
+  usage?: SubtaskResult["usage"]
 }
 
 function runtimeSubtaskKey(parentSessionId: string, callId: string): string {
@@ -60,7 +82,7 @@ export class AgentService {
   private readonly events: EventBus
   private readonly logger: Logger
   private readonly config: AppConfig
-  private readonly db: DatabaseService
+  private readonly permissions: PermissionRepository
   private readonly globalQueue = new SessionQueue()
   private readonly partIdMap = new Map<string, Map<string, string>>()
   /**
@@ -70,6 +92,7 @@ export class AgentService {
    * increasingly expensive O(n²) database workload.
    */
   private readonly streamedPartText = new Map<string, string>()
+  private readonly assistantParts: AssistantPartProjector
   private readonly subtaskManager: SubtaskManager
   private readonly sessionModels = new Map<string, AgentModel>()
   private readonly sessionRuntimeAdapters = new Map<string, string>()
@@ -86,7 +109,8 @@ export class AgentService {
     events: EventBus,
     logger: Logger,
     config: AppConfig,
-    db: DatabaseService,
+    permissions: PermissionRepository,
+    options?: { encapsulateMessageParts?: boolean },
   ) {
     this.registry = registry
     this.sessions = sessions
@@ -94,9 +118,12 @@ export class AgentService {
     this.events = events
     this.logger = logger
     this.config = config
-    this.db = db
+    this.permissions = permissions
 
-    this.subtaskManager = new SubtaskManager(registry, sessions, messages, events, logger, config)
+    this.assistantParts = new AssistantPartProjector(messages, events, {
+      encapsulateParts: options?.encapsulateMessageParts,
+    })
+    this.subtaskManager = new SubtaskManager(registry, sessions, messages, events, logger, config, this.assistantParts)
   }
 
   generateTitle(
@@ -187,12 +214,7 @@ export class AgentService {
     text: string,
     userMessageId: string,
     assistantMessageId: string,
-    subtaskParts: Array<{
-      prompt: string
-      description: string
-      agent: string
-      model?: AgentModel
-    }>,
+    subtaskParts: SubtaskPrompt[],
     mode: "sequential" | "parallel" | "chain",
     model?: AgentModel,
   ): void {
@@ -273,60 +295,10 @@ export class AgentService {
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`)
     }
-
-    const agentId = session.agent
-    const adapter = this.registry.get(agentId)
-    const pool = this.getPool(agentId)
-    let promptRuntime: AgentRuntime | undefined
-
-    try {
-      await this.globalQueue.run(sessionId, async () => {
-        this.abortedSessions.delete(sessionId)
-        await this.restartRuntimeIfModelChanged(sessionId, adapter, model, pool)
-
-        const runtime = await pool.getOrCreate({
-          sessionId,
-          directory: session.directory,
-          logger: this.logger.child({ sessionId, agent: agentId }),
-          config: await this.runtimeConfig(adapter, model),
-        })
-        promptRuntime = runtime
-
-        await runtime.prompt({
-          sessionId,
-          text,
-          messageId: userMessageId,
-          assistantMessageId,
-        })
-        pool.scheduleIdleCheck(sessionId)
-      })
-    } catch (err) {
-      if (promptRuntime) {
-        await this.invalidateRuntime(sessionId, promptRuntime, agentId, "prompt_failed")
-      }
-      this.logger.error("Agent prompt failed", {
-        sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      })
-      this.sessions.setStatus(sessionId, "idle")
-      this.messages.setMessageError(assistantMessageId, {
-        type: "agent_error",
-        message: err instanceof Error ? err.message : String(err),
-      })
-      this.publishMessageParts(assistantMessageId)
-      this.events.publish(
-        createEvent("session.error", {
-          sessionID: sessionId,
-          messageID: assistantMessageId,
-          error: {
-            name: "UnknownError",
-            data: { message: err instanceof Error ? err.message : String(err) },
-          },
-        }),
-      )
-      this.publishMessage(assistantMessageId)
-      this.publishStatus(sessionId, "idle")
-    }
+    await this.globalQueue.run(sessionId, async () => {
+      this.abortedSessions.delete(sessionId)
+      await this.executePrompt(sessionId, text, userMessageId, assistantMessageId, model)
+    })
   }
 
   async compact(sessionId: string, model?: AgentModel, customInstructions?: string): Promise<AgentCompactionResult> {
@@ -489,7 +461,7 @@ export class AgentService {
     })
   }
 
-  private async promptInternal(
+  private async executePrompt(
     sessionId: string,
     text: string,
     userMessageId: string,
@@ -528,28 +500,28 @@ export class AgentService {
       if (promptRuntime) {
         await this.invalidateRuntime(sessionId, promptRuntime, agentId, "prompt_failed")
       }
-      this.logger.error("Agent promptInternal failed", {
+      this.logger.error("Agent prompt failed", {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       })
       this.sessions.setStatus(sessionId, "idle")
-      this.messages.setMessageError(assistantMessageId, {
+      const failed = this.assistantParts.fail(assistantMessageId, {
         type: "agent_error",
         message: err instanceof Error ? err.message : String(err),
       })
-      this.publishMessageParts(assistantMessageId)
+      this.publishProjectedMessages(failed.messageIds)
       this.events.publish(
         createEvent("session.error", {
           sessionID: sessionId,
-          messageID: assistantMessageId,
+          messageID: failed.terminalMessageId,
           error: {
             name: "UnknownError",
             data: { message: err instanceof Error ? err.message : String(err) },
           },
         }),
       )
-      this.publishMessage(assistantMessageId)
       this.publishStatus(sessionId, "idle")
+      this.assistantParts.releaseSession(sessionId)
     }
   }
 
@@ -558,12 +530,7 @@ export class AgentService {
     text: string,
     userMessageId: string,
     assistantMessageId: string,
-    subtaskParts: Array<{
-      prompt: string
-      description: string
-      agent: string
-      model?: { providerID: string; modelID: string }
-    }>,
+    subtaskParts: SubtaskPrompt[],
     mode: "sequential" | "parallel" | "chain" = "sequential",
     model?: { providerID: string; modelID: string },
   ): Promise<void> {
@@ -586,26 +553,26 @@ export class AgentService {
     } catch (err) {
       this.logger.error("Subtask prompt failed", { sessionId, error: err instanceof Error ? err.message : String(err) })
       this.sessions.setStatus(sessionId, "idle")
-      this.messages.setMessageError(assistantMessageId, {
+      const failed = this.assistantParts.fail(assistantMessageId, {
         type: "agent_error",
         message: err instanceof Error ? err.message : String(err),
       })
-      this.publishMessageParts(assistantMessageId)
-      this.publishMessage(assistantMessageId)
+      this.publishProjectedMessages(failed.messageIds)
       this.publishStatus(sessionId, "idle")
+      this.assistantParts.releaseSession(sessionId)
     }
   }
 
   private createToolPartForSubtask(
     sessionId: string,
     userMessageId: string,
-    st: { prompt: string; description: string; agent: string },
+    st: SubtaskPrompt,
   ): { toolPart: ToolPart; subAssistantMsg: { id: string } } {
     const subAssistantMsg = this.messages.createAssistantMessage(sessionId, userMessageId, st.agent)
 
     const callID = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`
     const toolInput = { prompt: st.prompt, description: st.description, subagent_type: st.agent }
-    const toolPart = this.messages.createPart(sessionId, subAssistantMsg.id, "tool", {
+    const toolPart = this.assistantParts.createPart(sessionId, subAssistantMsg.id, "tool", {
       callID,
       tool: "task",
       state: {
@@ -621,6 +588,69 @@ export class AgentService {
     this.publishPart(toolPart.id)
 
     return { toolPart, subAssistantMsg }
+  }
+
+  private startSubtaskExecution(sessionId: string, userMessageId: string, request: SubtaskPrompt): SubtaskExecution {
+    const { toolPart, subAssistantMsg } = this.createToolPartForSubtask(sessionId, userMessageId, request)
+    try {
+      return {
+        request,
+        toolPart,
+        assistantMessageId: subAssistantMsg.id,
+        handle: this.subtaskManager.start({
+          parentSessionId: sessionId,
+          parentToolPartId: toolPart.id,
+          parentAssistantMessageId: subAssistantMsg.id,
+          prompt: request.prompt,
+          description: request.description,
+          agent: request.agent,
+          model: request.model,
+        }),
+      }
+    } catch (error) {
+      const startError = error instanceof Error ? error.message : String(error)
+      this.logger.error("Subtask failed to start", { agent: request.agent, error: startError })
+      return { request, toolPart, assistantMessageId: subAssistantMsg.id, startError }
+    }
+  }
+
+  private async settleSubtask(execution: SubtaskExecution): Promise<SubtaskOutcome> {
+    if (!execution.handle) {
+      return {
+        text: `Error: ${execution.startError ?? "Subtask did not start"}`,
+        status: "failed",
+        childSessionId: null,
+      }
+    }
+    try {
+      const result = await execution.handle.result
+      return {
+        text: result.output ?? (result.error ? `Error: ${result.error.message}` : ""),
+        status: result.status,
+        childSessionId: execution.handle.childSessionId,
+        usage: result.usage,
+      }
+    } catch (error) {
+      return {
+        text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+        status: "failed",
+        childSessionId: execution.handle.childSessionId,
+      }
+    }
+  }
+
+  private finalizeSubtaskExecution(sessionId: string, execution: SubtaskExecution, outcome: SubtaskOutcome): void {
+    this.finalizeToolPart(
+      sessionId,
+      execution.toolPart,
+      execution.assistantMessageId,
+      outcome.childSessionId,
+      execution.request.agent,
+      execution.request.description,
+      outcome.text,
+      outcome.status,
+      outcome.usage,
+    )
   }
 
   private finalizeToolPart(
@@ -679,76 +709,16 @@ export class AgentService {
     text: string,
     userMessageId: string,
     assistantMessageId: string,
-    subtaskParts: Array<{
-      prompt: string
-      description: string
-      agent: string
-      model?: { providerID: string; modelID: string }
-    }>,
+    subtaskParts: SubtaskPrompt[],
     parentModel?: { providerID: string; modelID: string },
   ): Promise<void> {
     const subtaskResults: string[] = []
 
-    for (const st of subtaskParts) {
-      const { toolPart, subAssistantMsg } = this.createToolPartForSubtask(sessionId, userMessageId, st)
-
-      let subText = ""
-      let subStatus: "completed" | "failed" | "aborted" = "completed"
-      let childSessionId: string | null = null
-      let usage:
-        | {
-            cost?: number
-            input?: number
-            output?: number
-            cacheRead?: number
-            cacheWrite?: number
-            contextTokens?: number
-            turns?: number
-          }
-        | undefined
-
-      try {
-        const handle = this.subtaskManager.start({
-          parentSessionId: sessionId,
-          parentToolPartId: toolPart.id,
-          parentAssistantMessageId: subAssistantMsg.id,
-          prompt: st.prompt,
-          description: st.description,
-          agent: st.agent,
-          model: st.model,
-        })
-
-        childSessionId = handle.childSessionId
-        const result: SubtaskResult = await handle.result
-
-        subText = result.output ?? ""
-        subStatus = result.status
-        usage = result.usage
-
-        if (result.status === "failed" && result.error) {
-          subText = subText || `Error: ${result.error.message}`
-        }
-      } catch (err) {
-        this.logger.error("Subtask failed to start", {
-          error: err instanceof Error ? err.message : String(err),
-          agent: st.agent,
-        })
-        subText = `Error: ${err instanceof Error ? err.message : String(err)}`
-        subStatus = "failed"
-      }
-
-      subtaskResults.push(subText)
-      this.finalizeToolPart(
-        sessionId,
-        toolPart,
-        subAssistantMsg.id,
-        childSessionId,
-        st.agent,
-        st.description,
-        subText,
-        subStatus,
-        usage,
-      )
+    for (const request of subtaskParts) {
+      const execution = this.startSubtaskExecution(sessionId, userMessageId, request)
+      const outcome = await this.settleSubtask(execution)
+      subtaskResults.push(outcome.text)
+      this.finalizeSubtaskExecution(sessionId, execution, outcome)
     }
 
     await this.finishParentPrompt(sessionId, text, userMessageId, assistantMessageId, subtaskResults, parentModel)
@@ -759,93 +729,18 @@ export class AgentService {
     text: string,
     userMessageId: string,
     assistantMessageId: string,
-    subtaskParts: Array<{
-      prompt: string
-      description: string
-      agent: string
-      model?: { providerID: string; modelID: string }
-    }>,
+    subtaskParts: SubtaskPrompt[],
     parentModel?: { providerID: string; modelID: string },
   ): Promise<void> {
-    const entries = subtaskParts.map((st) => {
-      const { toolPart, subAssistantMsg } = this.createToolPartForSubtask(sessionId, userMessageId, st)
-      return { st, toolPart, subAssistantMsg }
-    })
-
-    const handles = entries.map(({ st, toolPart, subAssistantMsg }) => {
-      try {
-        const handle = this.subtaskManager.start({
-          parentSessionId: sessionId,
-          parentToolPartId: toolPart.id,
-          parentAssistantMessageId: subAssistantMsg.id,
-          prompt: st.prompt,
-          description: st.description,
-          agent: st.agent,
-          model: st.model,
-        })
-        return { handle, toolPart, subAssistantMsg, st, error: null as string | null }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err)
-        return { handle: null, toolPart, subAssistantMsg, st, error: errMsg }
-      }
-    })
-
-    const results = await Promise.allSettled(
-      handles.map(async (h) => {
-        if (h.error || !h.handle) {
-          return { subText: `Error: ${h.error}`, subStatus: "failed" as const, childSessionId: null, usage: undefined }
-        }
-        const result: SubtaskResult = await h.handle.result
-        return {
-          subText: result.output ?? (result.error ? `Error: ${result.error.message}` : ""),
-          subStatus: result.status,
-          childSessionId: h.handle.childSessionId,
-          usage: result.usage,
-        }
-      }),
-    )
+    const executions = subtaskParts.map((request) => this.startSubtaskExecution(sessionId, userMessageId, request))
+    const outcomes = await Promise.all(executions.map((execution) => this.settleSubtask(execution)))
 
     const subtaskResults: string[] = []
-    for (let i = 0; i < handles.length; i++) {
-      const h = handles[i]!
-      const r = results[i]!
-      let subText: string
-      let subStatus: "completed" | "failed" | "aborted"
-      let childSessionId: string | null = null
-      let usage:
-        | {
-            cost?: number
-            input?: number
-            output?: number
-            cacheRead?: number
-            cacheWrite?: number
-            contextTokens?: number
-            turns?: number
-          }
-        | undefined
-
-      if (r.status === "fulfilled") {
-        subText = r.value.subText
-        subStatus = r.value.subStatus
-        childSessionId = r.value.childSessionId
-        usage = r.value.usage
-      } else {
-        subText = `Error: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`
-        subStatus = "failed"
-      }
-
-      subtaskResults.push(subText)
-      this.finalizeToolPart(
-        sessionId,
-        h.toolPart,
-        h.subAssistantMsg.id,
-        childSessionId,
-        h.st.agent,
-        h.st.description,
-        subText,
-        subStatus,
-        usage,
-      )
+    for (let index = 0; index < executions.length; index++) {
+      const execution = executions[index]!
+      const outcome = outcomes[index]!
+      subtaskResults.push(outcome.text)
+      this.finalizeSubtaskExecution(sessionId, execution, outcome)
     }
 
     await this.finishParentPrompt(sessionId, text, userMessageId, assistantMessageId, subtaskResults, parentModel)
@@ -856,102 +751,22 @@ export class AgentService {
     text: string,
     userMessageId: string,
     assistantMessageId: string,
-    subtaskParts: Array<{
-      prompt: string
-      description: string
-      agent: string
-      model?: { providerID: string; modelID: string }
-    }>,
+    subtaskParts: SubtaskPrompt[],
     parentModel?: { providerID: string; modelID: string },
   ): Promise<void> {
     const subtaskResults: string[] = []
     let previousOutput = ""
 
-    for (let i = 0; i < subtaskParts.length; i++) {
-      const st = subtaskParts[i]!
-      const effectivePrompt = st.prompt.replace(/\{previous\}/g, previousOutput)
-
-      const { toolPart, subAssistantMsg } = this.createToolPartForSubtask(sessionId, userMessageId, {
-        ...st,
-        prompt: effectivePrompt,
+    for (const request of subtaskParts) {
+      const execution = this.startSubtaskExecution(sessionId, userMessageId, {
+        ...request,
+        prompt: request.prompt.replace(/\{previous\}/g, previousOutput),
       })
-
-      let subText = ""
-      let subStatus: "completed" | "failed" | "aborted" = "completed"
-      let childSessionId: string | null = null
-      let usage:
-        | {
-            cost?: number
-            input?: number
-            output?: number
-            cacheRead?: number
-            cacheWrite?: number
-            contextTokens?: number
-            turns?: number
-          }
-        | undefined
-
-      try {
-        const handle = this.subtaskManager.start({
-          parentSessionId: sessionId,
-          parentToolPartId: toolPart.id,
-          parentAssistantMessageId: subAssistantMsg.id,
-          prompt: effectivePrompt,
-          description: st.description,
-          agent: st.agent,
-          model: st.model,
-        })
-
-        childSessionId = handle.childSessionId
-        const result: SubtaskResult = await handle.result
-
-        subText = result.output ?? ""
-        subStatus = result.status
-        usage = result.usage
-
-        if (result.status === "failed" && result.error) {
-          subText = subText || `Error: ${result.error.message}`
-        }
-
-        if (subStatus === "completed") {
-          previousOutput = subText
-        } else {
-          subtaskResults.push(subText)
-          this.finalizeToolPart(
-            sessionId,
-            toolPart,
-            subAssistantMsg.id,
-            childSessionId,
-            st.agent,
-            st.description,
-            subText,
-            subStatus,
-            usage,
-          )
-          break
-        }
-      } catch (err) {
-        this.logger.error("Chain step failed to start", {
-          error: err instanceof Error ? err.message : String(err),
-          agent: st.agent,
-          step: i + 1,
-        })
-        subText = `Error: ${err instanceof Error ? err.message : String(err)}`
-        subStatus = "failed"
-      }
-
-      subtaskResults.push(subText)
-      this.finalizeToolPart(
-        sessionId,
-        toolPart,
-        subAssistantMsg.id,
-        childSessionId,
-        st.agent,
-        st.description,
-        subText,
-        subStatus,
-        usage,
-      )
+      const outcome = await this.settleSubtask(execution)
+      subtaskResults.push(outcome.text)
+      this.finalizeSubtaskExecution(sessionId, execution, outcome)
+      if (outcome.status !== "completed") break
+      previousOutput = outcome.text
     }
 
     await this.finishParentPrompt(sessionId, text, userMessageId, assistantMessageId, subtaskResults, parentModel)
@@ -986,7 +801,7 @@ export class AgentService {
           text,
         ].join("\n\n")
       }
-      await this.promptInternal(sessionId, effectiveText, userMessageId, assistantMessageId, model)
+      await this.executePrompt(sessionId, effectiveText, userMessageId, assistantMessageId, model)
     } else {
       this.sessions.setStatus(sessionId, "idle")
       this.publishStatus(sessionId, "idle")
@@ -1102,6 +917,7 @@ export class AgentService {
     this.titleJobs.clear()
     this.runtimeSubtasks.clear()
     this.pendingStarts.clear()
+    this.assistantParts.clear()
   }
 
   recoverOnStartup(): void {
@@ -1114,36 +930,25 @@ export class AgentService {
     // No agent runtime survives a server restart. Any incomplete assistant message
     // is therefore orphaned, even when an older build happened to persist the
     // session itself as idle before it crashed.
-    const openMessages = this.db
-      .prepare(
-        "SELECT id, session_id FROM messages WHERE role = 'assistant' AND completed_at IS NULL ORDER BY created_at ASC, rowid ASC",
-      )
-      .all() as Array<{ id: string; session_id: string }>
-    for (const message of openMessages) {
-      this.messages.setMessageError(message.id, {
-        type: "interrupted",
-        message: "The server restarted before the agent turn reached a terminal state.",
-      })
-    }
+    const openMessages = this.messages.recoverOpenAssistantMessages(
+      "The server restarted before the agent turn reached a terminal state.",
+    )
 
     // Persisted parent sessions left busy would otherwise make Desktop render
     // "thinking" forever, even though no process can publish a future idle event.
     const orphanedSessions = this.sessions
       .listByStatuses(["running", "busy", "waiting_permission"])
       .filter((session) => !session.parentID)
-    const now = Date.now()
     for (const session of orphanedSessions) {
       this.sessions.setStatus(session.id, "idle")
     }
-    const permissions = this.db
-      .prepare("UPDATE permissions SET status = 'deny', response = ?, responded_at = ? WHERE status = 'pending'")
-      .run(JSON.stringify({ action: "deny", reason: "Server restarted" }), now)
-    if (openMessages.length > 0 || orphanedTools > 0 || orphanedSessions.length > 0 || permissions.changes > 0) {
+    const deniedPermissions = this.permissions.denyAllPending("Server restarted")
+    if (openMessages > 0 || orphanedTools > 0 || orphanedSessions.length > 0 || deniedPermissions > 0) {
       this.logger.warn("Recovered orphaned runtime state on startup", {
-        openMessages: openMessages.length,
+        openMessages,
         openTools: orphanedTools,
         busySessions: orphanedSessions.length,
-        pendingPermissions: permissions.changes,
+        pendingPermissions: deniedPermissions,
       })
     }
   }
@@ -1184,6 +989,12 @@ export class AgentService {
     }
   }
 
+  private flushProjectedMessageParts(messageId: string): void {
+    for (const projectedMessageId of this.assistantParts.messageIds(messageId)) {
+      this.flushStreamedMessageParts(projectedMessageId)
+    }
+  }
+
   private publishMessage(messageId: string): void {
     const info = this.messages.getMessage(messageId)
     if (!info) return
@@ -1204,6 +1015,13 @@ export class AgentService {
           time: Date.now(),
         }),
       )
+    }
+  }
+
+  private publishProjectedMessages(messageIds: string[]): void {
+    for (const messageId of messageIds) {
+      this.publishMessageParts(messageId)
+      this.publishMessage(messageId)
     }
   }
 
@@ -1280,6 +1098,7 @@ export class AgentService {
       title: subagentSessionTitle(description, agent),
       agent,
       parentId: parentSessionId,
+      idFormat: this.sessions.getIdFormat(parentSessionId),
       model: model ? { id: model.modelID, providerID: model.providerID } : undefined,
     })
     this.sessions.setStatus(child.id, "busy")
@@ -1381,7 +1200,7 @@ export class AgentService {
     let parentToolPartId = partIds.get(event.partId)
     const parentPart = parentToolPartId ? this.messages.getPart(parentToolPartId) : undefined
     if (!parentToolPartId || parentPart?.type !== "tool") {
-      const recovered = this.messages.createPart(event.sessionId, event.messageId, "tool", {
+      const recovered = this.assistantParts.createPart(event.sessionId, event.messageId, "tool", {
         callID: event.callId,
         tool: "task",
         state: {
@@ -1412,10 +1231,35 @@ export class AgentService {
       return
     }
     this.publishRuntimeSubtaskStarted(run)
-    this.handleAgentEvent(
-      retargetRuntimeEvent(event.event, run.childSessionId, run.childAssistantMessageId),
-      run.childSessionId,
-    )
+    const childEvent = retargetRuntimeEvent(event.event, run.childSessionId, run.childAssistantMessageId)
+    if (childEvent.type === "session_idle") {
+      // The nested Pi process settles before its enclosing task tool publishes
+      // tool_call_completed/tool_call_error. That outer event is the durable
+      // lifecycle boundary for the mirrored child session. Releasing the
+      // assistant projection here loses the root-to-sibling mapping and makes
+      // finishRuntimeSubtask incorrectly synthesize the task output again.
+      return
+    }
+    if (childEvent.type === "session_error" && childEvent.fatal !== false) {
+      // Persist and publish the child error, but keep its projection and busy
+      // lifecycle owned by the enclosing task. The matching parent
+      // tool_call_error will settle the mirrored child and release the group.
+      this.flushProjectedMessageParts(run.childAssistantMessageId)
+      const failed = this.assistantParts.fail(run.childAssistantMessageId, childEvent.error)
+      this.publishProjectedMessages(failed.messageIds)
+      this.events.publish(
+        createEvent("session.error", {
+          sessionID: run.childSessionId,
+          messageID: failed.terminalMessageId,
+          error: {
+            name: "UnknownError",
+            data: { message: childEvent.error.message },
+          },
+        }),
+      )
+      return
+    }
+    this.handleAgentEvent(childEvent, run.childSessionId)
   }
 
   private finishRuntimeSubtask(
@@ -1440,43 +1284,56 @@ export class AgentService {
           cost?: { total?: number }
         }
       | undefined
-    if (usage) {
-      this.messages.updateMessageUsage(run.childAssistantMessageId, {
-        cost: usage.cost?.total,
-        input: usage.input,
-        output: usage.output,
-        cacheRead: usage.cacheRead,
-        cacheWrite: usage.cacheWrite,
-        total: usage.totalTokens,
-      })
-    }
+    const projectedUsage = usage
+      ? {
+          cost: usage.cost?.total,
+          input: usage.input,
+          output: usage.output,
+          cacheRead: usage.cacheRead,
+          cacheWrite: usage.cacheWrite,
+          total: usage.totalTokens,
+        }
+      : undefined
 
-    const childParts = this.messages.listParts(run.childAssistantMessageId)
+    const childRoot = this.messages.getMessage(run.childAssistantMessageId)
+    const childParts = this.messages
+      .listMessages(run.childSessionId)
+      .filter(
+        (message) =>
+          message.info.role === "assistant" &&
+          childRoot?.role === "assistant" &&
+          message.info.parentID === childRoot.parentID,
+      )
+      .flatMap((message) => message.parts)
     if (output && !childParts.some((part) => part.type === "text" && part.text.trim())) {
-      this.messages.createPart(run.childSessionId, run.childAssistantMessageId, "text", {
+      this.assistantParts.createPart(run.childSessionId, run.childAssistantMessageId, "text", {
         text: output,
         time: { start: Date.now(), end: Date.now() },
       })
     }
 
-    const childMessage = this.messages.getMessage(run.childAssistantMessageId)
+    let projected: { messageIds: string[]; terminalMessageId: string }
     if (status === "completed") {
-      if (childMessage?.role === "assistant" && childMessage.time.completed === undefined && !childMessage.error) {
-        this.messages.completeMessage(run.childAssistantMessageId, "stop")
-      }
+      projected = this.assistantParts.complete(run.childAssistantMessageId, "stop", projectedUsage)
       this.sessions.setStatus(run.childSessionId, "idle")
     } else {
-      this.messages.setMessageError(run.childAssistantMessageId, {
+      if (projectedUsage) {
+        this.messages.updateMessageUsage(
+          this.assistantParts.terminalMessageId(run.childAssistantMessageId),
+          projectedUsage,
+        )
+      }
+      projected = this.assistantParts.fail(run.childAssistantMessageId, {
         type: status === "aborted" ? "aborted" : "subagent_error",
         message: error || output || (status === "aborted" ? "Delegated task was aborted" : "Delegated task failed"),
       })
       this.sessions.setStatus(run.childSessionId, status)
     }
 
-    this.publishMessageParts(run.childAssistantMessageId)
-    this.publishMessage(run.childAssistantMessageId)
+    this.publishProjectedMessages(projected.messageIds)
     this.publishStatus(run.childSessionId, "idle")
     this.events.publish(createEvent("session.idle", { sessionID: run.childSessionId }))
+    this.assistantParts.releaseSession(run.childSessionId)
     this.runtimeSubtasks.delete(key)
   }
 
@@ -1498,7 +1355,7 @@ export class AgentService {
 
       switch (event.type) {
         case "text_started": {
-          const part = this.messages.createPart(sessionId, event.messageId, "text", {
+          const part = this.assistantParts.createPart(sessionId, event.messageId, "text", {
             text: "",
             time: { start: Date.now() },
           })
@@ -1512,7 +1369,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           const existing = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || existing?.type !== "text") {
-            const part = this.messages.createPart(sessionId, event.messageId, "text", {
+            const part = this.assistantParts.createPart(sessionId, event.messageId, "text", {
               text: event.text,
               time: { start: Date.now() },
             })
@@ -1525,7 +1382,7 @@ export class AgentService {
             })
             this.publishPart(part.id)
           } else {
-            this.publishPartDelta(sessionId, event.messageId, dbPartId, "text", event.delta)
+            this.publishPartDelta(sessionId, existing.messageID, dbPartId, "text", event.delta)
           }
           this.streamedPartText.set(dbPartId, event.text)
           break
@@ -1535,7 +1392,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           let part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "text") {
-            part = this.messages.createPart(sessionId, event.messageId, "text", {
+            part = this.assistantParts.createPart(sessionId, event.messageId, "text", {
               text: event.text,
               time: { start: Date.now() },
             })
@@ -1558,7 +1415,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           const part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "text") {
-            const recovered = this.messages.createPart(sessionId, event.messageId, "text", {
+            const recovered = this.assistantParts.createPart(sessionId, event.messageId, "text", {
               text: event.text,
               time: { start: Date.now(), end: Date.now() },
             })
@@ -1581,7 +1438,7 @@ export class AgentService {
         }
 
         case "reasoning_started": {
-          const part = this.messages.createPart(sessionId, event.messageId, "reasoning", {
+          const part = this.assistantParts.createPart(sessionId, event.messageId, "reasoning", {
             text: "",
             time: { start: Date.now() },
           })
@@ -1595,7 +1452,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           const existing = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || existing?.type !== "reasoning") {
-            const part = this.messages.createPart(sessionId, event.messageId, "reasoning", {
+            const part = this.assistantParts.createPart(sessionId, event.messageId, "reasoning", {
               text: event.text,
               time: { start: Date.now() },
             })
@@ -1608,7 +1465,7 @@ export class AgentService {
             })
             this.publishPart(part.id)
           } else {
-            this.publishPartDelta(sessionId, event.messageId, dbPartId, "text", event.delta)
+            this.publishPartDelta(sessionId, existing.messageID, dbPartId, "text", event.delta)
           }
           this.streamedPartText.set(dbPartId, event.text)
           break
@@ -1618,7 +1475,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           let part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "reasoning") {
-            part = this.messages.createPart(sessionId, event.messageId, "reasoning", {
+            part = this.assistantParts.createPart(sessionId, event.messageId, "reasoning", {
               text: event.text,
               time: { start: Date.now() },
             })
@@ -1641,7 +1498,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           const part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "reasoning") {
-            const recovered = this.messages.createPart(sessionId, event.messageId, "reasoning", {
+            const recovered = this.assistantParts.createPart(sessionId, event.messageId, "reasoning", {
               text: event.text,
               time: { start: Date.now(), end: Date.now() },
             })
@@ -1664,7 +1521,7 @@ export class AgentService {
         }
 
         case "tool_call_started": {
-          const part = this.messages.createPart(sessionId, event.messageId, "tool", {
+          const part = this.assistantParts.createPart(sessionId, event.messageId, "tool", {
             callID: event.callId,
             tool: event.tool,
             state: {
@@ -1689,7 +1546,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           let part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "tool") {
-            part = this.messages.createPart(sessionId, event.messageId, "tool", {
+            part = this.assistantParts.createPart(sessionId, event.messageId, "tool", {
               callID: event.callId,
               tool: "unknown",
               state: {
@@ -1725,7 +1582,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           let part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "tool") {
-            part = this.messages.createPart(sessionId, event.messageId, "tool", {
+            part = this.assistantParts.createPart(sessionId, event.messageId, "tool", {
               callID: event.callId,
               tool: event.tool,
               state: {
@@ -1770,13 +1627,14 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           let part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "tool") {
-            part = this.messages.createPart(sessionId, event.messageId, "tool", {
+            part = this.assistantParts.createPart(sessionId, event.messageId, "tool", {
               callID: event.callId,
               tool: "unknown",
               state: {
                 status: "running",
+                output: event.output,
                 input: {},
-                metadata: { ...(event.metadata ?? {}), partialOutput: event.output },
+                metadata: { ...(event.metadata ?? {}), output: event.output, partialOutput: event.output },
                 time: { start: Date.now() },
               },
             }) as ToolPart
@@ -1792,11 +1650,13 @@ export class AgentService {
             this.messages.updatePart(dbPartId, {
               state: {
                 status: "running",
+                output: event.output,
                 input: part.state.input,
                 title: part.state.title,
                 metadata: {
                   ...(part.state.metadata ?? {}),
                   ...(event.metadata ?? {}),
+                  output: event.output,
                   partialOutput: event.output,
                 },
                 time: { start: part.state.time?.start ?? Date.now() },
@@ -1816,7 +1676,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           let part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "tool") {
-            part = this.messages.createPart(sessionId, event.messageId, "tool", {
+            part = this.assistantParts.createPart(sessionId, event.messageId, "tool", {
               callID: event.callId,
               tool: event.tool,
               state: {
@@ -1869,7 +1729,7 @@ export class AgentService {
           let dbPartId = partIdMap.get(event.partId)
           let part = dbPartId ? this.messages.getPart(dbPartId) : undefined
           if (!dbPartId || part?.type !== "tool") {
-            part = this.messages.createPart(sessionId, event.messageId, "tool", {
+            part = this.assistantParts.createPart(sessionId, event.messageId, "tool", {
               callID: event.callId,
               tool: event.tool,
               state: {
@@ -1922,11 +1782,14 @@ export class AgentService {
           const permId = event.permissionId
           const now = Date.now()
           const expiresAt = now + 120_000
-          this.db
-            .prepare(
-              "INSERT INTO permissions (id, session_id, tool, input, status, created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-            )
-            .run(permId, sessionId, event.tool, JSON.stringify(event.input), now, expiresAt)
+          this.permissions.create({
+            id: permId,
+            sessionId,
+            tool: event.tool,
+            input: event.input,
+            createdAt: now,
+            expiresAt,
+          })
 
           this.events.publish(
             createEvent("permission.asked", {
@@ -2018,15 +1881,19 @@ export class AgentService {
           this.sessions.setStatus(sessionId, "idle")
           this.publishStatus(sessionId, "idle")
           this.events.publish(createEvent("session.idle", { sessionID: sessionId }))
+          this.assistantParts.releaseSession(sessionId)
           break
         }
 
         case "session_error": {
           if (event.fatal === false) {
+            const diagnosticMessageId = event.messageId
+              ? this.assistantParts.terminalMessageId(event.messageId)
+              : undefined
             this.events.publish(
               createEvent("session.error", {
                 sessionID: sessionId,
-                messageID: event.messageId,
+                messageID: diagnosticMessageId,
                 error: {
                   name: "UnknownError",
                   data: { message: event.error.message },
@@ -2050,22 +1917,22 @@ export class AgentService {
             void this.invalidateRuntime(sessionId, runtime, agentId, "session_error")
             break
           }
-          this.flushStreamedMessageParts(event.messageId)
-          this.messages.setMessageError(event.messageId, event.error)
+          this.flushProjectedMessageParts(event.messageId)
+          const failed = this.assistantParts.fail(event.messageId, event.error)
           this.sessions.setStatus(sessionId, "idle")
-          this.publishMessageParts(event.messageId)
+          this.publishProjectedMessages(failed.messageIds)
           this.events.publish(
             createEvent("session.error", {
               sessionID: sessionId,
-              messageID: event.messageId,
+              messageID: failed.terminalMessageId,
               error: {
                 name: "UnknownError",
                 data: { message: event.error.message },
               },
             }),
           )
-          this.publishMessage(event.messageId)
           this.publishStatus(sessionId, "idle")
+          this.assistantParts.releaseSession(sessionId)
           void this.invalidateRuntime(sessionId, runtime, agentId, "session_error")
           break
         }
@@ -2095,16 +1962,12 @@ export class AgentService {
           // Older/custom backends can omit text_end/reasoning_end. Flush the
           // in-memory accumulator before closing the message so history and a
           // reconnect see exactly the same content as the live delta stream.
-          this.flushStreamedMessageParts(event.messageId)
-          if (event.usage) {
-            this.messages.updateMessageUsage(event.messageId, event.usage)
-          }
-          this.messages.completeMessage(event.messageId, event.finish ?? "stop")
+          this.flushProjectedMessageParts(event.messageId)
+          const completed = this.assistantParts.complete(event.messageId, event.finish ?? "stop", event.usage)
           // completeMessage closes any unterminated text/reasoning parts in the
           // database. Publish those snapshots before the terminal message/status
           // events so Desktop cannot retain a local part with no time.end.
-          this.publishMessageParts(event.messageId)
-          this.publishMessage(event.messageId)
+          this.publishProjectedMessages(completed.messageIds)
           break
         }
 
@@ -2139,19 +2002,18 @@ export class AgentService {
     const messageId = "messageId" in event && typeof event.messageId === "string" ? event.messageId : undefined
     try {
       if (messageId) {
-        this.flushStreamedMessageParts(messageId)
-        this.messages.setMessageError(messageId, {
+        this.flushProjectedMessageParts(messageId)
+        const failed = this.assistantParts.fail(messageId, {
           type: "event_projection_error",
           message: error instanceof Error ? error.message : String(error),
         })
-        this.publishMessageParts(messageId)
-        this.publishMessage(messageId)
+        this.publishProjectedMessages(failed.messageIds)
       }
       this.sessions.setStatus(sessionId, "idle")
       this.events.publish(
         createEvent("session.error", {
           sessionID: sessionId,
-          ...(messageId ? { messageID: messageId } : {}),
+          ...(messageId ? { messageID: this.assistantParts.terminalMessageId(messageId) } : {}),
           error: {
             name: "UnknownError",
             data: {
@@ -2161,6 +2023,7 @@ export class AgentService {
         }),
       )
       this.publishStatus(sessionId, "idle")
+      this.assistantParts.releaseSession(sessionId)
     } catch (recoveryError) {
       this.logger.error("Could not persist agent event projection failure", {
         sessionId,

@@ -106,6 +106,16 @@ describe("PiModelConfigStore", () => {
     expect(planExtension).toBeDefined()
     expect(readFileSync(planExtension!, "utf8")).toContain('new Set(["edit", "write"])')
     expect(readFileSync(planExtension!, "utf8")).toContain("Plan mode is read-only")
+    // Plan-mode instructions must be applied as a per-turn system-prompt override
+    // (BeforeAgentStartEventResult.systemPrompt), NOT as a persistent custom
+    // message. A persistent custom_message is stored in the Pi session file and
+    // replayed to the LLM even after the user switches away from the plan
+    // agent (which reuses the same session file), making the model believe it
+    // is still in plan mode. See pi-runtime-assets.ts PLAN_EXTENSION_SOURCE.
+    const planSource = readFileSync(planExtension!, "utf8")
+    expect(planSource).toContain("systemPrompt: event.systemPrompt")
+    expect(planSource).not.toContain("opencode-plan-mode")
+    expect(planSource).not.toContain("display: false")
     expect(statSync(join(targetAgentDir, "models.json")).mode & 0o777).toBe(0o600)
     expect(statSync(join(targetAgentDir, "auth.json")).mode & 0o777).toBe(0o600)
     expect(statSync(taskExtension!).mode & 0o777).toBe(0o600)

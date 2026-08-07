@@ -1,5 +1,6 @@
 import type { DatabaseService, SessionEventRow } from "../db/index.ts"
 import { createEventId } from "../id/index.ts"
+import type { OrderedIdFormat } from "../id/index.ts"
 import type { Logger } from "../logging/index.ts"
 
 export interface SessionDurableEvent {
@@ -24,6 +25,7 @@ export class SessionEventStore {
   constructor(
     private readonly db: DatabaseService,
     private readonly logger: Logger,
+    private readonly idFormats?: { getIdFormat(sessionId: string): OrderedIdFormat },
   ) {}
 
   append(
@@ -36,7 +38,7 @@ export class SessionEventStore {
       const row = this.db
         .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM session_events WHERE session_id = ?")
         .get(sessionID) as { seq: number }
-      const id = createEventId()
+      const id = createEventId(undefined, this.idFormats?.getIdFormat(sessionID) ?? "legacy")
       const durable = { aggregateID: sessionID, seq: row.seq, version: 1 }
       const stored = { durable, location, data }
       this.db

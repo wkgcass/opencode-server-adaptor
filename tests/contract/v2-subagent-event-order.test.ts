@@ -27,6 +27,7 @@ describe("OpenCode v2 subagent event ordering", () => {
         "127.0.0.1",
         "--port",
         String(port),
+        "--msg-part-encap",
       ],
       stdout: "pipe",
       stderr: "pipe",
@@ -53,7 +54,7 @@ describe("OpenCode v2 subagent event ordering", () => {
     await processHandle.exited
   })
 
-  test("existing child message events and persisted context retain generated part order once", async () => {
+  test("encapsulated child messages retain generated part order without duplicating terminal output", async () => {
     const eventController = new AbortController()
     const eventResponse = await fetch(`${baseUrl}/api/event`, { signal: eventController.signal })
     const reader = eventResponse.body!.getReader()
@@ -140,11 +141,19 @@ describe("OpenCode v2 subagent event ordering", () => {
     const waited = await fetch(`${baseUrl}/api/session/${parentID}/wait`, { method: "POST" })
     expect(waited.status).toBe(204)
     const context = (await (await fetch(`${baseUrl}/api/session/${childID}/context`)).json()) as {
-      data: Array<{ id: string; type: string; content?: Array<{ id?: string; type: string }> }>
+      data: Array<{
+        id: string
+        type: string
+        finish?: string
+        content?: Array<{ id?: string; type: string; text?: string }>
+      }>
     }
-    const assistant = context.data.find((message) => message.type === "assistant")
-    expect(assistant?.content?.map((content) => content.type)).toEqual(["reasoning", "tool", "text"])
-    expect(assistant?.content?.filter((content) => content.type === "text")).toHaveLength(1)
+    const assistants = context.data.filter((message) => message.type === "assistant")
+    const contents = assistants.flatMap((message) => message.content ?? [])
+    expect(assistants.every((message) => (message.content?.length ?? 0) <= 1)).toBe(true)
+    expect(contents.map((content) => content.type)).toEqual(["reasoning", "tool", "text"])
+    expect(contents.filter((content) => content.type === "text")).toHaveLength(1)
+    expect(assistants.filter((message) => message.finish !== undefined)).toHaveLength(1)
     expect(firstPartTypes.filter((type) => type === "reasoning")).toHaveLength(1)
     expect(firstPartTypes.filter((type) => type === "tool")).toHaveLength(1)
     expect(firstPartTypes.filter((type) => type === "text")).toHaveLength(1)

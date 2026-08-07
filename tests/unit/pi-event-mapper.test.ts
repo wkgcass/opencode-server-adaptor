@@ -351,6 +351,82 @@ describe("PiToOpenCodeEventMapper terminal reconciliation", () => {
     ])
   })
 
+  test("promotes Pi edit patch into metadata.filediff for Desktop diff rendering", () => {
+    const mapper = createMapper()
+    mapper.map({
+      type: "tool_execution_start",
+      toolCallId: "call_edit",
+      toolName: "edit",
+      args: { path: "src/foo.ts" },
+    })
+    const patch = [
+      "--- src/foo.ts",
+      "+++ src/foo.ts",
+      "@@ -1,2 +1,2 @@",
+      " line1",
+      "-old",
+      "+new",
+      " line2",
+    ].join("\n")
+    const completed = mapper.map({
+      type: "tool_execution_end",
+      toolCallId: "call_edit",
+      toolName: "edit",
+      result: {
+        content: [{ type: "text", text: "Successfully replaced 1 block(s) in src/foo.ts." }],
+        details: { diff: "<display diff>", patch, firstChangedLine: 2 },
+      },
+      isError: false,
+    })
+    expect(completed).toMatchObject([
+      {
+        type: "tool_call_completed",
+        tool: "edit",
+        input: { path: "src/foo.ts", filePath: "src/foo.ts" },
+        output: "Successfully replaced 1 block(s) in src/foo.ts.",
+        metadata: {
+          diff: "<display diff>",
+          patch,
+          firstChangedLine: 2,
+          filediff: {
+            file: "src/foo.ts",
+            patch,
+            additions: 1,
+            deletions: 1,
+            status: "modified",
+          },
+        },
+      },
+    ])
+  })
+
+  test("leaves non-edit tool metadata untouched (no filediff injection)", () => {
+    const mapper = createMapper()
+    mapper.map({
+      type: "tool_execution_start",
+      toolCallId: "call_write",
+      toolName: "write",
+      args: { path: "src/new.ts" },
+    })
+    const completed = mapper.map({
+      type: "tool_execution_end",
+      toolCallId: "call_write",
+      toolName: "write",
+      result: {
+        content: [{ type: "text", text: "Successfully wrote 10 bytes to src/new.ts" }],
+      },
+      isError: false,
+    })
+    expect(completed).toMatchObject([
+      {
+        type: "tool_call_completed",
+        tool: "write",
+      },
+    ])
+    const meta = (completed[0] as { metadata?: Record<string, unknown> }).metadata
+    expect(meta).not.toHaveProperty("filediff")
+  })
+
   test("extracts private Pi task events without leaking them into Desktop metadata", () => {
     const mapper = createMapper()
     mapper.map({

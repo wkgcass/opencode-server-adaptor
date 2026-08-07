@@ -244,10 +244,10 @@ export class PtyManager {
   }
 
   /**
-   * Arms (or re-arms) the idle-reap timer for a session with no subscriber.
-   * Running shells and already-exited sessions are both reaped after the
-   * timeout; the latter clears the lingering session record once Desktop has
-   * had plenty of time to observe the exit.
+   * Arms (or re-arms) the idle-reap timer for a running session with no
+   * subscriber. Exited sessions are removed immediately in `onExit`, so only
+   * running shells (e.g. created but never connected, or abandoned after the
+   * client disconnected) are reaped here.
    */
   private scheduleIdle(session: PtySession): void {
     if (this.idleTimeoutMs <= 0) return
@@ -294,13 +294,28 @@ export class PtyManager {
     if (session.info.status === "exited") return
     session.info.status = "exited"
     session.info.exitCode = Math.max(0, exitCode)
-    for (const subscriber of session.subscribers) subscriber.socket.close(1000)
-    session.subscribers.clear()
+    this.cancelIdle(session)
+    // 1. Remove the session record first so GET /api/pty/:id (and the
+    //    WebSocket upgrade) return 404. The OpenCode client reconnects on a
+    //    non-1000 WebSocket close but first checks GET for 404 to decide
+    //    whether to give up; arming the 404 before the close guarantees it can
+    //    never loop against an exited session.
+    this.sessions.delete(session.info.id)
+    for (const listener of session.listeners) listener.dispose()
+    // 2. Publish `pty.exited` so the client tears down the terminal panel.
+    //    SSE runs over TCP, so the event is delivered reliably (and buffered /
+    //    replayed by EventBus while the stream is momentarily down); no
+    //    retransmission is needed.
     this.events.publish(
       createEvent("pty.exited", { id: session.info.id, exitCode: session.info.exitCode }),
       session.directory,
     )
-    this.scheduleIdle(session)
+    // 3. Close the WebSocket with 1000 last. By now GET already 404s and the
+    //    exit event is on the wire, so even a non-1000 close (e.g. a 1006 from
+    //    a socket that died before we sent 1000) is covered: the client's
+    //    reconnect check sees 404 and gives up.
+    for (const subscriber of session.subscribers) subscriber.socket.close(1000)
+    session.subscribers.clear()
   }
 }
 

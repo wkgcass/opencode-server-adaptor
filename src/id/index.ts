@@ -9,9 +9,20 @@ const PREFIXES = {
 
 const RANDOM_LENGTH = 14
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+const WIDE_TIMESTAMP_BITS = 44n
+const WIDE_COUNTER_BITS = 12n
+const WIDE_COUNTER_SCALE = 1n << WIDE_COUNTER_BITS
+const WIDE_COUNTER_MAX = WIDE_COUNTER_SCALE - 1n
+const WIDE_TIMESTAMP_MAX = (1n << WIDE_TIMESTAMP_BITS) - 1n
+const WIDE_SORT_HEX_LENGTH = 14
+const WIDE_SORT_MAX = (1n << (WIDE_TIMESTAMP_BITS + WIDE_COUNTER_BITS)) - 1n
+
+export type OrderedIdFormat = "legacy" | "wide"
 
 let lastTimestamp = 0
 let counter = 0
+let lastWideTimestamp = 0n
+let wideCounter = 0n
 
 function randomBase62(length: number): string {
   const bytes = randomBytes(length)
@@ -22,7 +33,17 @@ function randomBase62(length: number): string {
   return result
 }
 
-function ordered(prefix: string, direction: "ascending" | "descending", timestamp = Date.now()): string {
+function encodeHex(value: bigint, bytes: number): string {
+  let encoded = ""
+  for (let index = 0; index < bytes; index++) {
+    encoded += Number((value >> BigInt(8 * (bytes - index - 1))) & 0xffn)
+      .toString(16)
+      .padStart(2, "0")
+  }
+  return encoded
+}
+
+function legacyOrdered(prefix: string, direction: "ascending" | "descending", timestamp = Date.now()): string {
   if (timestamp !== lastTimestamp) {
     lastTimestamp = timestamp
     counter = 0
@@ -31,25 +52,98 @@ function ordered(prefix: string, direction: "ascending" | "descending", timestam
 
   let value = BigInt(timestamp) * 0x1000n + BigInt(counter)
   if (direction === "descending") value = ~value
+  return `${prefix}_${encodeHex(value, 6)}${randomBase62(RANDOM_LENGTH)}`
+}
 
-  let encodedTime = ""
-  for (let index = 0; index < 6; index++) {
-    encodedTime += Number((value >> BigInt(40 - 8 * index)) & 0xffn)
-      .toString(16)
-      .padStart(2, "0")
+function wideOrdered(
+  prefix: string,
+  direction: "ascending" | "descending",
+  timestamp = Date.now(),
+  minimumExclusive?: bigint,
+): string {
+  const requested = BigInt(timestamp)
+  let logicalTimestamp: bigint
+  let nextCounter: bigint
+
+  if (requested > lastWideTimestamp) {
+    logicalTimestamp = requested
+    nextCounter = 1n
+  } else {
+    logicalTimestamp = lastWideTimestamp
+    nextCounter = wideCounter + 1n
   }
-  return `${prefix}_${encodedTime}${randomBase62(RANDOM_LENGTH)}`
+
+  if (nextCounter > WIDE_COUNTER_MAX) {
+    logicalTimestamp++
+    nextCounter = 0n
+  }
+
+  let value = logicalTimestamp * WIDE_COUNTER_SCALE + nextCounter
+  if (minimumExclusive !== undefined && value <= minimumExclusive) {
+    logicalTimestamp = minimumExclusive >> WIDE_COUNTER_BITS
+    nextCounter = (minimumExclusive & WIDE_COUNTER_MAX) + 1n
+    if (nextCounter > WIDE_COUNTER_MAX) {
+      logicalTimestamp++
+      nextCounter = 0n
+    }
+    value = logicalTimestamp * WIDE_COUNTER_SCALE + nextCounter
+  }
+
+  if (logicalTimestamp > WIDE_TIMESTAMP_MAX) throw new Error("Wide ordered ID timestamp exceeds 44-bit range")
+  lastWideTimestamp = logicalTimestamp
+  wideCounter = nextCounter
+
+  const sortable = direction === "descending" ? WIDE_SORT_MAX ^ value : value
+  return `${prefix}_-${sortable.toString(16).padStart(WIDE_SORT_HEX_LENGTH, "0")}${randomBase62(RANDOM_LENGTH)}`
+}
+
+function ordered(
+  prefix: string,
+  direction: "ascending" | "descending",
+  timestamp = Date.now(),
+  format: OrderedIdFormat = "legacy",
+): string {
+  return format === "wide" ? wideOrdered(prefix, direction, timestamp) : legacyOrdered(prefix, direction, timestamp)
+}
+
+function wideSortableValue(id: string, prefix: string): bigint | undefined {
+  const marker = `${prefix}_-`
+  if (!id.startsWith(marker)) return undefined
+  const body = id.slice(marker.length)
+  if (!/^[0-9a-f]{14}[0-9A-Za-z]{14}$/.test(body)) return undefined
+  const encoded = body.slice(0, WIDE_SORT_HEX_LENGTH)
+  return BigInt(`0x${encoded}`)
+}
+
+/** Advance the process-local wide timestamp/counter past an accepted external ID. */
+export function observeOrderedId(id: string): void {
+  for (const prefix of [PREFIXES.message, PREFIXES.part, PREFIXES.event]) {
+    const value = wideSortableValue(id, prefix)
+    if (value === undefined) continue
+    const observedTimestamp = value >> WIDE_COUNTER_BITS
+    const observedCounter = value & WIDE_COUNTER_MAX
+    const currentValue = lastWideTimestamp * WIDE_COUNTER_SCALE + wideCounter
+    if (value > currentValue) {
+      lastWideTimestamp = observedTimestamp
+      wideCounter = observedCounter
+    }
+  }
 }
 
 export function createSessionId(timestamp?: number): string {
   return ordered(PREFIXES.session, "descending", timestamp)
 }
 
-export function createMessageId(timestamp?: number): string {
-  return ordered(PREFIXES.message, "ascending", timestamp)
+export function createMessageId(timestamp?: number, format: OrderedIdFormat = "legacy"): string {
+  return ordered(PREFIXES.message, "ascending", timestamp, format)
 }
 
-export function createMessageIdAfter(afterId: string): string {
+export function createMessageIdAfter(afterId: string, format: OrderedIdFormat = orderedIdFormat(afterId)): string {
+  if (format === "wide") {
+    const after = wideSortableValue(afterId, PREFIXES.message)
+    return wideOrdered(PREFIXES.message, "ascending", Date.now(), after)
+  }
+
   let timestamp = Date.now()
   let candidate = createMessageId(timestamp)
   if (!isOrderedId(afterId, "message") || candidate > afterId) return candidate
@@ -62,16 +156,21 @@ export function createMessageIdAfter(afterId: string): string {
   return candidate
 }
 
-export function createPartId(timestamp?: number): string {
-  return ordered(PREFIXES.part, "ascending", timestamp)
+export function createPartId(timestamp?: number, format: OrderedIdFormat = "legacy"): string {
+  return ordered(PREFIXES.part, "ascending", timestamp, format)
 }
 
-export function createEventId(timestamp?: number): string {
-  return ordered(PREFIXES.event, "ascending", timestamp)
+export function createEventId(timestamp?: number, format: OrderedIdFormat = "legacy"): string {
+  return ordered(PREFIXES.event, "ascending", timestamp, format)
+}
+
+export function orderedIdFormat(id: string | undefined): OrderedIdFormat {
+  return id?.startsWith("msg_-") || id?.startsWith("prt_-") || id?.startsWith("evt_-") ? "wide" : "legacy"
 }
 
 export function isOrderedId(id: string, prefix: keyof typeof PREFIXES): boolean {
   const expectedPrefix = `${PREFIXES[prefix]}_`
-  if (!id.startsWith(expectedPrefix) || id.length !== expectedPrefix.length + 26) return false
-  return /^[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(id.slice(expectedPrefix.length))
+  if (!id.startsWith(expectedPrefix)) return false
+  const body = id.slice(expectedPrefix.length)
+  return /^[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(body) || /^-[0-9a-f]{14}[0-9A-Za-z]{14}$/.test(body)
 }

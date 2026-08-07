@@ -30,16 +30,12 @@ export async function runServe(
     logLevel,
     printLogs,
     verbose,
+    apiVersion: serveOptions.apiVersion,
+    msgPartEncap: serveOptions.msgPartEncap,
     compatVersion: config.compatibilityVersion,
     adaptorVersion: "0.1.0",
   })
 
-  if (serveOptions.mdns) {
-    logger.warn("--mdns flag received but mDNS is not yet implemented")
-  }
-  if (serveOptions.mdnsDomain) {
-    logger.warn("--mdns-domain flag received but mDNS is not yet implemented")
-  }
   if (serveOptions.disablePtyTokenCheck) {
     logger.warn(
       "PTY connect-token check is disabled (--disable-pty-token-check); PTY WebSocket clients can connect without a ticket",
@@ -59,6 +55,9 @@ export async function runServe(
     cors: serveOptions.cors,
     verbose,
     disablePtyTokenCheck: serveOptions.disablePtyTokenCheck,
+    disableV1Compatible: serveOptions.disableV1Compatible,
+    apiVersion: serveOptions.apiVersion,
+    msgPartEncap: serveOptions.msgPartEncap,
     config,
     logger,
   })

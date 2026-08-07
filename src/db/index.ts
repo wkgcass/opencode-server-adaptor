@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite"
 import { existsSync, mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import type { Logger } from "../logging/index.ts"
-import { createMessageId, createPartId, isOrderedId } from "../id/index.ts"
+import { createMessageId, createPartId, isOrderedId, observeOrderedId, type OrderedIdFormat } from "../id/index.ts"
 
 export interface SessionRow {
   id: string
@@ -166,6 +166,11 @@ export class DatabaseService {
       .query("SELECT rowid AS rowid, * FROM parts ORDER BY session_id ASC, message_id ASC, created_at ASC, rowid ASC")
       .all() as Array<RowWithOrder<PartRow>>
 
+    for (const row of messages) observeOrderedId(row.id)
+    for (const row of parts) observeOrderedId(row.id)
+    const eventIds = this.db.prepare("SELECT id FROM session_events").all() as Array<{ id: string }>
+    for (const row of eventIds) observeOrderedId(row.id)
+
     const affected = new Set<string>()
     for (const message of messages) {
       if (!isOrderedId(message.id, "message")) affected.add(message.session_id)
@@ -175,17 +180,32 @@ export class DatabaseService {
     }
     if (affected.size === 0) return
 
+    const sessionFormats = new Map<string, OrderedIdFormat>()
+    const sessionRows = this.db.prepare("SELECT id, metadata FROM sessions").all() as Array<{
+      id: string
+      metadata: string | null
+    }>
+    for (const row of sessionRows) {
+      try {
+        const metadata = row.metadata ? (JSON.parse(row.metadata) as { idFormat?: string }) : undefined
+        sessionFormats.set(row.id, metadata?.idFormat === "wide" ? "wide" : "legacy")
+      } catch {
+        sessionFormats.set(row.id, "legacy")
+      }
+    }
+
     for (const sessionId of affected) {
+      const idFormat = sessionFormats.get(sessionId) ?? "legacy"
       const sessionMessages = messages.filter((row) => row.session_id === sessionId)
       const messageIds = new Map<string, string>()
       for (const row of sessionMessages) {
-        messageIds.set(row.id, createMessageId(row.created_at))
+        messageIds.set(row.id, createMessageId(row.created_at, idFormat))
       }
 
       const sessionParts = parts.filter((row) => row.session_id === sessionId)
       const partIds = new Map<string, string>()
       for (const row of sessionParts) {
-        partIds.set(row.id, createPartId(row.created_at))
+        partIds.set(row.id, createPartId(row.created_at, idFormat))
       }
 
       this.db.transaction(() => {

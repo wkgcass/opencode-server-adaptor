@@ -18,9 +18,13 @@
 
 ```mermaid
 flowchart LR
-    V2["OpenCode v2 路由"] --> Service["SessionService"]
+    V2["OpenCode v2 路由<br/>(默认)"] --> Service["SessionService"]
+    V1["OpenCode v1 路由<br/>(--api-version=v1)"] --> Service
+    Permission["v2 权限路由"] --> PermissionRepo["PermissionRepository"]
     Service --> Server["统一会话与事件流程"]
+    Service --> Repositories["Session / Message / Event 仓库"]
     Server --> Integration["AgentIntegration"]
+    Server --> PermissionRepo
     Integration --> Adapter["AgentAdapter"]
     Adapter --> Runtime["AgentRuntime<br/>每个 OpenCode 会话"]
     Adapter --> Subagent["SubagentRunner"]
@@ -36,7 +40,11 @@ flowchart LR
 定义位置：
 
 - [`src/api/routes/v2-session.ts`](src/api/routes/v2-session.ts)：v2 会话协议映射。
-- [`src/api/routes/v2.ts`](src/api/routes/v2.ts)：其余 v2 HTTP 接口。
+- [`src/api/routes/v2.ts`](src/api/routes/v2.ts)：Agent、provider、项目、文件系统和 PTY 等 v2 HTTP 接口。
+- [`src/api/routes/v2-permission.ts`](src/api/routes/v2-permission.ts)：v2 权限请求、查询和回复生命周期。
+- [`src/api/routes/v1.ts`](src/api/routes/v1.ts)：v1 专属路由（配置与检查层）。
+- [`src/api/routes/v1-compatible.ts`](src/api/routes/v1-compatible.ts)：两种模式都挂载的兼容路由（`GET /config`、`DELETE /session/:id`）。
+- [`src/api/version.ts`](src/api/version.ts)：`--api-version` 选项与默认版本。
 - [`src/session/session-service.ts`](src/session/session-service.ts)：协议无关的会话应用服务。
 - [`src/event/session-event-store.ts`](src/event/session-event-store.ts)：v2 持久事件序列。
 
@@ -44,13 +52,59 @@ flowchart LR
 消息投影、压缩、回退、终止和启动恢复都必须通过同一个 `SessionService`，不能在路由内复制事件流程。
 后端 Adapter 和 Runtime 不感知 OpenCode HTTP 字段。
 
-服务固定声明 v2：`/api/health` 返回数值型 `pid`，`/global/health` 不注册并返回 404，以匹配 OpenCode
-的协议探测顺序。V1 业务路由和 `--api-version` 参数均不再保留。
+服务默认启用 v2，可通过 `--api-version=v1` 切换为 v1。`/api/health` 返回数值型 `pid`，
+`/global/health` 不注册并返回 404，以匹配 OpenCode 的协议探测顺序。v1 模式下挂载
+`v1.ts` 和 `v1-compatible.ts`；v2 模式下挂载 `v2.ts`、`v2-session.ts`、`v2-permission.ts`、`event.ts` 和
+`v1-compatible.ts`。`v1-compatible.ts`（`GET /config`、`DELETE /session/:id`）在两种模式下都挂载。
+
+### 应用层与持久化边界
+
+`src/server.ts` 是唯一组合根。它创建 repository、应用服务、integration 和路由，并通过构造参数显式连接依赖。
+`SessionRepository`、`MessageRepository`、`PermissionRepository` 和 `SessionEventStore` 分别拥有自己的业务表查询；
+路由和 `AgentService` 不直接执行这些表的 SQL。这样运行时事件产生的权限请求、HTTP 创建的权限请求和启动恢复共享同一套
+pending/reply 语义，项目目录查询也不会在 v1/v2 路由中各复制一份。
+
+provider/model 的通用目录模型与构建逻辑位于 [`src/provider/index.ts`](src/provider/index.ts)。后端 integration 可以贡献
+内置 provider，但不需要依赖 HTTP 路由模块；`src/api/provider.ts` 仅作为旧导入路径的兼容导出。
 
 通用 `EventBus` 继续发布 OpenCode 兼容实时事件；`SessionEventStore` 将需要断点续传的 v2 会话事件保存为每个
 session 单调递增的 durable sequence。订阅流程先注册实时监听，再回放数据库历史并按 sequence 去重，避免回放与
 实时切换窗口内丢失事件。日志优化器处理 v2 的消息快照与 SSE envelope，保留事件身份、生命周期和统计，
 但不重复输出累积文本或工具结果。
+
+### 会话级有序 ID 格式
+
+默认继续生成 OpenCode 兼容的 legacy ID：`<prefix>_<12 hex><14 base62>`。当客户端提交的消息 ID 以 `msg_-`
+开头时，`SessionService` 将该 session 持久切换为 wide ID 模式；随后由服务端生成的消息、part、实时事件和 durable
+事件分别使用 `msg_-`、`prt_-` 和 `evt_-`。wide ID 格式为
+`<prefix>_-<14 hex><14 base62>`：前 14 位十六进制由 44-bit 逻辑毫秒时间戳和 12-bit 同毫秒计数器组成，即
+`logicalTimestamp * 4096 + counter`；同毫秒并发或系统时钟回拨时继续单调递增，
+随机尾部只负责降低跨进程冲突概率。
+
+`-` 的字典序低于 legacy ID 排序部分使用的十六进制字符，因此同一 session 混用两种格式时，wide ID 会排在 legacy
+ID 之前；正常用法是在会话第一条客户端消息即使用 `msg_-`，避免混用。
+
+ID 模式保存在 session 的内部 metadata 中，重启后继续生效；手动和模型原生 subtask 创建的子 session 继承父 session
+模式。session 本身在收到第一条消息前已经创建，因此其 `ses_` ID 不改写，子 session ID 也仍使用 legacy `ses_`；
+权限、tool call、PTY 和 RPC ID 不参与消息/part 时间排序，也不切换格式。客户端明确传入的 message/part ID 原样保留，
+格式策略只控制适配器后续生成的 ID。
+
+`SessionRepository` 为事件路由维护一个仅包含 `directory` 和 `idFormat` 的进程内 cache。两者会被每个实时事件使用，
+因此必须一起读取和缓存，避免 token delta 为目录路由和 ID 格式重复查询 SQLite。session 创建或列表读取会预热 cache，
+目录更新和 wide 切换会同步刷新，递归删除会清除父子 session 条目；SQLite 仍是重启后的持久化真相来源。其他 Session
+字段不进入该 cache。
+
+### 可选的单 Part Message 投影
+
+默认情况下，一次后端执行产生的 reasoning、text 和 tool part 都投影到 prompt 预先创建的 assistant message。
+`serve --msg-part-encap` 改用 `AssistantPartProjector`：第一项复用预创建 message，后续每个新 assistant part 创建一条
+同 parent user message 的有序 sibling message，从而保证 v2 历史加载即使在 message 内重排 part，也无法改变跨 part
+的时间顺序。客户端提交的 user message 及其 text/file/agent/subtask part 不拆分，否则会错误增加用户轮次。
+
+该模式只改变 OpenCode 展示投影，不改变 Runtime 的 `PromptInput.assistantMessageId`；后端整轮仍使用原始 root message ID
+上报事件，投影器维护 root 到 sibling message 的进程内映射。`message_completed` 会统一关闭整组 message，只有最后一个
+实际含 part 的 message 保存最终 `finish` 和 usage；错误也只归属该 terminal message。`session_idle` 是独立的执行终态，
+不得由任意单条 message 的完成推导。启动恢复仍以数据库中所有未完成 assistant message 为准，不依赖进程内映射。
 
 四个主要边界：
 
@@ -501,7 +555,10 @@ createPiAgentIntegration
 
 - `PiAgentAdapter` 负责 Pi Runtime 配置校验、模型选择、revision、标题生成和 Runtime 创建。`plan` adapter 是
   `primary` agent，使用只读工具策略并加载 Pi 官方示例机制派生的扩展。
-- `PiRpcRuntime` 负责 Pi RPC 进程生命周期、原生 `compact` 调用以及 `PiEvent → AgentRuntimeEvent` 转换。
+- `PiRpcRuntime` 负责 Pi RPC 进程生命周期、原生 `compact` 调用以及 `PiEvent → AgentRuntimeEvent` 转换。其中 Pi `edit`
+  工具返回的 `details.patch`（标准 unified patch）会被提升为工具 part 的 `metadata.filediff`（`Snapshot.FileDiff` 形状：
+  `file`/`patch`/`additions`/`deletions`/`status`），使 OpenCode 桌面端的 edit 卡片能渲染行级 diff。该映射留在 Pi 专属
+  事件映射层，不把 `filediff` 等 OpenCode 字段名引入通用 `AgentService` 或路由层。
 - Pi 的 `prompt` RPC response 只表示 preflight 成功，不表示该轮结束。`PiRpcRuntime` 以官方
   `agent_settled` 为正常终态；兼容漏发该事件的实现时，只有 `get_state` 确认 Pi 已非 streaming 且无 pending message
   才能补齐终态，并会持续复查而不是只检查一次。

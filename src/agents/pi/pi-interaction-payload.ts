@@ -1,3 +1,5 @@
+import { OPENCODE_SUBTASK_EVENT_KEY } from "./pi-event-mapper.ts"
+
 type UnknownRecord = Record<string, unknown>
 
 function record(value: unknown): UnknownRecord | undefined {
@@ -48,6 +50,33 @@ function compactMessageEnd(payload: UnknownRecord): UnknownRecord {
     usage: message.usage,
     timestamp: message.timestamp,
   })
+}
+
+function compactSubtaskDetails(details: unknown): unknown {
+  // The subtask child event is nested under details so the parent runtime can
+  // project subtask progress. For message_update events it carries the full
+  // accumulated assistant `partial` (including reasoning/thinking and response
+  // text), which is only needed for event projection on the raw event path and
+  // is pure noise in the interaction log. Summarize its content to lengths so
+  // the printed payload no longer includes the verbose prompt/reasoning text.
+  const detailsRecord = record(details)
+  if (!detailsRecord) return details
+  const child = record(detailsRecord[OPENCODE_SUBTASK_EVENT_KEY])
+  if (!child) return details
+  const assistantMessageEvent = record(child.assistantMessageEvent)
+  if (!assistantMessageEvent) return details
+  const partial = record(assistantMessageEvent.partial)
+  if (!partial || !Array.isArray(partial.content)) return details
+  return {
+    ...detailsRecord,
+    [OPENCODE_SUBTASK_EVENT_KEY]: {
+      ...child,
+      assistantMessageEvent: {
+        ...assistantMessageEvent,
+        partial: { ...partial, content: contentSummary(partial.content) },
+      },
+    },
+  }
 }
 
 function compactPayload(payload: unknown): unknown {
@@ -110,7 +139,7 @@ function compactPayload(payload: unknown): unknown {
         toolCallId: event.toolCallId,
         toolName: event.toolName,
         content: contentSummary(partial?.content),
-        details: partial?.details,
+        details: compactSubtaskDetails(partial?.details),
       })
     }
     case "tool_execution_end": {

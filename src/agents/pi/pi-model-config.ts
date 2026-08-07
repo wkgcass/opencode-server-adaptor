@@ -4,7 +4,7 @@ import { homedir } from "node:os"
 import { randomUUID } from "node:crypto"
 import type { AppConfig } from "../../config/index.ts"
 import type { Logger } from "../../logging/index.ts"
-import type { ProviderConfig, ProviderModelConfig } from "../../api/provider.ts"
+import type { ProviderConfig, ProviderModelConfig } from "../../config/provider-config.ts"
 import type { ProviderConfigStore } from "../../config/provider-config.ts"
 import { planExtensionPath, syncPiRuntimeAssets, taskExtensionPath } from "./pi-runtime-assets.ts"
 

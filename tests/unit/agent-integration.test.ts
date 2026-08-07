@@ -18,6 +18,7 @@ import { StubAgentRuntime } from "../../src/agents/stub-adapter.ts"
 import { loadConfig } from "../../src/config/index.ts"
 import { Logger } from "../../src/logging/index.ts"
 import { createServerContext } from "../../src/server.ts"
+import { createMessageId } from "../../src/id/index.ts"
 
 describe("agent integrations", () => {
   const cleanup: string[] = []
@@ -187,8 +188,98 @@ describe("agent integrations", () => {
           }),
         }),
       )
+      expect(
+        context.messages.listMessages(session.id).filter((message) => message.info.role === "assistant"),
+      ).toHaveLength(1)
       expect(context.sessions.get(session.id)?.title).toBe("Backend-updated title")
     } finally {
+      await context.agentService.closeAll()
+      context.db.close()
+    }
+  })
+
+  test("encapsulates generated assistant parts without completing the session early", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agent-part-encap-"))
+    cleanup.push(directory)
+    const adapter = new GatedEncapsulationAdapter()
+    const integration: AgentIntegrationFactory = () => ({
+      adapters: [adapter],
+      providers: [{ id: adapter.id, name: "Encapsulation", modelID: "model" }],
+      defaultAdapterType: adapter.id,
+      defaultModel: `${adapter.id}/model`,
+    })
+    const config = {
+      ...loadConfig(),
+      databasePath: join(directory, "adaptor.db"),
+      providerConfigPath: join(directory, "providers.yaml"),
+      defaultAgent: adapter.id,
+      serverUsername: null,
+      serverPassword: null,
+    }
+    const context = createServerContext(config, new Logger({ minLevel: "ERROR" }), {
+      agentIntegrations: [integration],
+      msgPartEncap: true,
+    })
+
+    try {
+      const session = context.sessions.create({ directory, title: "Encapsulation", agent: adapter.id })
+      const response = await context.app.request(`/api/session/${session.id}/prompt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: createMessageId(undefined, "wide"),
+          prompt: { text: "encapsulate the response" },
+        }),
+      })
+      expect(response.status).toBe(200)
+
+      let assistants = context.messages.listMessages(session.id).filter((message) => message.info.role === "assistant")
+      for (
+        let attempt = 0;
+        attempt < 100 &&
+        (assistants.length !== 3 ||
+          assistants.some((message) => message.info.role !== "assistant" || message.info.time.completed === undefined));
+        attempt++
+      ) {
+        await Bun.sleep(10)
+        assistants = context.messages.listMessages(session.id).filter((message) => message.info.role === "assistant")
+      }
+
+      expect(assistants).toHaveLength(3)
+      expect(assistants.map((message) => message.parts.length)).toEqual([1, 1, 1])
+      expect(assistants.map((message) => message.parts[0]?.type)).toEqual(["text", "reasoning", "tool"])
+      expect(assistants.map((message) => message.info.id)).toEqual(
+        assistants.map((message) => message.info.id).toSorted(),
+      )
+      expect(
+        assistants.every((message) => message.info.role === "assistant" && message.info.time.completed !== undefined),
+      ).toBe(true)
+      expect(
+        assistants.map((message) => (message.info.role === "assistant" ? message.info.finish : undefined)),
+      ).toEqual([undefined, undefined, "stop"])
+      expect(
+        assistants.map((message) => (message.info.role === "assistant" ? message.info.tokens.input : undefined)),
+      ).toEqual([0, 0, 12])
+      expect(assistants.map((message) => (message.info.role === "assistant" ? message.info.cost : undefined))).toEqual([
+        0, 0, 0.01,
+      ])
+      expect(context.sessions.getStatus(session.id)).toBe("busy")
+
+      const history = await context.app.request(`/api/session/${session.id}/message?order=asc&limit=20`)
+      const payload = (await history.json()) as {
+        data: Array<{ type: string; id: string; content?: Array<{ type: string }> }>
+      }
+      const projected = payload.data.filter((message) => message.type === "assistant")
+      expect(projected.map((message) => message.content?.length)).toEqual([1, 1, 1])
+      expect(projected.map((message) => message.content?.[0]?.type)).toEqual(["text", "reasoning", "tool"])
+
+      adapter.releaseIdle()
+      for (let attempt = 0; attempt < 100 && context.sessions.getStatus(session.id) !== "idle"; attempt++) {
+        await Bun.sleep(10)
+      }
+      expect(context.sessions.getStatus(session.id)).toBe("idle")
+    } finally {
+      adapter.releaseIdle()
       await context.agentService.closeAll()
       context.db.close()
     }
@@ -285,6 +376,92 @@ class MissingStartRuntime implements AgentRuntime {
   }
 
   async abort(): Promise<void> {}
+
+  async respondToPermission(_requestId: string, _response: PermissionResponse): Promise<void> {}
+
+  subscribe(listener: (event: AgentRuntimeEvent) => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  private emit(event: AgentRuntimeEvent): void {
+    for (const listener of this.listeners) listener(event)
+  }
+}
+
+class GatedEncapsulationAdapter implements AgentAdapter {
+  readonly id = "encapsulation"
+  readonly displayName = "Encapsulation"
+  private release: (() => void) | undefined
+  private readonly idleGate = new Promise<void>((resolve) => {
+    this.release = resolve
+  })
+
+  async validateConfig(input: unknown): Promise<AgentAdapterConfig> {
+    return input as AgentAdapterConfig
+  }
+
+  async createRuntime(context: AgentRuntimeContext): Promise<AgentRuntime> {
+    return new GatedEncapsulationRuntime(context.sessionId, this.idleGate)
+  }
+
+  releaseIdle(): void {
+    this.release?.()
+  }
+}
+
+class GatedEncapsulationRuntime implements AgentRuntime {
+  private readonly listeners = new Set<(event: AgentRuntimeEvent) => void>()
+
+  constructor(
+    private readonly sessionId: string,
+    private readonly idleGate: Promise<void>,
+  ) {}
+
+  async start(): Promise<void> {}
+
+  async stop(): Promise<void> {}
+
+  async prompt(input: PromptInput): Promise<void> {
+    this.emit({
+      type: "text_ended",
+      sessionId: this.sessionId,
+      messageId: input.assistantMessageId,
+      partId: "encap-text",
+      text: "answer",
+    })
+    this.emit({
+      type: "reasoning_ended",
+      sessionId: this.sessionId,
+      messageId: input.assistantMessageId,
+      partId: "encap-reasoning",
+      text: "reasoning",
+    })
+    this.emit({
+      type: "tool_call_completed",
+      sessionId: this.sessionId,
+      messageId: input.assistantMessageId,
+      partId: "encap-tool",
+      callId: "call_encap",
+      tool: "read",
+      input: { filePath: "/tmp/example" },
+      output: "tool output",
+      title: "read",
+    })
+    this.emit({
+      type: "message_completed",
+      sessionId: this.sessionId,
+      messageId: input.assistantMessageId,
+      finish: "stop",
+      usage: { input: 12, output: 5, total: 17, cost: 0.01 },
+    })
+    await this.idleGate
+    this.emit({ type: "session_idle", sessionId: this.sessionId })
+  }
+
+  async abort(): Promise<void> {
+    this.emit({ type: "session_idle", sessionId: this.sessionId })
+  }
 
   async respondToPermission(_requestId: string, _response: PermissionResponse): Promise<void> {}
 

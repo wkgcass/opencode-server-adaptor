@@ -4,6 +4,11 @@ import { randomUUID } from "node:crypto"
 import { parse, stringify } from "yaml"
 import type { Logger } from "../logging/index.ts"
 
+/** Notifies an agent backend that provider or authentication data changed. */
+export interface ProviderConfigChangeListener {
+  markDirty(): void
+}
+
 export type ProviderApi =
   | "anthropic-messages"
   | "openai-completions"
@@ -251,6 +256,28 @@ export class ProviderConfigStore {
     if (apiKey?.trim()) provider.apiKey = apiKey.trim()
     else delete provider.apiKey
     next.provider![providerID] = provider
+    this.write(next)
+    return true
+  }
+
+  deleteProvider(providerID: string): boolean {
+    this.refresh()
+    if (!this.value.provider?.[providerID]) return false
+    const next = structuredClone(this.value)
+    delete next.provider![providerID]
+    if (Object.keys(next.provider!).length === 0) delete next.provider
+    this.write(next)
+    return true
+  }
+
+  deleteModel(providerID: string, modelID: string): boolean {
+    this.refresh()
+    const provider = this.value.provider?.[providerID]
+    if (!provider?.models?.[modelID]) return false
+    const next = structuredClone(this.value)
+    const nextProvider = next.provider![providerID]!
+    delete nextProvider.models![modelID]
+    if (Object.keys(nextProvider.models!).length === 0) delete nextProvider.models
     this.write(next)
     return true
   }

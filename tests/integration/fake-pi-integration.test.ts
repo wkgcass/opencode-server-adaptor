@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { homedir } from "node:os"
 import { reserveFreePort } from "../helpers/free-port.ts"
 import { createV2TestFetch } from "../helpers/v2-test-fetch.ts"
+import { createMessageId } from "../../src/id/index.ts"
 
 const fetch = createV2TestFetch()
 
@@ -150,6 +151,46 @@ describe("Fake Pi Integration", () => {
     const textParts = assistant!.parts.filter((p) => p.type === "text")
     expect(textParts.length).toBeGreaterThan(0)
     expect(textParts[0]!.text).toContain("fake Pi response")
+  }, 15000)
+
+  test("a msg_- client message switches the session to persistent wide IDs", async () => {
+    const headers = { Authorization: authHeader, "Content-Type": "application/json" }
+    const createRes = await fetch(`${baseUrl}/session`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ title: "Wide ID Test", agent: "pi" }),
+    })
+    const session = (await createRes.json()) as { id: string }
+    const messageID = createMessageId(undefined, "wide")
+
+    for (const body of [
+      { messageID, parts: [{ type: "text", text: "enable wide IDs" }] },
+      { parts: [{ type: "text", text: "keep wide IDs" }] },
+    ]) {
+      const response = await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      })
+      expect(response.status).toBe(204)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
+    }
+
+    const historyRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
+      headers: { Authorization: authHeader },
+    })
+    const history = (await historyRes.json()) as Array<{
+      info: { id: string; role: string }
+      parts: Array<{ id: string }>
+    }>
+    expect(history).toHaveLength(4)
+    expect(history.every((message) => message.info.id.startsWith("msg_-"))).toBe(true)
+    expect(
+      history
+        .filter((message) => message.info.role === "assistant")
+        .flatMap((message) => message.parts)
+        .filter((part) => !part.id.startsWith("prt_-")),
+    ).toEqual([])
   }, 15000)
 
   test("session returns to idle after Fake Pi completes", async () => {
@@ -792,6 +833,98 @@ describe("Fake Pi Integration", () => {
     })
     expect(tool?.state?.time?.start).toBeNumber()
     expect(tool?.state?.time?.end).toBeNumber()
+  }, 15000)
+
+  test("streams partial bash output on the running tool part via SSE", async () => {
+    const controller = new AbortController()
+    const eventRes = await fetch(`${baseUrl}/global/event`, {
+      headers: { Authorization: authHeader },
+      signal: controller.signal,
+    })
+    const reader = eventRes.body!.getReader()
+    await waitForSseEvent(reader, (event) => event.payload?.type === "server.connected")
+
+    try {
+      const directory = "/tmp"
+      const scopedHeaders = {
+        Authorization: authHeader,
+        "Content-Type": "application/json",
+        "x-opencode-directory": encodeURIComponent(directory),
+      }
+      const createRes = await fetch(`${baseUrl}/session`, {
+        method: "POST",
+        headers: scopedHeaders,
+        body: JSON.stringify({ title: "Streaming bash output", agent: "pi" }),
+      })
+      const session = (await createRes.json()) as { id: string }
+
+      await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
+        method: "POST",
+        headers: scopedHeaders,
+        body: JSON.stringify({ parts: [{ type: "text", text: "run a bash tool" }] }),
+      })
+
+      const toolParts: Array<{ status?: string; output?: string; metadataOutput?: string }> = []
+      await waitForSseEvent(
+        reader,
+        (event) => {
+          const payload = event.payload
+          if (
+            payload?.type === "message.part.updated" &&
+            payload.properties?.sessionID === session.id &&
+            payload.properties?.part?.type === "tool"
+          ) {
+            const state = payload.properties.part.state ?? {}
+            toolParts.push({
+              status: state.status,
+              output: state.output,
+              metadataOutput: state.metadata?.output,
+            })
+          }
+          return (
+            payload?.type === "session.status" &&
+            payload.properties?.sessionID === session.id &&
+            payload.properties?.status?.type === "idle"
+          )
+        },
+        10_000,
+      )
+
+      // The running tool part must carry the partial output on BOTH state.output
+      // (read by the Desktop shell renderer via props.output on the live event
+      // path) AND state.metadata.output (read via props.metadata.output after a
+      // v2 REST reload, and by the ACP shellOutputSnapshot). This matches how
+      // the canonical opencode ShellTool streams via ctx.metadata({ output }).
+      expect(toolParts.some((part) => part.status === "running" && part.output === "hel")).toBe(true)
+      expect(toolParts.some((part) => part.status === "running" && part.metadataOutput === "hel")).toBe(true)
+      // The final completed part carries the full output ("hello").
+      expect(toolParts.some((part) => part.status === "completed" && part.output === "hello")).toBe(true)
+
+      // The v2 REST message projection must also carry tool metadata inside
+      // `state.metadata` (not only at the top level) so the Desktop's v2
+      // `toolPart` converter preserves it via normalizeToolMetadata after a
+      // reload/reconnect.
+      const v2Res = await fetch(`${baseUrl}/api/session/${session.id}/message?limit=20&order=asc`, {
+        headers: { Authorization: authHeader },
+      })
+      const v2Messages = (await v2Res.json()) as {
+        data: Array<{
+          type: string
+          content?: Array<{
+            type: string
+            state?: { status?: string; metadata?: { output?: string } | null }
+          }>
+        }>
+      }
+      const v2Tool = v2Messages.data
+        .filter((message) => message.type === "assistant")
+        .flatMap((message) => message.content ?? [])
+        .find((content) => content.type === "tool")
+      expect(v2Tool?.state?.metadata).toBeDefined()
+    } finally {
+      await reader.cancel()
+      controller.abort()
+    }
   }, 15000)
 
   test("exposes a model-invoked task as a navigable child session with its full execution", async () => {

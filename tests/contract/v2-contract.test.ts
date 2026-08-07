@@ -487,6 +487,57 @@ describe("OpenCode v2 protocol", () => {
     expect(await read.text()).toContain("opencode-server-adaptor")
   })
 
+  test("legacy v1-compatible file routes serve the desktop file tree", async () => {
+    const encodedDirectory = encodeURIComponent(process.cwd())
+    // GET /file lists the workspace root as FileNode[] (paths relative to root,
+    // directories first). The desktop drives its tree via client.file.list.
+    const list = await request(`/file?path=.&directory=${encodedDirectory}`)
+    expect(list.ok).toBe(true)
+    const nodes = (await list.json()) as Array<{
+      name: string
+      path: string
+      absolute: string
+      type: "file" | "directory"
+      ignored: boolean
+    }>
+    expect(Array.isArray(nodes)).toBe(true)
+    expect(nodes.length).toBeGreaterThan(0)
+    const pkg = nodes.find((node) => node.name === "package.json")
+    expect(pkg).toBeDefined()
+    expect(pkg?.type).toBe("file")
+    expect(pkg?.path).toBe("package.json")
+    expect(pkg?.absolute).toBe(join(process.cwd(), "package.json"))
+    // Directories sort before files.
+    const firstDirIndex = nodes.findIndex((node) => node.type === "directory")
+    const firstFileIndex = nodes.findIndex((node) => node.type === "file")
+    if (firstDirIndex !== -1 && firstFileIndex !== -1) expect(firstDirIndex).toBeLessThan(firstFileIndex)
+
+    // Listing a subdirectory returns paths relative to the workspace root.
+    const srcList = await request(`/file?path=src&directory=${encodedDirectory}`)
+    expect(srcList.ok).toBe(true)
+    const srcNodes = (await srcList.json()) as Array<{ path: string; type: "file" | "directory" }>
+    expect(srcNodes.length).toBeGreaterThan(0)
+    expect(srcNodes.every((node) => node.path.startsWith("src/"))).toBe(true)
+
+    // GET /file/content returns a FileContent (text for package.json).
+    const content = await request(`/file/content?path=package.json&directory=${encodedDirectory}`)
+    expect(content.ok).toBe(true)
+    const body = (await content.json()) as { type: "text" | "binary"; content: string }
+    expect(body.type).toBe("text")
+    expect(body.content).toContain("opencode-server-adaptor")
+
+    // Path traversal is rejected.
+    const traversal = await request(`/file/content?path=../../etc/hosts&directory=${encodedDirectory}`)
+    expect(traversal.status).toBe(403)
+
+    // GET /find/file returns relative paths.
+    const found = await request(`/find/file?query=package&directory=${encodedDirectory}`)
+    expect(found.ok).toBe(true)
+    const foundPaths = (await found.json()) as string[]
+    expect(Array.isArray(foundPaths)).toBe(true)
+    expect(foundPaths.some((path) => path.endsWith("package.json"))).toBe(true)
+  })
+
   test("PTY compatibility implements the full v2 CRUD surface", async () => {
     const created = await request("/api/pty", {
       method: "POST",

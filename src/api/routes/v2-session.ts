@@ -178,6 +178,7 @@ function toV2Tool(part: ToolPart) {
         input: part.state.input,
         structured: {},
         content: part.state.output ? [{ type: "text" as const, text: part.state.output }] : [],
+        metadata: part.state.metadata,
       },
     }
   }
@@ -190,6 +191,7 @@ function toV2Tool(part: ToolPart) {
         structured: {},
         content: part.state.output ? [{ type: "text" as const, text: part.state.output }] : [],
         result: part.state.output,
+        metadata: part.state.metadata,
       },
     }
   }
@@ -205,6 +207,7 @@ function toV2Tool(part: ToolPart) {
         message: part.state.error ?? (part.state.status === "aborted" ? "Tool call aborted" : "Tool call failed"),
       },
       result: part.state.output,
+      metadata: part.state.metadata,
     },
   }
 }
@@ -517,6 +520,35 @@ export function createV2SessionRoutes(options: { service: SessionService; logger
           promotedSeq: admitted.promotedSeq,
         },
       })
+    } catch (error) {
+      return v2Error(c, error)
+    }
+  })
+
+  app.post("/api/session/:sessionID/shell", async (c) => {
+    const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+    if (!body || typeof body.command !== "string") {
+      return v2Error(c, new SessionServiceError("invalid_request", "command is required"))
+    }
+    const model = body.model as { providerID?: string; id?: string; modelID?: string; variant?: string } | undefined
+    try {
+      service.shell(c.req.param("sessionID"), {
+        messageID:
+          typeof body.id === "string" ? body.id : typeof body.messageID === "string" ? body.messageID : undefined,
+        agent: typeof body.agent === "string" ? body.agent : undefined,
+        model:
+          model && typeof model === "object"
+            ? {
+                providerID: String(model.providerID ?? ""),
+                modelID: String(model.id ?? model.modelID ?? ""),
+                variant: typeof model.variant === "string" ? model.variant : undefined,
+              }
+            : undefined,
+        command: body.command,
+      })
+      // The Desktop client treats shell as fire-and-forget (204 No Content);
+      // execution continues and progress is streamed via /api/event.
+      return c.body(null, 204)
     } catch (error) {
       return v2Error(c, error)
     }

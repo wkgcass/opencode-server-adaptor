@@ -81,6 +81,7 @@ export function createV2TestFetch(nativeFetch: Fetch = globalThis.fetch): Fetch 
       const suffix = sessionMatch[2]!
       if (suffix === "" && (!init?.method || init.method === "GET")) {
         const response = await nativeFetch(apiURL(original, `/api/session/${sessionID}`), { ...init, headers })
+        if (!response.ok) return response
         const body = await response.json() as { data: JsonRecord }
         return jsonResponse(legacySession(body.data), response)
       }
@@ -230,6 +231,28 @@ export function createV2TestFetch(nativeFetch: Fetch = globalThis.fetch): Fetch 
     if (agentDelete && init?.method === "DELETE") {
       const response = await nativeFetch(apiURL(original, `/api/agent/${agentDelete[1]}`), { ...init, headers })
       return response.ok ? jsonResponse(true, response) : response
+    }
+
+    // Legacy v1 /auth/:providerID maps to the v2 credential endpoints. The v2
+    // credential id for a provider is `credential_<providerID>`.
+    const authProvider = path.match(/^\/auth\/([^/]+)$/)
+    if (authProvider) {
+      const providerID = authProvider[1]!
+      const credentialID = `credential_${providerID}`
+      if (init?.method === "PUT") {
+        const response = await nativeFetch(
+          apiURL(original, `/api/integration/${providerID}/connect/key`),
+          jsonInit({ method: "POST" }, headers, { key: json?.key }),
+        )
+        return response.ok ? jsonResponse(true, response) : response
+      }
+      if (init?.method === "DELETE") {
+        const response = await nativeFetch(apiURL(original, `/api/credential/${credentialID}`), {
+          method: "DELETE",
+          headers,
+        })
+        return response.ok ? jsonResponse(true, response) : response
+      }
     }
 
     if (path === "/event" || path === "/global/event") {
@@ -385,17 +408,19 @@ function legacyPermission(permission: JsonRecord) {
     permission: permission.action,
     tool: permission.action,
     patterns: permission.resources,
-    status: "pending",
+    status: permission.status ?? "pending",
   }
 }
 
 function legacyAgent(agent: JsonRecord) {
+  const model = agent.model as { id?: string; modelID?: string; providerID: string } | undefined
   return {
     ...agent,
     name: agent.id,
     description: agent.description ?? agent.name,
     permission: agent.permissions ?? [],
     options: {},
+    model: model ? { providerID: model.providerID, modelID: model.modelID ?? model.id } : undefined,
   }
 }
 

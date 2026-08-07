@@ -13,13 +13,17 @@ import { installAgentIntegrations, type AgentIntegrationFactory } from "./agents
 import { createPiAgentIntegration } from "./agents/pi/pi-integration.ts"
 import { createV2SessionRoutes } from "./api/routes/v2-session.ts"
 import { createV2Routes } from "./api/routes/v2.ts"
+import { createV2PermissionRoutes } from "./api/routes/v2-permission.ts"
 import { createV1Routes } from "./api/routes/v1.ts"
+import { createV1CompatibleRoutes } from "./api/routes/v1-compatible.ts"
 import { registerInteractionPayloadOptimizer } from "./logging/interaction-payload.ts"
 import { ProviderConfigStore } from "./config/provider-config.ts"
 import { SessionEventStore } from "./event/session-event-store.ts"
 import { SessionService } from "./session/session-service.ts"
 import { PtyManager, type PtySocketData } from "./api/pty-manager.ts"
 import { requestDirectory } from "./api/request-directory.ts"
+import { DEFAULT_API_VERSION, type ApiVersion } from "./api/version.ts"
+import { PermissionRepository } from "./permission/index.ts"
 
 export interface ServerStartOptions {
   hostname: string
@@ -27,6 +31,9 @@ export interface ServerStartOptions {
   cors: string[]
   verbose: boolean
   disablePtyTokenCheck?: boolean
+  disableV1Compatible?: boolean
+  msgPartEncap?: boolean
+  apiVersion?: ApiVersion
   config: AppConfig
   logger: Logger
 }
@@ -220,6 +227,7 @@ export interface ServerContext {
   db: DatabaseService
   sessions: SessionRepository
   messages: MessageRepository
+  permissions: PermissionRepository
   events: EventBus
   agentService: AgentService
   sessionService: SessionService
@@ -243,9 +251,22 @@ export interface ServerContextOptions {
    * PTY connectToken call is not wired up).
    */
   disablePtyTokenCheck?: boolean
+  /**
+   * Selects the API surface: v1 mounts the legacy v1 routes, v2 mounts the
+   * v2 routes. The v1-compatible routes (DELETE /session/:id, GET /config) are
+   * always mounted unless disableV1Compatible is set. Defaults to v2.
+   */
+  apiVersion?: ApiVersion
+  /**
+   * Skips mounting the v1-compatible routes (GET /config, DELETE /session/:id).
+   */
+  disableV1Compatible?: boolean
+  /** Places each server-generated assistant part in its own sibling message. */
+  msgPartEncap?: boolean
 }
 
 export function createServerContext(config: AppConfig, logger: Logger, options?: ServerContextOptions): ServerContext {
+  const apiVersion = options?.apiVersion ?? DEFAULT_API_VERSION
   const cors = options?.cors ?? []
   const verbose = options?.verbose ?? false
   const readiness = createReadiness()
@@ -253,12 +274,28 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
   const db = new DatabaseService(config.databasePath, logger)
   const providerConfig = new ProviderConfigStore(config.providerConfigPath, logger)
   const sessions = new SessionRepository(db, config.compatibilityVersion)
-  const messages = new MessageRepository(db)
+  const messages = new MessageRepository(db, sessions)
+  const permissions = new PermissionRepository(db)
   const startupSessionIds = new Set(sessions.list().map((session) => session.id))
-  const events = new EventBus(logger, (event) => {
-    const sessionID = (event.properties as { sessionID?: string }).sessionID
-    return sessionID ? sessions.get(sessionID)?.directory : undefined
-  })
+  const eventSessionID = (event: { properties: Record<string, unknown> }): string | undefined => {
+    const properties = event.properties as {
+      sessionID?: string
+      info?: { sessionID?: string }
+      part?: { sessionID?: string }
+    }
+    return properties.sessionID ?? properties.info?.sessionID ?? properties.part?.sessionID
+  }
+  const events = new EventBus(
+    logger,
+    (event) => {
+      const sessionID = eventSessionID(event)
+      return sessionID ? sessions.getDirectory(sessionID) : undefined
+    },
+    (event) => {
+      const sessionID = eventSessionID(event)
+      return sessionID ? sessions.getIdFormat(sessionID) : "legacy"
+    },
+  )
   const ptys = new PtyManager(events, logger, options?.disablePtyTokenCheck ?? false)
 
   const registry = new AgentAdapterRegistry()
@@ -276,8 +313,10 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
   const providerConfigListeners = installedIntegrations.providerConfigListeners
   const defaultAdapterType = installedIntegrations.defaultAdapterType ?? effectiveDefaultAgent
 
-  const agentService = new AgentService(registry, sessions, messages, events, logger, config, db)
-  const sessionEvents = new SessionEventStore(db, logger)
+  const agentService = new AgentService(registry, sessions, messages, events, logger, config, permissions, {
+    encapsulateMessageParts: options?.msgPartEncap,
+  })
+  const sessionEvents = new SessionEventStore(db, logger, sessions)
   const sessionService = new SessionService(
     sessions,
     messages,
@@ -314,25 +353,42 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
     return c.json({ healthy: true, version: config.compatibilityVersion, pid: process.pid })
   })
 
-  app.route("/", createV2SessionRoutes({ service: sessionService, logger }))
-  app.route(
-    "/",
-    createV2Routes({
-      registry,
-      config,
-      providerConfig,
-      builtinProviders,
-      sessions: sessionService,
-      db,
-      agentService,
-      events,
-      ptys,
-      defaultAdapterType,
-      providerConfigListeners,
-    }),
-  )
-  app.route("/", createEventRoutes({ events, logger }))
-  app.route("/", createV1Routes({ config, providerConfig, sessionService: sessionService }))
+  // The v1-compatible routes (DELETE /session/:id, GET /config) have no v2
+  // counterpart and are mounted in both api versions unless explicitly disabled.
+  if (!options?.disableV1Compatible) {
+    app.route("/", createV1CompatibleRoutes({ config, providerConfig, sessionService: sessionService }))
+  }
+
+  if (apiVersion === "v1") {
+    app.route(
+      "/",
+      createV1Routes({
+        sessionService,
+        registry,
+        config,
+        providerConfig,
+        builtinProviders,
+        providerConfigListeners,
+      }),
+    )
+  } else {
+    app.route("/", createV2SessionRoutes({ service: sessionService, logger }))
+    app.route(
+      "/",
+      createV2Routes({
+        registry,
+        config,
+        providerConfig,
+        builtinProviders,
+        sessions: sessionService,
+        ptys,
+        defaultAdapterType,
+        providerConfigListeners,
+      }),
+    )
+    app.route("/", createV2PermissionRoutes({ sessions: sessionService, permissions, agentService, events }))
+    app.route("/", createEventRoutes({ events, logger }))
+  }
 
   app.all("*", (c) => c.text(`Cannot ${c.req.method} ${c.req.url}`, 404))
 
@@ -341,6 +397,7 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
     db,
     sessions,
     messages,
+    permissions,
     events,
     agentService,
     sessionService,
@@ -374,6 +431,7 @@ async function checkPortAvailable(hostname: string, port: number): Promise<void>
 
 export async function startServer(options: ServerStartOptions): Promise<ServerHandle> {
   const { hostname, port, config, logger } = options
+  const apiVersion = options.apiVersion ?? DEFAULT_API_VERSION
 
   await checkPortAvailable(hostname, port)
 
@@ -381,6 +439,9 @@ export async function startServer(options: ServerStartOptions): Promise<ServerHa
     cors: options.cors,
     verbose: options.verbose,
     disablePtyTokenCheck: options.disablePtyTokenCheck,
+    disableV1Compatible: options.disableV1Compatible,
+    msgPartEncap: options.msgPartEncap,
+    apiVersion: options.apiVersion,
   })
   const { app, db, events, agentService, sessionService, sessionEvents, ptys, readiness } = ctx
 
@@ -422,10 +483,10 @@ export async function startServer(options: ServerStartOptions): Promise<ServerHa
     throw new Error(`Failed to start HTTP server on ${hostname}:${port}: ${msg}`)
   }
 
-  logger.info("HTTP server listening", { hostname, port, apiVersion: "v2" })
+  logger.info("HTTP server listening", { hostname, port, apiVersion })
 
   readiness.setReady(true)
-  logger.info("Server is ready", { hostname, port, apiVersion: "v2" })
+  logger.info("Server is ready", { hostname, port, apiVersion })
 
   let closed = false
   const cleanup = async (): Promise<void> => {

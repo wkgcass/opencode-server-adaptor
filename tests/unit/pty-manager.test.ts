@@ -110,14 +110,16 @@ describe("PtyManager idle reaping", () => {
     }
   })
 
-  test("reaps an already-exited PTY session after the idle timeout", async () => {
+  test("removes an exited PTY session immediately and publishes pty.exited once", async () => {
     const { ptys, events, server } = setup(400)
+    const exited: string[] = []
     const deleted: string[] = []
     events.subscribeInternal((e) => {
+      if (e.type === "pty.exited") exited.push((e.properties as { id: string }).id)
       if (e.type === "pty.deleted") deleted.push((e.properties as { id: string }).id)
     })
     try {
-      // A shell that exits immediately. The session record stays in memory as "exited".
+      // A shell that exits immediately.
       const info = await ptys.create({
         command: "bash",
         args: ["-c", "exit 0"],
@@ -125,16 +127,87 @@ describe("PtyManager idle reaping", () => {
         cwd: DIRECTORY,
         title: "short-lived",
       })
-      // Wait for the process to exit and the pty.exited event to be published.
+      // Wait for the process to exit and onExit to run.
       await Bun.sleep(150)
-      expect(ptys.get(info.id, DIRECTORY)?.status).toBe("exited")
-      // Not yet reaped (under the idle timeout).
-      await Bun.sleep(150)
-      expect(ptys.get(info.id, DIRECTORY)?.status).toBe("exited")
-      // Past the idle timeout → the exited session record is removed.
-      await Bun.sleep(400)
+      // The session record is gone immediately (GET /api/pty/:id would 404),
+      // so the OpenCode client's reconnect check gives up instead of looping.
       expect(ptys.get(info.id, DIRECTORY)).toBeUndefined()
-      expect(deleted).toContain(info.id)
+      // pty.exited published exactly once; no retransmission, no pty.deleted
+      // (that event is only for explicit DELETE).
+      expect(exited.filter((id) => id === info.id).length).toBe(1)
+      expect(deleted).not.toContain(info.id)
+    } finally {
+      ptys.close()
+      server.stop(true)
+    }
+  })
+})
+
+describe("PtyManager exit signaling", () => {
+  test("arms 404, publishes pty.exited, then closes the subscribed WebSocket with 1000", async () => {
+    const { ptys, events, server } = setup(0)
+    const exited: string[] = []
+    events.subscribeInternal((e) => {
+      if (e.type === "pty.exited") exited.push((e.properties as { id: string }).id)
+    })
+    try {
+      // A shell that stays alive long enough for a client to subscribe, then
+      // exits on its own.
+      const info = await ptys.create({
+        command: "bash",
+        args: ["-c", "sleep 0.3; exit 0"],
+        directory: DIRECTORY,
+        cwd: DIRECTORY,
+        title: "subscribed-exit",
+      })
+      const wsUrl = `ws://localhost:${server.port}/api/pty/${info.id}/connect?location[directory]=${encodeURIComponent(DIRECTORY)}`
+      const ws = await openWebSocket(wsUrl)
+
+      // Wait for the shell to exit; the server closes the WebSocket.
+      const closeEvent = await new Promise<CloseEvent>((resolve) => {
+        ws.addEventListener("close", (ev) => resolve(ev as CloseEvent))
+      })
+      // Closed with 1000 so the client does not reconnect.
+      expect(closeEvent.code).toBe(1000)
+      // The session record is already gone (GET would 404), so even if the
+      // close had been non-1000 the client's reconnect check would give up.
+      expect(ptys.get(info.id, DIRECTORY)).toBeUndefined()
+      // pty.exited published exactly once (no retransmission).
+      expect(exited.filter((id) => id === info.id).length).toBe(1)
+    } finally {
+      ptys.close()
+      server.stop(true)
+    }
+  })
+
+  test("a reconnect attempt to an exited PTY sees 404 (no reconnect loop)", async () => {
+    const { ptys, server } = setup(0)
+    try {
+      const info = await ptys.create({
+        command: "bash",
+        args: ["-c", "exit 0"],
+        directory: DIRECTORY,
+        cwd: DIRECTORY,
+        title: "gone",
+      })
+      await Bun.sleep(150) // let it exit and be removed
+      expect(ptys.get(info.id, DIRECTORY)).toBeUndefined()
+
+      // A WebSocket connect to the now-deleted session fails the upgrade with
+      // 404 (session not found). The client sees an abnormal close, checks
+      // GET for 404, and gives up instead of looping.
+      const wsUrl = `ws://localhost:${server.port}/api/pty/${info.id}/connect?location[directory]=${encodeURIComponent(DIRECTORY)}`
+      const closeEvent = await new Promise<CloseEvent>((resolve) => {
+        const ws = new WebSocket(wsUrl)
+        ws.binaryType = "arraybuffer"
+        ws.addEventListener("close", (ev) => resolve(ev as CloseEvent))
+        ws.addEventListener("error", () => {
+          /* close will follow */
+        })
+      })
+      // Upgrade rejected → abnormal close (1006), never 1000. The point is
+      // that GET is 404 so the client stops here.
+      expect(closeEvent.code).not.toBe(1000)
     } finally {
       ptys.close()
       server.stop(true)

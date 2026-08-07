@@ -1,3 +1,7 @@
+import { DEFAULT_API_VERSION, type ApiVersion } from "../api/version.ts"
+
+export type { ApiVersion }
+
 export type ParsedLogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR"
 
 export interface GlobalOptions {
@@ -12,10 +16,11 @@ export interface ServeOptions {
   hostname: string
   port: number
   cors: string[]
-  mdns: boolean
-  mdnsDomain: string | null
   verbose: boolean
   disablePtyTokenCheck: boolean
+  disableV1Compatible: boolean
+  msgPartEncap: boolean
+  apiVersion: ApiVersion
 }
 
 export type Subcommand =
@@ -163,10 +168,11 @@ function parseServeOptions(args: string[]): ServeOptions {
     hostname: "127.0.0.1",
     port: 4096,
     cors: [],
-    mdns: false,
-    mdnsDomain: null,
     verbose: false,
     disablePtyTokenCheck: false,
+    disableV1Compatible: false,
+    msgPartEncap: false,
+    apiVersion: DEFAULT_API_VERSION,
   }
 
   let i = 0
@@ -209,10 +215,6 @@ function parseServeOptions(args: string[]): ServeOptions {
         i += 2
         break
       }
-      case "--mdns":
-        options.mdns = true
-        i++
-        break
       case "--verbose":
         options.verbose = true
         i++
@@ -221,12 +223,23 @@ function parseServeOptions(args: string[]): ServeOptions {
         options.disablePtyTokenCheck = true
         i++
         break
-      case "--mdns-domain": {
+      case "--disable-v1-compatible":
+        options.disableV1Compatible = true
+        i++
+        break
+      case "--msg-part-encap":
+        options.msgPartEncap = true
+        i++
+        break
+      case "--api-version": {
         const value = args[i + 1]
         if (value === undefined) {
-          throw new ParseError("--mdns-domain requires a value")
+          throw new ParseError("--api-version requires a value: v1|v2")
         }
-        options.mdnsDomain = value
+        if (value !== "v1" && value !== "v2") {
+          throw new ParseError(`Invalid api version: ${value}. Expected v1 or v2`)
+        }
+        options.apiVersion = value
         i += 2
         break
       }
@@ -252,6 +265,15 @@ function parseServeOptions(args: string[]): ServeOptions {
         }
         if (arg.startsWith("--cors=")) {
           options.cors.push(arg.slice("--cors=".length))
+          i++
+          break
+        }
+        if (arg.startsWith("--api-version=")) {
+          const value = arg.slice("--api-version=".length)
+          if (value !== "v1" && value !== "v2") {
+            throw new ParseError(`Invalid api version: ${value}. Expected v1 or v2`)
+          }
+          options.apiVersion = value
           i++
           break
         }
@@ -311,9 +333,10 @@ export function formatHelp(): string {
     "  --port <PORT>            Listen port (default: 4096)",
     "  --cors <ORIGIN>          Allowed CORS origin (repeatable)",
     "  --verbose                Print HTTP requests and debug logs to stderr",
-    "  --mdns                   Enable mDNS (not yet implemented, prints warning)",
-    "  --mdns-domain <DOMAIN>   mDNS domain (not yet implemented)",
     "  --disable-pty-token-check  Skip the PTY WebSocket connect-ticket check",
+    "  --disable-v1-compatible   Do not mount the v1-compatible routes (GET /config, DELETE /session/:id)",
+    "  --msg-part-encap         Put each generated assistant part in its own message",
+    "  --api-version <VERSION>  API surface to expose: v1 or v2 (default: v2)",
     "",
     "ENVIRONMENT:",
     "  OPENCODE_SERVER_USERNAME    HTTP Basic Auth username",

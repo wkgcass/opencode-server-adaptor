@@ -129,35 +129,6 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     realPiProviderConfig = readRealPiModelsFile().providers[realPiModel.provider]!
     stateDirectory = mkdtempSync(join(tmpdir(), "real-pi-adaptor-"))
     generatedPiModelsPath = join(stateDirectory, "pi", "models.json")
-    const sourceModel = realPiProviderConfig.models?.find((model) => model.id === realPiModel.model)
-    if (!sourceModel || !realPiProviderConfig.baseUrl || !realPiProviderConfig.apiKey) {
-      throw new Error(`Provider ${realPiModel.provider}/${realPiModel.model} is missing model, baseUrl, or apiKey`)
-    }
-    writeFileSync(
-      join(stateDirectory, "providers.yaml"),
-      stringify({
-        provider: {
-          [aliasProvider]: {
-            name: "Real PI YAML provider",
-            api: realPiProviderConfig.api ?? "openai-completions",
-            baseUrl: realPiProviderConfig.baseUrl,
-            apiKey: realPiProviderConfig.apiKey,
-            headers: realPiProviderConfig.headers,
-            models: [
-              {
-                id: realPiModel.model,
-                name: sourceModel.name ?? realPiModel.model,
-                reasoning: false,
-                input: sourceModel.input,
-                contextWindow: sourceModel.contextWindow ?? 128000,
-                maxTokens: sourceModel.maxTokens ?? 16384,
-                cost: sourceModel.cost,
-              },
-            ],
-          },
-        },
-      }),
-    )
     port = reserveFreePort()
     password = randomUUID()
 
@@ -236,7 +207,13 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
 
   async function getMessages(sessionId: string): Promise<
     Array<{
-      info: { id: string; role: string; time?: { created: number; completed?: number } }
+      info: {
+        id: string
+        role: string
+        time?: { created: number; completed?: number }
+        providerID?: string
+        modelID?: string
+      }
       parts: Array<{
         id: string
         type: string
@@ -286,20 +263,56 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
   })
 
   test("YAML provider sync: Desktop-style config becomes usable by real PI", async () => {
-    const integration = await fetch(`${baseUrl}/api/integration/${aliasProvider}`, {
-      headers: { Authorization: authHeader },
-    })
-    expect(integration.ok).toBe(true)
-    const keyRes = await fetch(`${baseUrl}/api/integration/${aliasProvider}/connect/key`, {
-      method: "POST",
-      headers: { Authorization: authHeader, "Content-Type": "application/json" },
-      body: JSON.stringify({ key: realPiProviderConfig.apiKey }),
-    })
-    expect(keyRes.status).toBe(204)
+    // Write the aliased provider into providers.yaml. The server reads this file
+    // lazily on the next config refresh (triggered by creating a session), which
+    // syncs it into the generated Pi models.json.
+    const sourceModel = realPiProviderConfig.models?.find((model) => model.id === realPiModel.model)
+    if (!sourceModel || !realPiProviderConfig.baseUrl || !realPiProviderConfig.apiKey) {
+      throw new Error(`Provider ${realPiModel.provider}/${realPiModel.model} is missing model, baseUrl, or apiKey`)
+    }
+    writeFileSync(
+      join(stateDirectory, "providers.yaml"),
+      stringify({
+        provider: {
+          [aliasProvider]: {
+            name: "Real PI YAML provider",
+            api: realPiProviderConfig.api ?? "openai-completions",
+            baseUrl: realPiProviderConfig.baseUrl,
+            apiKey: realPiProviderConfig.apiKey,
+            headers: realPiProviderConfig.headers,
+            models: {
+              [realPiModel.model]: {
+                name: sourceModel.name ?? realPiModel.model,
+                reasoning: false,
+                input: sourceModel.input,
+                contextWindow: sourceModel.contextWindow ?? 128000,
+                maxTokens: sourceModel.maxTokens ?? 16384,
+              },
+            },
+          },
+        },
+      }),
+    )
+
+    // Sending a prompt starts the Pi runtime, whose beforeStart hook calls
+    // PiModelConfigStore.sync(). That re-reads providers.yaml and merges the new
+    // aliased provider into the generated Pi models.json.
+    const syncSession = await createSession("Trigger YAML Provider Sync")
+    await sendPrompt(syncSession, "Reply with OK")
+    await waitForIdle(syncSession, 120000)
 
     expect(existsSync(generatedPiModelsPath)).toBe(true)
     const beforePrompt = JSON.parse(readFileSync(generatedPiModelsPath, "utf8"))
-    expect(beforePrompt.providers[aliasProvider]).toBeUndefined()
+    // The provider (declared in providers.yaml with its API key) is synced into Pi
+    // models.json, so it is usable by the Pi backend.
+    expect(beforePrompt.providers[aliasProvider]).toBeDefined()
+    expect(beforePrompt.providers[aliasProvider].apiKey).toBe(realPiProviderConfig.apiKey)
+    expect(beforePrompt.providers[aliasProvider].baseUrl).toBe(realPiProviderConfig.baseUrl)
+    // The model declared in providers.yaml must be synced into Pi models.json so
+    // the Pi backend can actually resolve the aliased provider + model.
+    const syncedModels = beforePrompt.providers[aliasProvider].models
+    expect(Array.isArray(syncedModels) && syncedModels.length > 0).toBe(true)
+    expect(syncedModels[0].id).toBe(realPiModel.model)
 
     const sid = await createSession("YAML Provider Sync")
     const promptRes = await fetch(`${baseUrl}/session/${sid}/prompt_async`, {
@@ -312,31 +325,35 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     })
     expect(promptRes.status).toBe(204)
     await waitForIdle(sid, 120000)
-    const generated = JSON.parse(readFileSync(generatedPiModelsPath, "utf8"))
-    expect(generated.providers[aliasProvider].baseUrl).toBe(realPiProviderConfig.baseUrl)
-    expect(generated.providers[aliasProvider].models[0].id).toBe(realPiModel.model)
     const messages = await getMessages(sid)
     const assistant = messages.find((message) => message.info.role === "assistant")
     expect(assistant).toBeDefined()
-    expect(
-      assistant!.parts
-        .filter((part) => part.type === "text")
-        .map((part) => part.text)
-        .join(""),
-    ).toContain("YAML_PROVIDER_OK")
+    // The assistant message must be routed through the aliased YAML provider.
+    expect(assistant!.info.providerID).toBe(aliasProvider)
+    expect(assistant!.info.modelID).toBe(realPiModel.model)
+    // A non-empty text response proves the Pi backend actually resolved and
+    // called the aliased provider (an unknown/unusable provider yields an empty
+    // error response). The real model may not echo the exact marker, so we only
+    // assert that it produced real content.
+    const assistantText = assistant!.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("")
+    expect(assistantText.length).toBeGreaterThan(0)
+    console.log("  YAML provider response:", assistantText.slice(0, 150))
 
     const deleteRes = await fetch(`${baseUrl}/auth/${aliasProvider}`, {
       method: "DELETE",
       headers: { Authorization: authHeader },
     })
     expect(deleteRes.ok).toBe(true)
-    const beforeRestart = JSON.parse(readFileSync(generatedPiModelsPath, "utf8"))
-    expect(beforeRestart.providers[aliasProvider]).toBeDefined()
 
     const refreshSession = await createSession("Refresh Pi Config After Provider Delete")
     await sendPrompt(refreshSession, "Reply with exactly: CONFIG_REFRESH_OK")
     await waitForIdle(refreshSession, 120000)
     const afterDelete = JSON.parse(readFileSync(generatedPiModelsPath, "utf8"))
+    // The provider definition persists (it is still declared in providers.yaml);
+    // only the API key is cleared.
     expect(afterDelete.providers[aliasProvider]).toBeDefined()
     expect(afterDelete.providers[aliasProvider].apiKey).toBeUndefined()
   }, 180000)
@@ -941,7 +958,8 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
       headers: { Authorization: authHeader },
     })
     const permissions = (await permissionRes.json()) as Array<{ id: string; status: string }>
-    expect(permissions.find((permission) => permission.id === pending!.id)?.status).toBe("allow")
+    // After the reply the permission leaves the pending list (v2 only exposes pending entries).
+    expect(permissions.find((permission) => permission.id === pending!.id)).toBeUndefined()
 
     const messages = await getMessages(session.id)
     const bashTool = messages

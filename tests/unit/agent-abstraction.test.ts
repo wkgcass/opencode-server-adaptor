@@ -36,7 +36,7 @@ describe("agent backend abstractions", () => {
     const logger = new Logger({ minLevel: "ERROR" })
     const db = new DatabaseService(join(directory, "test.db"), logger)
     const sessions = new SessionRepository(db, "1.18.7")
-    const messages = new MessageRepository(db)
+    const messages = new MessageRepository(db, sessions)
     const events = new EventBus(logger)
     const nativeRunner = new FakeNativeSubagentRunner()
     const registry = new AgentAdapterRegistry()
@@ -51,6 +51,7 @@ describe("agent backend abstractions", () => {
     const manager = new SubtaskManager(registry, sessions, messages, events, logger, config)
 
     const parent = sessions.create({ directory, agent: "native-test" })
+    sessions.enableWideIds(parent.id)
     const user = messages.createUserMessage(parent.id, parent.agent)
     const assistant = messages.createAssistantMessage(parent.id, user.id, parent.agent)
     const tool = messages.createPart(parent.id, assistant.id, "tool", {
@@ -79,6 +80,15 @@ describe("agent backend abstractions", () => {
     const childAssistant = messages
       .listMessages(handle.childSessionId)
       .find((message) => message.info.role === "assistant")
+    expect(sessions.getIdFormat(handle.childSessionId)).toBe("wide")
+    expect(
+      messages
+        .listMessages(handle.childSessionId)
+        .every(
+          (message) =>
+            message.info.id.startsWith("msg_-") && message.parts.every((part) => part.id.startsWith("prt_-")),
+        ),
+    ).toBe(true)
     expect(childAssistant?.parts).toEqual(
       expect.arrayContaining([expect.objectContaining({ type: "text", text: "native child result" })]),
     )

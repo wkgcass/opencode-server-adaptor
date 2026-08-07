@@ -84,6 +84,45 @@ function toolResultText(result: { content?: Array<{ type?: string; text?: string
   )
 }
 
+/**
+ * Pi's edit tool returns a unified patch in `details.patch`. The OpenCode
+ * desktop edit card reads the diff from `metadata.filediff` (a Snapshot.FileDiff
+ * shaped object), so the Pi-specific mapping layer promotes the patch into
+ * that structure. This stays inside the Pi mapper (not the generic
+ * AgentService) so OpenCode HTTP field names do not leak across the backend
+ * boundary.
+ *
+ * additions/deletions are counted from the unified-patch hunk lines so the
+ * desktop can render the +/- badge without a separate diff dependency.
+ */
+function buildFileDiffMetadata(
+  tool: string,
+  input: Record<string, unknown>,
+  details: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!details) return undefined
+  const result: Record<string, unknown> = { ...details }
+  if (tool !== "edit") return result
+  const patch = details.patch
+  if (typeof patch !== "string" || patch.length === 0) return result
+  let additions = 0
+  let deletions = 0
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue
+    if (line.startsWith("+")) additions++
+    else if (line.startsWith("-")) deletions++
+  }
+  const file = typeof input.filePath === "string" ? input.filePath : typeof input.path === "string" ? input.path : ""
+  result.filediff = {
+    file,
+    patch,
+    additions,
+    deletions,
+    status: "modified",
+  }
+  return result
+}
+
 function splitSubtaskDetails(details: Record<string, unknown> | undefined): {
   metadata: Record<string, unknown> | undefined
   childEvent: Record<string, unknown> | undefined
@@ -245,7 +284,7 @@ export class PiToOpenCodeEventMapper {
     toolCall.terminal = true
     const output = toolResultText(result)
     toolCall.output = output
-    toolCall.metadata = result?.details
+    toolCall.metadata = buildFileDiffMetadata(toolCall.tool, toolCall.input, result?.details as Record<string, unknown> | undefined)
 
     if (isError || result?.isError) {
       ensured.events.push({
@@ -257,7 +296,7 @@ export class PiToOpenCodeEventMapper {
         tool: toolCall.tool,
         input: toolCall.input,
         error: output || "Tool execution failed",
-        metadata: result?.details,
+        metadata: toolCall.metadata,
       })
       return ensured.events
     }
@@ -272,7 +311,7 @@ export class PiToOpenCodeEventMapper {
       input: toolCall.input,
       output,
       title: toolCall.tool,
-      metadata: result?.details,
+      metadata: toolCall.metadata,
     })
     return ensured.events
   }
@@ -710,8 +749,9 @@ export class PiToOpenCodeEventMapper {
           | undefined
         const output = toolResultText(partialResult)
         const details = splitSubtaskDetails(partialResult?.details)
+        const fileDiffMetadata = buildFileDiffMetadata(ensured.toolCall.tool, ensured.toolCall.input, details.metadata)
         ensured.toolCall.output = output
-        ensured.toolCall.metadata = details.metadata
+        ensured.toolCall.metadata = fileDiffMetadata
         ensured.events.push({
           type: "tool_call_progress",
           sessionId: ctx.sessionId,
@@ -719,7 +759,7 @@ export class PiToOpenCodeEventMapper {
           partId: ensured.toolCall.partId,
           callId: toolCallId,
           output,
-          metadata: details.metadata,
+          metadata: fileDiffMetadata,
         })
         if (ensured.toolCall.tool === "task" && details.childEvent) {
           for (const childEvent of this.mapSubtaskEvent(toolCallId, details.childEvent)) {

@@ -7,7 +7,8 @@ import { createEvent } from "../event/index.ts"
 import type { SessionEventStore } from "../event/session-event-store.ts"
 import type { MessageRepository, MessageWithParts, Part } from "../message/index.ts"
 import type { Session, SessionRepository } from "./index.ts"
-import { buildDefaultProviderMap, buildProviders, type BuiltinProviderDefinition } from "../api/provider.ts"
+import { buildDefaultProviderMap, buildProviders, type BuiltinProviderDefinition } from "../provider/index.ts"
+import { runShellCommand } from "./shell-runner.ts"
 
 export interface SessionPromptPartInput extends Record<string, unknown> {
   type: string
@@ -25,6 +26,13 @@ export interface SessionPromptRequest {
   directory?: string
   delivery?: "steer" | "queue"
   resume?: boolean
+}
+
+export interface SessionShellRequest {
+  messageID?: string
+  agent?: string
+  model?: { providerID: string; modelID: string; variant?: string }
+  command: string
 }
 
 export interface SessionPromptAdmission {
@@ -142,7 +150,7 @@ export class SessionService {
       this.appendSessionEvent(sessionID, "session.next.agent.switched", {
         timestamp: Date.now(),
         sessionID,
-        messageID: crypto.randomUUID(),
+        messageID: this.messages.nextMessageId(sessionID),
         agent: input.agent,
       })
     }
@@ -153,7 +161,7 @@ export class SessionService {
       this.appendSessionEvent(sessionID, "session.next.model.switched", {
         timestamp: Date.now(),
         sessionID,
-        messageID: crypto.randomUUID(),
+        messageID: this.messages.nextMessageId(sessionID),
         model: input.model,
       })
     }
@@ -236,7 +244,7 @@ export class SessionService {
       this.appendSessionEvent(sessionID, "session.next.revert.committed", {
         timestamp: Date.now(),
         sessionID,
-        messageID: crypto.randomUUID(),
+        messageID: this.messages.nextMessageId(sessionID),
       })
     } catch (error) {
       throw this.conversationError(error)
@@ -259,6 +267,7 @@ export class SessionService {
         resource: input.messageID,
       })
     }
+    this.enableWideIdsFromMessage(sessionID, input.messageID)
 
     const selectedModel =
       input.model ??
@@ -449,17 +458,123 @@ export class SessionService {
     if (!admitted.assistantMessageID) {
       throw new SessionServiceError("conflict", "Prompt was admitted without execution")
     }
-    const deadline = Date.now() + this.config.agentRpcTimeoutMs
-    while (Date.now() < deadline) {
-      if (signal?.aborted) throw new SessionServiceError("conflict", "Request aborted")
-      const info = this.messages.getMessage(admitted.assistantMessageID)
-      if (info?.role === "assistant" && (info.time.completed !== undefined || info.error !== undefined)) {
-        return { info, parts: this.messages.listParts(info.id) }
+    try {
+      await this.wait(sessionID, signal)
+    } catch (error) {
+      if (error instanceof SessionServiceError && error.code === "unavailable") {
+        await this.agentService.abort(sessionID)
       }
-      await Bun.sleep(20)
+      throw error
     }
-    await this.agentService.abort(sessionID)
-    throw new SessionServiceError("unavailable", "Timed out waiting for assistant message")
+    const terminal = this.messages
+      .listMessages(sessionID)
+      .findLast((message) => message.info.role === "assistant" && message.info.parentID === admitted.id)
+    if (!terminal) throw new SessionServiceError("message_not_found", "Assistant message was not persisted")
+    return terminal
+  }
+
+  /**
+   * Execute a shell command directly (shell mode). The command never goes
+   * through the model; it is recorded as an assistant `bash` tool part so it
+   * renders in the Desktop timeline and persists for later context, mirroring
+   * OpenCode's native `SessionPrompt.shell`. The Desktop client treats this
+   * endpoint as fire-and-forget (204), so command execution continues after
+   * the response is sent and progress is streamed via message events.
+   */
+  shell(sessionID: string, input: SessionShellRequest): void {
+    if (typeof input.command !== "string" || input.command.trim().length === 0) {
+      throw new SessionServiceError("invalid_request", "command is required")
+    }
+    const session = this.requireSession(sessionID)
+    this.enableWideIdsFromMessage(sessionID, input.messageID)
+    const selectedModel =
+      input.model ??
+      (session.model
+        ? { providerID: session.model.providerID, modelID: session.model.id, variant: session.model.variant }
+        : undefined)
+    const model = this.resolveModel(selectedModel)
+    if (!model) throw new SessionServiceError("invalid_request", "No model configured")
+    const agent = input.agent?.trim() || session.agent
+    if (!this.agentService.hasAgent(agent)) {
+      throw new SessionServiceError("invalid_request", `Agent not found: ${agent}`)
+    }
+
+    const user = this.messages.createUserMessage(sessionID, agent, model, input.messageID)
+    const userTextPart = this.messages.createPart(sessionID, user.id, "text", {
+      text: "The following tool was executed by the user",
+      time: { start: Date.now() },
+      synthetic: true,
+    })
+    this.publishMessage(user)
+    // Shell mode is fire-and-forget on the client (no optimistic message), so
+    // the user-side text part must be streamed explicitly to render.
+    this.publishPart(userTextPart.id)
+
+    const assistant = this.messages.createAssistantMessage(sessionID, user.id, agent, model)
+    this.publishMessage(assistant)
+
+    const callID = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`
+    const started = Date.now()
+    const toolPart = this.messages.createPart(sessionID, assistant.id, "tool", {
+      callID,
+      tool: "bash",
+      state: {
+        status: "running",
+        input: { command: input.command },
+        time: { start: started },
+      },
+    })
+    this.publishPart(toolPart.id)
+
+    void this.executeShell(assistant.id, toolPart.id, input.command, session.directory, started)
+  }
+
+  private async executeShell(
+    assistantMessageId: string,
+    toolPartId: string,
+    command: string,
+    cwd: string,
+    started: number,
+  ): Promise<void> {
+    let lastPublish = 0
+    const result = await runShellCommand(command, {
+      cwd,
+      onOutput: (_chunk, accumulated) => {
+        const now = Date.now()
+        if (now - lastPublish < 150) return
+        lastPublish = now
+        const current = this.messages.getPart(toolPartId)
+        if (!current || current.type !== "tool") return
+        this.messages.updatePart(toolPartId, {
+          state: { ...current.state, output: accumulated, metadata: { output: accumulated } },
+        })
+        this.publishPart(toolPartId)
+      },
+    })
+
+    const completed = Date.now()
+    const current = this.messages.getPart(toolPartId)
+    const baseState =
+      current && current.type === "tool" ? current.state : { status: "running" as const, input: { command } }
+    const failed = result.error !== undefined
+    this.messages.updatePart(toolPartId, {
+      state: {
+        ...baseState,
+        status: failed ? "error" : "completed",
+        input: { command },
+        output: result.output,
+        ...(failed ? { error: result.error } : {}),
+        metadata: { output: result.output, exitCode: result.exitCode },
+        time: { start: started, end: completed },
+      },
+    })
+    this.publishPart(toolPartId)
+    this.messages.completeMessage(assistantMessageId, failed ? "error" : "stop")
+    this.publishMessage(this.messages.getMessage(assistantMessageId)!)
+  }
+
+  private enableWideIdsFromMessage(sessionID: string, messageID: string | undefined): void {
+    if (messageID?.startsWith("msg_-")) this.sessions.enableWideIds(sessionID)
   }
 
   requireSession(sessionID: string): Session {
@@ -482,6 +597,12 @@ export class SessionService {
 
   private publishMessage(info: MessageWithParts["info"]): void {
     this.events.publish(createEvent("message.updated", { sessionID: info.sessionID, info }))
+  }
+
+  private publishPart(partId: string): void {
+    const part = this.messages.getPart(partId)
+    if (!part) return
+    this.events.publish(createEvent("message.part.updated", { sessionID: part.sessionID, part, time: Date.now() }))
   }
 
   private publishStatus(sessionID: string, status: "busy" | "idle"): void {

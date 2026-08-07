@@ -61,10 +61,11 @@ describe("CLI Parser", () => {
           hostname: "127.0.0.1",
           port: 4096,
           cors: [],
-          mdns: false,
-          mdnsDomain: null,
           verbose: false,
           disablePtyTokenCheck: false,
+          disableV1Compatible: false,
+          msgPartEncap: false,
+          apiVersion: "v2",
         },
       })
     })
@@ -90,10 +91,11 @@ describe("CLI Parser", () => {
           hostname: "0.0.0.0",
           port: 4096,
           cors: [],
-          mdns: false,
-          mdnsDomain: null,
           verbose: false,
           disablePtyTokenCheck: false,
+          disableV1Compatible: false,
+          msgPartEncap: false,
+          apiVersion: "v2",
         },
       })
     })
@@ -152,10 +154,11 @@ describe("CLI Parser", () => {
           hostname: "127.0.0.1",
           port: 4096,
           cors: [],
-          mdns: false,
-          mdnsDomain: null,
           verbose: false,
           disablePtyTokenCheck: false,
+          disableV1Compatible: false,
+          msgPartEncap: false,
+          apiVersion: "v2",
         },
       })
     })
@@ -208,14 +211,6 @@ describe("CLI Parser", () => {
       }
     })
 
-    test("serve with --mdns", () => {
-      const result = parseArgs(["node", "opencode", "serve", "--mdns"])
-      expect(result.subcommand?.type).toBe("serve")
-      if (result.subcommand?.type === "serve") {
-        expect(result.subcommand.options.mdns).toBe(true)
-      }
-    })
-
     test("serve with --verbose (after serve)", () => {
       const result = parseArgs(["node", "opencode", "serve", "--verbose", "--port", "8080"])
       expect(result.subcommand?.type).toBe("serve")
@@ -234,19 +229,41 @@ describe("CLI Parser", () => {
       }
     })
 
-    test("serve with --mdns-domain", () => {
-      const result = parseArgs(["node", "opencode", "serve", "--mdns-domain", "local"])
-      expect(result.subcommand?.type).toBe("serve")
-      if (result.subcommand?.type === "serve") {
-        expect(result.subcommand.options.mdnsDomain).toBe("local")
-      }
-    })
-
     test("serve with --disable-pty-token-check", () => {
       const result = parseArgs(["node", "opencode", "serve", "--disable-pty-token-check"])
       expect(result.subcommand?.type).toBe("serve")
       if (result.subcommand?.type === "serve") {
         expect(result.subcommand.options.disablePtyTokenCheck).toBe(true)
+      }
+    })
+
+    test("serve with --disable-v1-compatible", () => {
+      const result = parseArgs(["node", "opencode", "serve", "--disable-v1-compatible"])
+      expect(result.subcommand?.type).toBe("serve")
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.disableV1Compatible).toBe(true)
+      }
+    })
+
+    test("serve defaults disableV1Compatible to false", () => {
+      const result = parseArgs(["node", "opencode", "serve"])
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.disableV1Compatible).toBe(false)
+      }
+    })
+
+    test("serve with --msg-part-encap", () => {
+      const result = parseArgs(["node", "opencode", "serve", "--msg-part-encap"])
+      expect(result.subcommand?.type).toBe("serve")
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.msgPartEncap).toBe(true)
+      }
+    })
+
+    test("serve defaults msgPartEncap to false", () => {
+      const result = parseArgs(["node", "opencode", "serve"])
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.msgPartEncap).toBe(false)
       }
     })
 
@@ -316,10 +333,47 @@ describe("CLI Parser", () => {
       expect(() => parseArgs(["node", "opencode", "serve", "--unknown"])).toThrow(ParseError)
     })
 
-    test("removed API version option is rejected", () => {
-      expect(() => parseArgs(["node", "opencode", "serve", "--api-version=v2"])).toThrow(
-        "Unknown serve option: --api-version=v2",
-      )
+    test("--mdns is rejected as unknown", () => {
+      expect(() => parseArgs(["node", "opencode", "serve", "--mdns"])).toThrow(ParseError)
+    })
+
+    test("--mdns-domain is rejected as unknown", () => {
+      expect(() => parseArgs(["node", "opencode", "serve", "--mdns-domain", "local"])).toThrow(ParseError)
+    })
+
+    test("--api-version=v2 selects v2", () => {
+      const result = parseArgs(["node", "opencode", "serve", "--api-version=v2"])
+      expect(result.subcommand?.type).toBe("serve")
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.apiVersion).toBe("v2")
+      }
+    })
+
+    test("--api-version=v1 selects v1", () => {
+      const result = parseArgs(["node", "opencode", "serve", "--api-version=v1"])
+      expect(result.subcommand?.type).toBe("serve")
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.apiVersion).toBe("v1")
+      }
+    })
+
+    test("--api-version space syntax", () => {
+      const result = parseArgs(["node", "opencode", "serve", "--api-version", "v1"])
+      expect(result.subcommand?.type).toBe("serve")
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.apiVersion).toBe("v1")
+      }
+    })
+
+    test("invalid --api-version throws", () => {
+      expect(() => parseArgs(["node", "opencode", "serve", "--api-version=v3"])).toThrow(ParseError)
+    })
+
+    test("api version defaults to v2", () => {
+      const result = parseArgs(["node", "opencode", "serve"])
+      if (result.subcommand?.type === "serve") {
+        expect(result.subcommand.options.apiVersion).toBe("v2")
+      }
     })
 
     test("unknown command", () => {
@@ -338,7 +392,8 @@ describe("CLI Parser", () => {
       expect(help).toContain("version")
       expect(help).toContain("--print-logs")
       expect(help).toContain("--verbose")
-      expect(help).not.toContain("--api-version")
+      expect(help).toContain("--api-version")
+      expect(help).toContain("--msg-part-encap")
     })
   })
 })

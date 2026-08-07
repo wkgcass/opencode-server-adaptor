@@ -1,6 +1,13 @@
 import type { DatabaseService } from "../db/index.ts"
 import type { MessageRow, PartRow } from "../db/index.ts"
-import { createMessageId, createMessageIdAfter, createPartId } from "../id/index.ts"
+import {
+  createMessageId,
+  createMessageIdAfter,
+  createPartId,
+  observeOrderedId,
+  orderedIdFormat,
+  type OrderedIdFormat,
+} from "../id/index.ts"
 
 export interface UserMessage {
   id: string
@@ -121,12 +128,8 @@ function isTerminalToolStatus(status: string | undefined): boolean {
   return status === "completed" || status === "error" || status === "aborted"
 }
 
-function generateMessageId(): string {
-  return createMessageId()
-}
-
-function generatePartId(): string {
-  return createPartId()
+export interface SessionIdFormatResolver {
+  getIdFormat(sessionId: string): OrderedIdFormat
 }
 
 function rowToMessage(row: MessageRow): Message {
@@ -230,7 +233,18 @@ function rowToPart(row: PartRow): Part {
 }
 
 export class MessageRepository {
-  constructor(private readonly db: DatabaseService) {}
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly idFormats?: SessionIdFormatResolver,
+  ) {}
+
+  private idFormat(sessionId: string): OrderedIdFormat {
+    return this.idFormats?.getIdFormat(sessionId) ?? "legacy"
+  }
+
+  nextMessageId(sessionId: string): string {
+    return createMessageId(undefined, this.idFormat(sessionId))
+  }
 
   private finalizeOpenTextParts(messageId: string, end: number): void {
     const rows = this.db
@@ -312,6 +326,18 @@ export class MessageRepository {
     return count
   }
 
+  recoverOpenAssistantMessages(reason: string): number {
+    const rows = this.db
+      .prepare(
+        "SELECT id FROM messages WHERE role = 'assistant' AND completed_at IS NULL ORDER BY created_at ASC, rowid ASC",
+      )
+      .all() as Array<{ id: string }>
+    for (const row of rows) {
+      this.setMessageError(row.id, { type: "interrupted", message: reason })
+    }
+    return rows.length
+  }
+
   createUserMessage(
     sessionId: string,
     agent: string,
@@ -319,7 +345,10 @@ export class MessageRepository {
     requestedId?: string,
     details?: { system?: string; tools?: Record<string, boolean> },
   ): UserMessage {
-    const id = requestedId?.trim() || generateMessageId()
+    const requested = requestedId?.trim()
+    if (requested) observeOrderedId(requested)
+    const format = requested && orderedIdFormat(requested) === "wide" ? "wide" : this.idFormat(sessionId)
+    const id = requested || createMessageId(undefined, format)
     const now = Date.now()
     const providerID = model?.providerID ?? agent
     const modelID = model?.modelID ?? "default"
@@ -351,9 +380,10 @@ export class MessageRepository {
     parentId: string,
     agent: string,
     model?: { providerID: string; modelID: string },
+    afterId?: string,
   ): AssistantMessage {
     const now = Date.now()
-    const id = createMessageIdAfter(parentId)
+    const id = createMessageIdAfter(afterId ?? parentId, this.idFormat(sessionId))
     const providerID = model?.providerID ?? agent
     const modelID = model?.modelID ?? "default"
     const session = this.db.prepare("SELECT directory FROM sessions WHERE id = ?").get(sessionId) as {
@@ -493,7 +523,9 @@ export class MessageRepository {
     data: Omit<Part, "id" | "sessionID" | "messageID" | "type">,
     requestedId?: string,
   ): Part {
-    const id = requestedId?.trim() || generatePartId()
+    const requested = requestedId?.trim()
+    if (requested) observeOrderedId(requested)
+    const id = requested || createPartId(undefined, this.idFormat(sessionId))
     const now = Date.now()
     const partData: Record<string, unknown> = { ...data }
     this.db

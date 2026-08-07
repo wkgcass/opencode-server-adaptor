@@ -2,15 +2,11 @@ import { Hono } from "hono"
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs"
 import { basename, join, relative, resolve, sep } from "node:path"
 import type { AgentAdapterRegistry } from "../../agents/registry.ts"
-import type { AgentService } from "../../agents/agent-service.ts"
 import type { AppConfig } from "../../config/index.ts"
 import type { ProviderConfigStore } from "../../config/provider-config.ts"
-import type { DatabaseService, PermissionRow } from "../../db/index.ts"
-import type { EventBus } from "../../event/index.ts"
-import { createEvent } from "../../event/index.ts"
 import { projectIDForDirectory } from "../../project/index.ts"
 import type { SessionService } from "../../session/session-service.ts"
-import type { ProviderConfigChangeListener } from "../provider-config.ts"
+import type { ProviderConfigChangeListener } from "../../config/provider-config.ts"
 import { buildProviders, type BuiltinProviderDefinition, type ProviderInfo, type ProviderModel } from "../provider.ts"
 import type { PtyManager } from "../pty-manager.ts"
 import { requestDirectory } from "../request-directory.ts"
@@ -42,9 +38,6 @@ export function createV2Routes(options: {
   providerConfig: ProviderConfigStore
   builtinProviders: readonly BuiltinProviderDefinition[]
   sessions: SessionService
-  db: DatabaseService
-  agentService: AgentService
-  events: EventBus
   ptys: PtyManager
   defaultAdapterType: string
   providerConfigListeners?: readonly ProviderConfigChangeListener[]
@@ -143,18 +136,31 @@ export function createV2Routes(options: {
       return c.json({ _tag: "InvalidRequestError", message: `Agent adapter type not found: ${type}` }, 400)
     }
     const description = typeof body.description === "string" && body.description.trim() ? body.description.trim() : id
+    const provider = typeof body.provider === "string" ? body.provider : undefined
+    const model = typeof body.model === "string" ? body.model : undefined
+    const systemPrompt = typeof body.systemPrompt === "string" ? body.systemPrompt : undefined
+    const tools = Array.isArray(body.tools)
+      ? body.tools.filter((tool): tool is string => typeof tool === "string")
+      : undefined
     const adapter = options.registry.create(type, {
       id,
       displayName: description,
       cliPath,
-      provider: typeof body.provider === "string" ? body.provider : undefined,
-      model: typeof body.model === "string" ? body.model : undefined,
-      systemPrompt: typeof body.systemPrompt === "string" ? body.systemPrompt : undefined,
-      tools: Array.isArray(body.tools)
-        ? body.tools.filter((tool): tool is string => typeof tool === "string")
-        : undefined,
+      provider,
+      model,
+      systemPrompt,
+      tools,
     })
     options.registry.register(adapter)
+    adapter.subagents?.registerProfile?.({
+      name: id,
+      description,
+      command: cliPath,
+      provider,
+      model,
+      tools,
+      systemPrompt,
+    })
     return c.json(
       {
         location: location(c),
@@ -383,8 +389,7 @@ export function createV2Routes(options: {
 
   app.get("/api/project", (c) => {
     const requested = directory(c)
-    const rows = options.db.prepare("SELECT DISTINCT directory FROM sessions").all() as Array<{ directory: string }>
-    const directories = [requested, ...rows.map((row) => resolve(row.directory))]
+    const directories = [requested, ...options.sessions.sessions.listDirectories()]
     return c.json([...new Set(directories)].map(projectInfo))
   })
   app.get("/api/project/current", (c) => {
@@ -393,153 +398,12 @@ export function createV2Routes(options: {
   })
   app.get("/api/project/:projectID/directories", (c) => {
     const requested = directory(c)
-    const rows = options.db.prepare("SELECT DISTINCT directory FROM sessions").all() as Array<{ directory: string }>
-    const directories = [requested, ...rows.map((row) => resolve(row.directory))]
+    const directories = [requested, ...options.sessions.sessions.listDirectories()]
     return c.json(
       [...new Set(directories)]
         .filter((candidate) => projectIDForDirectory(candidate) === c.req.param("projectID"))
         .map((candidate) => ({ directory: candidate })),
     )
-  })
-
-  app.get("/api/permission/request", (c) => {
-    const rows = options.db
-      .prepare(
-        `SELECT permissions.*
-         FROM permissions
-         JOIN sessions ON sessions.id = permissions.session_id
-         WHERE permissions.status = 'pending' AND sessions.directory = ?
-         ORDER BY permissions.created_at DESC`,
-      )
-      .all(directory(c)) as PermissionRow[]
-    return c.json({ location: location(c), data: rows.map(toV2Permission) })
-  })
-
-  app.get("/api/permission/saved", (c) => c.json({ data: [] }))
-  app.delete("/api/permission/saved/:id", (c) => c.body(null, 204))
-
-  app.get("/api/session/:sessionID/permission", (c) => {
-    try {
-      options.sessions.requireSession(c.req.param("sessionID"))
-      const rows = options.db
-        .prepare("SELECT * FROM permissions WHERE session_id = ? AND status = 'pending' ORDER BY created_at DESC")
-        .all(c.req.param("sessionID")) as PermissionRow[]
-      return c.json({ data: rows.map(toV2Permission) })
-    } catch {
-      return sessionNotFound(c, c.req.param("sessionID"))
-    }
-  })
-
-  app.post("/api/session/:sessionID/permission", async (c) => {
-    const sessionID = c.req.param("sessionID")
-    try {
-      options.sessions.requireSession(sessionID)
-    } catch {
-      return sessionNotFound(c, sessionID)
-    }
-    const body = await c.req.json<Record<string, unknown>>().catch(() => null)
-    if (
-      !body ||
-      typeof body.action !== "string" ||
-      !Array.isArray(body.resources) ||
-      !body.resources.every((resource) => typeof resource === "string")
-    ) {
-      return c.json({ _tag: "InvalidRequestError", message: "action and string resources are required" }, 400)
-    }
-    const id =
-      typeof body.id === "string" && body.id.trim() ? body.id : `per_${crypto.randomUUID().replaceAll("-", "")}`
-    const metadata =
-      typeof body.metadata === "object" && body.metadata ? (body.metadata as Record<string, unknown>) : {}
-    const input = {
-      ...metadata,
-      resources: body.resources,
-      save: Array.isArray(body.save) ? body.save : undefined,
-      source: body.source,
-      agent: body.agent,
-    }
-    try {
-      options.db
-        .prepare(
-          "INSERT INTO permissions (id, session_id, tool, input, status, response, created_at, responded_at, expires_at) VALUES (?, ?, ?, ?, 'pending', NULL, ?, NULL, NULL)",
-        )
-        .run(id, sessionID, body.action, JSON.stringify(input), Date.now())
-    } catch {
-      return c.json({ _tag: "InvalidRequestError", message: `Permission already exists: ${id}` }, 400)
-    }
-    options.events.publish(
-      createEvent("permission.asked", {
-        id,
-        sessionID,
-        permission: body.action,
-        patterns: body.resources,
-        metadata: input,
-        always: Array.isArray(body.save) ? body.save : [],
-      }),
-    )
-    return c.json({ data: { id, effect: "ask" as const } })
-  })
-
-  app.get("/api/session/:sessionID/permission/:requestID", (c) => {
-    try {
-      options.sessions.requireSession(c.req.param("sessionID"))
-    } catch {
-      return sessionNotFound(c, c.req.param("sessionID"))
-    }
-    const row = options.db
-      .prepare("SELECT * FROM permissions WHERE session_id = ? AND id = ? AND status = 'pending'")
-      .get(c.req.param("sessionID"), c.req.param("requestID")) as PermissionRow | null
-    if (!row) {
-      return c.json(
-        {
-          _tag: "PermissionNotFoundError",
-          sessionID: c.req.param("sessionID"),
-          requestID: c.req.param("requestID"),
-          message: `Permission not found: ${c.req.param("requestID")}`,
-        },
-        404,
-      )
-    }
-    return c.json({ data: toV2Permission(row) })
-  })
-
-  app.post("/api/session/:sessionID/permission/:requestID/reply", async (c) => {
-    const body = await c.req.json<Record<string, unknown>>().catch(() => null)
-    if (!body || !["once", "always", "reject"].includes(String(body.reply))) {
-      return c.json({ _tag: "InvalidRequestError", message: "Invalid permission reply" }, 400)
-    }
-    const row = options.db
-      .prepare("SELECT * FROM permissions WHERE session_id = ? AND id = ? AND status = 'pending'")
-      .get(c.req.param("sessionID"), c.req.param("requestID")) as PermissionRow | null
-    if (!row) {
-      try {
-        options.sessions.requireSession(c.req.param("sessionID"))
-      } catch {
-        return sessionNotFound(c, c.req.param("sessionID"))
-      }
-      return c.json(
-        {
-          _tag: "PermissionNotFoundError",
-          sessionID: c.req.param("sessionID"),
-          requestID: c.req.param("requestID"),
-          message: `Permission not found: ${c.req.param("requestID")}`,
-        },
-        404,
-      )
-    }
-    const action = body.reply === "reject" ? "deny" : "allow"
-    const message = typeof body.message === "string" ? body.message : undefined
-    options.db
-      .prepare("UPDATE permissions SET status = ?, response = ?, responded_at = ? WHERE id = ?")
-      .run(action, JSON.stringify({ action, reason: message }), Date.now(), row.id)
-    await options.agentService.respondToPermission(row.session_id, row.id, action, message)
-    options.events.publish(
-      createEvent("permission.replied", {
-        sessionID: row.session_id,
-        requestID: row.id,
-        reply: body.reply,
-      }),
-    )
-    return c.body(null, 204)
   })
 
   app.get("/api/question/request", (c) => c.json({ location: location(c), data: [] }))
@@ -819,20 +683,6 @@ function projectInfo(worktree: string) {
       updated: stat?.mtimeMs || now,
     },
     sandboxes: [] as string[],
-  }
-}
-
-function toV2Permission(row: PermissionRow) {
-  const metadata = JSON.parse(row.input) as Record<string, unknown>
-  const resources = Array.isArray(metadata.resources)
-    ? metadata.resources.filter((value): value is string => typeof value === "string")
-    : []
-  return {
-    id: row.id,
-    sessionID: row.session_id,
-    action: row.tool,
-    resources,
-    metadata,
   }
 }
 

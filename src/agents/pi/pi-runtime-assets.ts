@@ -368,20 +368,26 @@ export default function opencodePlanMode(pi) {
     }
   });
 
-  pi.on("before_agent_start", async () => {
+  pi.on("before_agent_start", async (event) => {
     if (pi.getFlag("plan") !== true) return;
+    // Apply plan-mode instructions as a per-turn system-prompt override rather
+    // than a persistent custom message. A 'message' returned here is persisted
+    // into the Pi session file (as a custom_message entry) and replayed to the
+    // LLM on every subsequent turn. Switching away from the plan agent reuses
+    // the same Pi session file, so those persisted "[PLAN MODE ACTIVE]"
+    // messages would keep telling the model it is still in plan mode even
+    // after the user switches to the normal agent without a system prompt. A
+    // 'systemPrompt' override applies only to the current turn and is never
+    // stored in the session file, so it disappears cleanly on agent switch.
+    const planInstructions = [
+      "[PLAN MODE ACTIVE]",
+      "You are in a read-only exploration mode for safe code analysis.",
+      "Inspect the relevant code before proposing changes.",
+      "Do not edit files or run commands that mutate the workspace.",
+      "Return a concrete numbered plan with file paths, validation steps, and risks.",
+    ].join("\n");
     return {
-      message: {
-        customType: "opencode-plan-mode",
-        content: [
-          "[PLAN MODE ACTIVE]",
-          "You are in a read-only exploration mode for safe code analysis.",
-          "Inspect the relevant code before proposing changes.",
-          "Do not edit files or run commands that mutate the workspace.",
-          "Return a concrete numbered plan with file paths, validation steps, and risks.",
-        ].join("\n"),
-        display: false,
-      },
+      systemPrompt: event.systemPrompt + "\n\n" + planInstructions,
     };
   });
 }

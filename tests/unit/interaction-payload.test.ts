@@ -179,6 +179,65 @@ describe("verbose interaction payload design", () => {
     expect(JSON.stringify(terminal)).not.toContain("final command output")
   })
 
+  test("Pi tool_execution_update slims the nested subtask event prompt/reasoning text", () => {
+    const result = optimizeInteractionPayload(
+      "pi",
+      { stream: "stdout" },
+      {
+        type: "tool_execution_update",
+        toolCallId: "call_1",
+        toolName: "task",
+        partialResult: {
+          content: [{ type: "text", text: "subtask output so far" }],
+          details: {
+            mode: "single",
+            agent: "general",
+            status: "running",
+            description: "write files",
+            __opencode_adaptor_subtask_event: {
+              type: "message_update",
+              assistantMessageEvent: {
+                type: "text_delta",
+                contentIndex: 1,
+                delta: "2",
+                partial: {
+                  role: "assistant",
+                  content: [
+                    { type: "thinking", thinking: "The user wants me to write two files.", thinkingSignature: "reasoning_content" },
+                    { type: "text", text: "已成功执行两条命令。" },
+                  ],
+                  provider: "pi-cmss",
+                  model: "demo-model",
+                  usage: { input: 0, output: 0, totalTokens: 0 },
+                  stopReason: "stop",
+                  timestamp: 1785802272970,
+                  responseId: "chatcmpl-x",
+                },
+              },
+            },
+          },
+        },
+      },
+    )
+    const json = JSON.stringify(result)
+    // Verbose prompt/reasoning text must not be printed.
+    expect(json).not.toContain("The user wants me to write two files.")
+    expect(json).not.toContain("已成功执行两条命令。")
+    expect(json).not.toContain("reasoning_content")
+    // Structure and actionable fields are preserved.
+    expect(json).toContain('"delta":"2"')
+    expect(json).toContain('"description":"write files"')
+    // Content is summarized to lengths, consistent with the top-level content.
+    const details = (result as { details: Record<string, unknown> }).details
+    const childEvent = details.__opencode_adaptor_subtask_event as {
+      assistantMessageEvent: { partial: { content: Array<{ type: string; length?: number }> } }
+    }
+    expect(childEvent.assistantMessageEvent.partial.content).toEqual([
+      { type: "thinking", length: 37 },
+      { type: "text", length: 10 },
+    ])
+  })
+
   test("Pi agent_end reports counts instead of repeating every message", () => {
     const result = optimizeInteractionPayload(
       "pi",

@@ -2,12 +2,14 @@ import type { AgentRuntimeEvent } from "../agent-adapter.ts"
 import type { MessageRepository, ToolPart } from "../../message/index.ts"
 import type { EventBus } from "../../event/index.ts"
 import { createEvent } from "../../event/index.ts"
+import type { AssistantPartProjector } from "../assistant-part-projector.ts"
 
 export interface SubagentEventBridgeContext {
   sessionId: string
   assistantMessageId: string
   messages: MessageRepository
   events: EventBus
+  assistantParts: AssistantPartProjector
 }
 
 /** Persists normalized child-agent runtime events into an OpenCode child session. */
@@ -15,14 +17,14 @@ export class SubagentEventBridge {
   private readonly partIds = new Map<string, string>()
 
   handle(event: AgentRuntimeEvent, context: SubagentEventBridgeContext): void {
-    const { sessionId, assistantMessageId, messages, events } = context
+    const { sessionId, assistantMessageId, messages, events, assistantParts } = context
     const messageId = "messageId" in event ? assistantMessageId : undefined
 
     switch (event.type) {
       case "text_started":
       case "reasoning_started": {
         const type = event.type === "text_started" ? "text" : "reasoning"
-        const part = messages.createPart(sessionId, assistantMessageId, type, {
+        const part = assistantParts.createPart(sessionId, assistantMessageId, type, {
           text: "",
           time: { start: Date.now() },
         })
@@ -55,7 +57,7 @@ export class SubagentEventBridge {
         return
       }
       case "tool_call_started": {
-        const part = messages.createPart(sessionId, assistantMessageId, "tool", {
+        const part = assistantParts.createPart(sessionId, assistantMessageId, "tool", {
           callID: event.callId,
           tool: event.tool,
           state: {
@@ -78,11 +80,12 @@ export class SubagentEventBridge {
           state: {
             ...part.state,
             status: "running",
+            ...("output" in event ? { output: event.output } : {}),
             input: "input" in event ? event.input : part.state.input,
             metadata: {
               ...(part.state.metadata ?? {}),
               ...("metadata" in event ? event.metadata : {}),
-              ...("output" in event ? { partialOutput: event.output } : {}),
+              ...("output" in event ? { output: event.output, partialOutput: event.output } : {}),
             },
             time: { start: part.state.time?.start ?? Date.now() },
           },
@@ -113,10 +116,10 @@ export class SubagentEventBridge {
         return
       }
       case "message_completed":
-        if (messageId) messages.completeMessage(messageId, event.finish ?? "stop")
+        if (messageId) assistantParts.complete(messageId, event.finish ?? "stop", event.usage)
         return
       case "session_error":
-        if (messageId) messages.setMessageError(messageId, event.error)
+        if (messageId) assistantParts.fail(messageId, event.error)
         return
       default:
         return

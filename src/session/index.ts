@@ -3,7 +3,7 @@ import type { SessionRow } from "../db/index.ts"
 import { resolve } from "node:path"
 import { OPENCODE_COMPAT_VERSION } from "../config/index.ts"
 import { projectIDForDirectory } from "../project/index.ts"
-import { createSessionId } from "../id/index.ts"
+import { createSessionId, type OrderedIdFormat } from "../id/index.ts"
 
 export interface Session {
   id: string
@@ -39,6 +39,8 @@ export interface SessionCreateInput {
   model?: { id: string; providerID: string; variant?: string }
   metadata?: Record<string, unknown>
   permission?: Array<{ permission: string; pattern: string; action: "allow" | "deny" | "ask" }>
+  /** Internal ID policy inherited by child sessions; not exposed in the OpenCode session payload. */
+  idFormat?: OrderedIdFormat
 }
 
 export interface SessionUpdateInput {
@@ -50,12 +52,18 @@ export interface SessionUpdateInput {
   time?: { archived?: number | null }
 }
 
+export interface SessionRoutingContext {
+  directory: string
+  idFormat: OrderedIdFormat
+}
+
 interface StoredSessionMetadata {
   model?: Session["model"]
   metadata?: Session["metadata"]
   permission?: Session["permission"]
   archived?: number
   revert?: Session["revert"]
+  idFormat?: OrderedIdFormat
 }
 
 function parseMetadata(value: string | null): StoredSessionMetadata {
@@ -95,7 +103,16 @@ function rowToSession(row: SessionRow, compatibilityVersion: string): Session {
   }
 }
 
+function routingContext(row: Pick<SessionRow, "directory" | "metadata">): SessionRoutingContext {
+  return {
+    directory: row.directory,
+    idFormat: parseMetadata(row.metadata).idFormat === "wide" ? "wide" : "legacy",
+  }
+}
+
 export class SessionRepository {
+  private readonly routingCache = new Map<string, SessionRoutingContext>()
+
   constructor(
     private readonly db: DatabaseService,
     private readonly compatibilityVersion = OPENCODE_COMPAT_VERSION,
@@ -112,6 +129,7 @@ export class SessionRepository {
       model: input.model,
       metadata: input.metadata,
       permission: input.permission,
+      idFormat: input.idFormat,
     } satisfies StoredSessionMetadata)
 
     this.db
@@ -125,20 +143,30 @@ export class SessionRepository {
 
   get(id: string): Session | null {
     const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as SessionRow | null
-    if (!row) return null
-    return rowToSession(row, this.compatibilityVersion)
+    if (!row) {
+      this.routingCache.delete(id)
+      return null
+    }
+    return this.mapRow(row)
   }
 
   list(): Session[] {
     const rows = this.db.prepare("SELECT * FROM sessions ORDER BY updated_at DESC").all() as SessionRow[]
-    return rows.map((row) => rowToSession(row, this.compatibilityVersion))
+    return rows.map((row) => this.mapRow(row))
   }
 
   listByDirectory(directory: string): Session[] {
     const rows = this.db
       .prepare("SELECT * FROM sessions WHERE directory = ? ORDER BY updated_at DESC")
       .all(resolve(directory)) as SessionRow[]
-    return rows.map((row) => rowToSession(row, this.compatibilityVersion))
+    return rows.map((row) => this.mapRow(row))
+  }
+
+  listDirectories(): string[] {
+    const rows = this.db.prepare("SELECT DISTINCT directory FROM sessions ORDER BY directory ASC").all() as Array<{
+      directory: string
+    }>
+    return rows.map((row) => resolve(row.directory))
   }
 
   update(id: string, input: SessionUpdateInput): Session | null {
@@ -187,6 +215,16 @@ export class SessionRepository {
   }
 
   delete(id: string): boolean {
+    const descendants = this.db
+      .prepare(
+        `WITH RECURSIVE descendants(id) AS (
+          SELECT id FROM sessions WHERE id = ?
+          UNION ALL
+          SELECT child.id FROM sessions child JOIN descendants parent ON child.parent_id = parent.id
+        )
+        SELECT id FROM descendants`,
+      )
+      .all(id) as Array<{ id: string }>
     const result = this.db
       .prepare(
         `WITH RECURSIVE descendants(id) AS (
@@ -197,6 +235,9 @@ export class SessionRepository {
       DELETE FROM sessions WHERE id IN (SELECT id FROM descendants)`,
       )
       .run(id)
+    if (result.changes > 0) {
+      for (const session of descendants) this.routingCache.delete(session.id)
+    }
     return result.changes > 0
   }
 
@@ -240,11 +281,51 @@ export class SessionRepository {
     return row?.status ?? null
   }
 
+  getIdFormat(id: string): OrderedIdFormat {
+    return this.getRoutingContext(id)?.idFormat ?? "legacy"
+  }
+
+  getDirectory(id: string): string | undefined {
+    return this.getRoutingContext(id)?.directory
+  }
+
+  getRoutingContext(id: string): Readonly<SessionRoutingContext> | null {
+    const cached = this.routingCache.get(id)
+    if (cached) return cached
+    const row = this.db.prepare("SELECT directory, metadata FROM sessions WHERE id = ?").get(id) as Pick<
+      SessionRow,
+      "directory" | "metadata"
+    > | null
+    if (!row) return null
+    const context = routingContext(row)
+    this.routingCache.set(id, context)
+    return context
+  }
+
+  enableWideIds(id: string): boolean {
+    const cached = this.routingCache.get(id)
+    if (cached?.idFormat === "wide") return true
+    const row = this.db.prepare("SELECT directory, metadata FROM sessions WHERE id = ?").get(id) as Pick<
+      SessionRow,
+      "directory" | "metadata"
+    > | null
+    if (!row) return false
+    const metadata = parseMetadata(row.metadata)
+    if (metadata.idFormat === "wide") {
+      this.routingCache.set(id, { directory: row.directory, idFormat: "wide" })
+      return true
+    }
+    metadata.idFormat = "wide"
+    const result = this.db.prepare("UPDATE sessions SET metadata = ? WHERE id = ?").run(JSON.stringify(metadata), id)
+    if (result.changes > 0) this.routingCache.set(id, { directory: row.directory, idFormat: "wide" })
+    return result.changes > 0
+  }
+
   listChildren(parentId: string): Session[] {
     const rows = this.db
       .prepare("SELECT * FROM sessions WHERE parent_id = ? ORDER BY created_at ASC")
       .all(parentId) as SessionRow[]
-    return rows.map((row) => rowToSession(row, this.compatibilityVersion))
+    return rows.map((row) => this.mapRow(row))
   }
 
   getParent(childId: string): Session | null {
@@ -275,7 +356,7 @@ export class SessionRepository {
     const rows = this.db
       .prepare("SELECT * FROM sessions WHERE status = ? ORDER BY created_at DESC")
       .all(status) as SessionRow[]
-    return rows.map((row) => rowToSession(row, this.compatibilityVersion))
+    return rows.map((row) => this.mapRow(row))
   }
 
   listByStatuses(statuses: string[]): Session[] {
@@ -283,6 +364,11 @@ export class SessionRepository {
     const rows = this.db
       .prepare(`SELECT * FROM sessions WHERE status IN (${placeholders}) ORDER BY created_at DESC`)
       .all(...statuses) as SessionRow[]
-    return rows.map((row) => rowToSession(row, this.compatibilityVersion))
+    return rows.map((row) => this.mapRow(row))
+  }
+
+  private mapRow(row: SessionRow): Session {
+    this.routingCache.set(row.id, routingContext(row))
+    return rowToSession(row, this.compatibilityVersion)
   }
 }

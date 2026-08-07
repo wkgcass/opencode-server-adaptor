@@ -1,5 +1,5 @@
 import type { Logger } from "../logging/index.ts"
-import { createEventId } from "../id/index.ts"
+import { createEventId, orderedIdFormat, type OrderedIdFormat } from "../id/index.ts"
 
 export interface OpenCodeEvent {
   id: string
@@ -48,21 +48,32 @@ export class EventBus {
   private globalSubscriberGapLogged = false
   private readonly logger: Logger
   private readonly resolveDirectory?: (event: OpenCodeEvent) => string | undefined
+  private readonly resolveIdFormat?: (event: OpenCodeEvent) => OrderedIdFormat
 
-  constructor(logger: Logger, resolveDirectory?: (event: OpenCodeEvent) => string | undefined) {
+  constructor(
+    logger: Logger,
+    resolveDirectory?: (event: OpenCodeEvent) => string | undefined,
+    resolveIdFormat?: (event: OpenCodeEvent) => OrderedIdFormat,
+  ) {
     this.logger = logger
     this.resolveDirectory = resolveDirectory
+    this.resolveIdFormat = resolveIdFormat
   }
 
   publish(event: OpenCodeEvent, directory?: string): void {
+    const idFormat = this.resolveIdFormat?.(event) ?? "legacy"
+    const publishedEvent =
+      idFormat === "wide" && orderedIdFormat(event.id) !== "wide"
+        ? { ...event, id: createEventId(undefined, "wide") }
+        : event
     this.logger.debug("Event published", {
-      type: event.type,
-      id: event.id,
+      type: publishedEvent.type,
+      id: publishedEvent.id,
       globalListeners: this.globalListeners.size,
     })
     for (const listener of this.internalListeners) {
       try {
-        listener(event)
+        listener(publishedEvent)
       } catch (err) {
         this.logger.error("Internal event listener error", {
           error: err instanceof Error ? err.message : String(err),
@@ -72,11 +83,11 @@ export class EventBus {
     const globalEvent: GlobalEvent = {
       directory:
         directory ??
-        (event.properties as { directory?: string; info?: { directory?: string } }).directory ??
-        (event.properties as { info?: { directory?: string } }).info?.directory ??
-        this.resolveDirectory?.(event) ??
+        (publishedEvent.properties as { directory?: string; info?: { directory?: string } }).directory ??
+        (publishedEvent.properties as { info?: { directory?: string } }).info?.directory ??
+        this.resolveDirectory?.(publishedEvent) ??
         process.cwd(),
-      payload: event,
+      payload: publishedEvent,
     }
     if (this.globalListeners.size === 0) {
       this.bufferGlobalEvent(globalEvent)

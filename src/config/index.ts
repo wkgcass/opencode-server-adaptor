@@ -184,6 +184,11 @@ export function loadConfig(): AppConfig {
     providerConfigPath,
     piAgentDir: getPiAgentDir(databasePath),
     defaultAgent: process.env.DEFAULT_AGENT ?? fileConfig.defaultAgent ?? "pi",
+    // NOTE: PI_CLI_PATH is not a public configuration option. It is used only
+    // by tests that spawn the server as a subprocess and need to override
+    // the Pi executable path via environment variable. Do not rely on it in
+    // production deployments; use config.json's piCliPath if an override is
+    // truly needed.
     piCliPath: process.env.PI_CLI_PATH ?? fileConfig.piCliPath ?? getDefaultPiCliPath(),
     piSessionDir: process.env.PI_SESSION_DIR ?? fileConfig.piSessionDir ?? join(stateDir, "pi-sessions"),
     piProvider: process.env.PI_PROVIDER ?? fileConfig.piProvider ?? "",
