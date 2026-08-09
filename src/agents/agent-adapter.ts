@@ -1,4 +1,5 @@
 import type { SubagentRunner } from "./subagent-adapter.ts"
+import type { SkillCatalogSnapshot } from "../skill/skill-service.ts"
 
 export type AgentModel = { providerID: string; modelID: string }
 
@@ -202,6 +203,13 @@ export interface AgentRuntimeContext {
     isVerbose?: () => boolean
   }
   config: Record<string, unknown>
+  skills: SkillCatalogSnapshot
+}
+
+export interface AgentRuntimeRevisionInput {
+  model: AgentModel | undefined
+  directory: string
+  skills: SkillCatalogSnapshot
 }
 
 export interface AgentRuntime {
@@ -214,6 +222,12 @@ export interface AgentRuntime {
    * user message. This is conversation-only: workspace files are untouched.
    */
   fork?(input: { messageId: string }): Promise<AgentForkResult>
+  /**
+   * Create an independent backend session from this conversation. When a
+   * message is supplied, the new backend conversation ends immediately before
+   * that OpenCode user message; otherwise the active branch is cloned in full.
+   */
+  createSessionFork?(input: { targetSessionId: string; messageId?: string }): Promise<AgentForkResult>
   /** Restore the backend conversation that was active before the latest fork. */
   restoreFork?(): Promise<AgentForkResult>
   /** Make the current fork permanent after the client sends a new prompt. */
@@ -231,7 +245,7 @@ export interface AgentAdapter {
   readonly removable?: boolean
   validateConfig(input: unknown): Promise<AgentAdapterConfig>
   getRuntimeConfig?(model: AgentModel | undefined): AgentAdapterConfig
-  getRuntimeRevision?(model: AgentModel | undefined): string | number | undefined
+  getRuntimeRevision?(input: AgentRuntimeRevisionInput): string | number | undefined
   generateTitle?(directory: string, prompt: string, model: AgentModel | undefined): Promise<string | null>
   close?(): Promise<void>
   createRuntime(context: AgentRuntimeContext): Promise<AgentRuntime>

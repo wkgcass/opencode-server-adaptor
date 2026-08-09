@@ -77,6 +77,11 @@ export class StubAgentRuntime implements AgentRuntime {
     this.emit({ type: "session_idle", sessionId: this.context.sessionId })
   }
 
+  async createSessionFork(input: { targetSessionId: string }): Promise<{ backendSessionId: string }> {
+    if (!this.running) throw new Error("Runtime not started")
+    return { backendSessionId: `stub:${input.targetSessionId}` }
+  }
+
   async respondToPermission(_requestId: string, _response: PermissionResponse): Promise<void> {
     // stub
   }

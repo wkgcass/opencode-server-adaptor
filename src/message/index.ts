@@ -438,6 +438,86 @@ export class MessageRepository {
     })
   }
 
+  /**
+   * Copy an OpenCode conversation into another session while assigning fresh
+   * globally unique message/part IDs. The boundary message itself is excluded,
+   * matching Desktop's "fork from message" behavior.
+   */
+  cloneMessagesBefore(sourceSessionId: string, targetSessionId: string, messageId?: string): number {
+    const boundary = messageId
+      ? (this.db
+          .prepare("SELECT rowid AS position FROM messages WHERE session_id = ? AND id = ?")
+          .get(sourceSessionId, messageId) as { position: number } | null)
+      : null
+    if (messageId && !boundary) throw new Error(`Message not found: ${messageId}`)
+
+    const messageRows = this.db
+      .prepare(
+        `SELECT rowid AS position, * FROM messages
+         WHERE session_id = ? ${boundary ? "AND rowid < ?" : ""}
+         ORDER BY created_at ASC, rowid ASC`,
+      )
+      .all(...(boundary ? [sourceSessionId, boundary.position] : [sourceSessionId])) as Array<
+      MessageRow & { position: number }
+    >
+    const messageIds = new Map<string, string>()
+    for (const row of messageRows) {
+      messageIds.set(row.id, createMessageId(row.created_at, this.idFormat(targetSessionId)))
+    }
+
+    const partRows = messageRows.length
+      ? (this.db
+          .prepare(
+            `SELECT part.* FROM parts part
+             JOIN messages message ON message.id = part.message_id
+             WHERE message.session_id = ? ${boundary ? "AND message.rowid < ?" : ""}
+             ORDER BY part.created_at ASC, part.rowid ASC`,
+          )
+          .all(...(boundary ? [sourceSessionId, boundary.position] : [sourceSessionId])) as PartRow[])
+      : []
+    const partIds = new Map<string, string>()
+    for (const row of partRows) {
+      partIds.set(row.id, createPartId(row.created_at, this.idFormat(targetSessionId)))
+    }
+
+    this.db.transaction(() => {
+      const insertMessage = this.db.prepare(
+        `INSERT INTO messages
+          (id, session_id, role, created_at, completed_at, parent_id, model_id, provider_id, agent, data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      for (const row of messageRows) {
+        insertMessage.run(
+          messageIds.get(row.id)!,
+          targetSessionId,
+          row.role,
+          row.created_at,
+          row.completed_at,
+          row.parent_id ? (messageIds.get(row.parent_id) ?? null) : null,
+          row.model_id,
+          row.provider_id,
+          row.agent,
+          row.data,
+        )
+      }
+
+      const insertPart = this.db.prepare(
+        "INSERT INTO parts (id, session_id, message_id, type, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      for (const row of partRows) {
+        insertPart.run(
+          partIds.get(row.id)!,
+          targetSessionId,
+          messageIds.get(row.message_id)!,
+          row.type,
+          row.data,
+          row.created_at,
+        )
+      }
+    })
+    return messageRows.length
+  }
+
   completeMessage(id: string, finish?: string): void {
     const now = Date.now()
     this.finalizeOpenTextParts(id, now)

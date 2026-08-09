@@ -25,6 +25,17 @@ function argumentValue(name: string): string | undefined {
   return index >= 0 ? argv[index + 1] : undefined
 }
 
+function argumentValues(name: string): string[] {
+  const values: string[] = []
+  for (let index = 0; index < argv.length - 1; index++) {
+    if (argv[index] === name && argv[index + 1]) values.push(argv[index + 1]!)
+  }
+  return values
+}
+
+const SKILL_PATHS = argumentValues("--skill")
+const NO_SKILLS = argv.includes("--no-skills")
+
 const SESSION_DIR = argumentValue("--session-dir")
 const SESSION_ID = argumentValue("--session-id")
 const REQUESTED_SESSION_FILE = argumentValue("--session")
@@ -284,6 +295,18 @@ async function handleCommand(cmd: RpcCommand): Promise<void> {
       persistedPrompts = persistedPrompts.slice(0, index)
       persistSession()
       sendResponse(cmd.id, "fork", true, { text: "", cancelled: false })
+      break
+    }
+
+    case "clone": {
+      if (!SESSION_DIR || persistedEntries.length === 0) {
+        sendResponse(cmd.id, "clone", false)
+        break
+      }
+      activeSessionId = crypto.randomUUID()
+      activeSessionFile = join(SESSION_DIR, `${activeSessionId}.fake.json`)
+      persistSession()
+      sendResponse(cmd.id, "clone", true, { cancelled: false })
       break
     }
 
@@ -791,11 +814,13 @@ async function simulatePrompt(text: string): Promise<void> {
     const reasoning = "Let me analyze this request carefully."
     const response = TITLE_MODE
       ? "Fake conversation title"
-      : text.includes("__recall_previous_prompt__")
-        ? `Restored previous prompt: "${previousPrompt ?? "<none>"}".`
-        : wantsTool || wantsModelSubtask
-          ? `Done. I executed the requested tool.`
-          : `This is a fake Pi response to: "${text}". Pi agent simulation is working correctly.`
+      : text.includes("__report_skill_args__")
+        ? JSON.stringify({ noSkills: NO_SKILLS, skillPaths: SKILL_PATHS })
+        : text.includes("__recall_previous_prompt__")
+          ? `Restored previous prompt: "${previousPrompt ?? "<none>"}".`
+          : wantsTool || wantsModelSubtask
+            ? `Done. I executed the requested tool.`
+            : `This is a fake Pi response to: "${text}". Pi agent simulation is working correctly.`
     const textContentIndex = wantsReasoning ? 1 : 0
 
     if (!finalOnly) {

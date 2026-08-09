@@ -19,6 +19,8 @@ const silentLogger = {
   error() {},
 }
 
+const emptySkills = (directory: string) => ({ revision: "empty", directory, skills: [] })
+
 function createTestRuntime(sessionId: string): PiRpcRuntime {
   return new PiRpcRuntime(
     {
@@ -26,6 +28,7 @@ function createTestRuntime(sessionId: string): PiRpcRuntime {
       directory: process.cwd(),
       logger: silentLogger,
       config: {},
+      skills: emptySkills(process.cwd()),
     },
     {
       cliPath: `"${process.execPath}" "${fakePi}"`,
@@ -239,6 +242,7 @@ describe("PiRpcTransport", () => {
         directory: process.cwd(),
         logger: silentLogger,
         config: {},
+        skills: emptySkills(process.cwd()),
       },
       {
         cliPath: `"${process.execPath}" "${fakePi}"`,
@@ -256,6 +260,59 @@ describe("PiRpcTransport", () => {
       await runtime.start()
       expect(beforeStartCalls).toBe(1)
     } finally {
+      await runtime.stop()
+    }
+  })
+
+  test("starts Pi with only the Skill snapshot supplied by the application layer", async () => {
+    const skillPath = join(process.cwd(), ".pi", "skills", "review", "SKILL.md")
+    const runtime = new PiRpcRuntime(
+      {
+        sessionId: "runtime-skills",
+        directory: process.cwd(),
+        logger: silentLogger,
+        config: {},
+        skills: {
+          revision: "skills-1",
+          directory: process.cwd(),
+          skills: [
+            {
+              name: "review",
+              description: "Review code",
+              slash: true,
+              location: skillPath,
+              content: "Review code.",
+              baseDirectory: join(process.cwd(), ".pi", "skills", "review"),
+              files: [skillPath],
+              digest: "review-digest",
+              disableModelInvocation: true,
+            },
+          ],
+        },
+      },
+      {
+        cliPath: `"${process.execPath}" "${fakePi}"`,
+        sessionDir: "/tmp",
+        rpcTimeoutMs: 2000,
+        startTimeoutMs: 2000,
+      },
+    )
+    const texts: string[] = []
+    const unsubscribe = runtime.subscribe((event) => {
+      if (event.type === "text_ended") texts.push(event.text)
+    })
+    try {
+      await runtime.start()
+      await runtime.prompt({
+        sessionId: "runtime-skills",
+        messageId: "msg_user_skills",
+        assistantMessageId: "msg_assistant_skills",
+        text: "__report_skill_args__",
+      })
+      expect(texts.join("\n")).toContain('"noSkills":true')
+      expect(texts.join("\n")).toContain(JSON.stringify(skillPath).slice(1, -1))
+    } finally {
+      unsubscribe()
       await runtime.stop()
     }
   })
@@ -292,6 +349,7 @@ describe("PiRpcTransport", () => {
         directory: process.cwd(),
         logger,
         config: {},
+        skills: emptySkills(process.cwd()),
       },
       {
         cliPath: `"${process.execPath}" "${fakePi}"`,
@@ -344,6 +402,7 @@ describe("PiRpcTransport", () => {
         directory: process.cwd(),
         logger: silentLogger,
         config: {},
+        skills: emptySkills(process.cwd()),
       },
       {
         cliPath: `"${process.execPath}" "${fakePi}"`,
@@ -382,6 +441,7 @@ describe("PiRpcTransport", () => {
         directory: process.cwd(),
         logger: silentLogger,
         config: {},
+        skills: emptySkills(process.cwd()),
       },
       {
         cliPath: `"${process.execPath}" "${fakePi}"`,
@@ -547,6 +607,7 @@ describe("PiRpcTransport", () => {
           directory,
           logger: silentLogger,
           config: {},
+          skills: emptySkills(directory),
         },
         {
           cliPath: `"${process.execPath}" "${fakePi}"`,

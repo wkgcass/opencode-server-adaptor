@@ -3,7 +3,7 @@ import { spawn } from "bun"
 import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { homedir, tmpdir } from "node:os"
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { stringify } from "yaml"
 import { reserveFreePort } from "../helpers/free-port.ts"
 import { createV2TestFetch } from "../helpers/v2-test-fetch.ts"
@@ -146,13 +146,13 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     if (stateDirectory) rmSync(stateDirectory, { recursive: true, force: true })
   })
 
-  async function createSession(title: string): Promise<string> {
+  async function createSession(title: string, directory = process.cwd()): Promise<string> {
     const res = await fetch(`${baseUrl}/session`, {
       method: "POST",
       headers: {
         Authorization: authHeader,
         "Content-Type": "application/json",
-        "x-opencode-directory": encodeURIComponent(process.cwd()),
+        "x-opencode-directory": encodeURIComponent(directory),
       },
       body: JSON.stringify({ title, agent: "pi" }),
     })
@@ -178,14 +178,14 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     return session.id
   }
 
-  async function sendPrompt(sessionId: string, text: string): Promise<string> {
+  async function sendPrompt(sessionId: string, text: string, directory = process.cwd()): Promise<string> {
     const messageID = createMessageId()
     const res = await fetch(`${baseUrl}/session/${sessionId}/prompt_async`, {
       method: "POST",
       headers: {
         Authorization: authHeader,
         "Content-Type": "application/json",
-        "x-opencode-directory": encodeURIComponent(process.cwd()),
+        "x-opencode-directory": encodeURIComponent(directory),
       },
       body: JSON.stringify({ messageID, parts: [{ type: "text", text }] }),
     })
@@ -508,6 +508,80 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     const fullText = textParts.map((p) => p.text).join("")
     console.log("  Text response:", fullText.slice(0, 150))
   }, 120000)
+
+  test("project skill: Pi automatically loads and follows a matching skill", async () => {
+    const projectDirectory = join(stateDirectory, "project-skill-invocation")
+    const skillDirectory = join(projectDirectory, ".pi", "skills", "project-skill-check")
+    const skillPath = join(skillDirectory, "SKILL.md")
+    const marker = `PROJECT_SKILL_OK_${randomUUID().replaceAll("-", "")}`
+    mkdirSync(skillDirectory, { recursive: true })
+    writeFileSync(
+      skillPath,
+      [
+        "---",
+        "name: project-skill-check",
+        "description: Use for PROJECT_SKILL_CHECK requests to produce the project-specific verification response.",
+        "---",
+        "",
+        "# Project Skill Check",
+        "",
+        "For a PROJECT_SKILL_CHECK request, reply with exactly this token and nothing else:",
+        "",
+        marker,
+        "",
+      ].join("\n"),
+    )
+
+    const encodedDirectory = encodeURIComponent(projectDirectory)
+    const catalogResponse = await fetch(`${baseUrl}/api/skill?location%5Bdirectory%5D=${encodedDirectory}`, {
+      headers: { Authorization: authHeader },
+    })
+    expect(catalogResponse.ok).toBe(true)
+    const catalog = (await catalogResponse.json()) as {
+      data: Array<{ name: string; description?: string; location: string; content: string }>
+    }
+    expect(catalog.data.find((skill) => skill.name === "project-skill-check")).toMatchObject({
+      name: "project-skill-check",
+      location: skillPath,
+      description: "Use for PROJECT_SKILL_CHECK requests to produce the project-specific verification response.",
+      content: expect.any(String),
+    })
+
+    const sid = await createSession("Project Skill Invocation Test", projectDirectory)
+    await sendPrompt(
+      sid,
+      [
+        "Complete PROJECT_SKILL_CHECK.",
+        "A project skill whose description matches this request is available.",
+        "You MUST use the normal Pi skill workflow: load the matching skill with the read tool before answering, then follow it exactly.",
+      ].join(" "),
+      projectDirectory,
+    )
+    await waitForIdle(sid, 180000)
+
+    const messages = await getMessages(sid)
+    const readCall = messages
+      .flatMap((message) => message.parts)
+      .find(
+        (part) =>
+          part.type === "tool" &&
+          part.tool === "read" &&
+          (part.state?.input?.path === skillPath || part.state?.input?.file_path === skillPath),
+      )
+    if (!readCall) console.log("  Project skill messages:", JSON.stringify(messages, null, 2))
+    expect(readCall).toBeDefined()
+    expect(readCall!.state!.status).toBe("completed")
+    expect(readCall!.state!.output).toContain(marker)
+
+    const assistantText = messages
+      .filter((message) => message.info.role === "assistant")
+      .flatMap((message) => message.parts)
+      .filter((part) => part.type === "text")
+      .map((part) => part.text ?? "")
+      .join("")
+    expect(assistantText).toContain(marker)
+    console.log("  Project skill response:", assistantText.slice(0, 150))
+  }, 240000)
 
   test("model-native subagent: Pi invokes the adapter task extension", async () => {
     const sid = await createSession("Model Native Subagent Test")

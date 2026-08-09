@@ -7,6 +7,7 @@ import type { ProviderConfigStore } from "../config/provider-config.ts"
 import type { BuiltinProviderDefinition } from "../provider/index.ts"
 import type { AgentAdapter } from "./agent-adapter.ts"
 import type { AgentAdapterFactory, AgentAdapterRegistry } from "./registry.ts"
+import type { SkillDirectoryRegistration } from "../skill/skill-service.ts"
 
 export interface AgentAdapterFactoryRegistration {
   type: string
@@ -31,6 +32,7 @@ export interface AgentIntegration {
   providers?: readonly BuiltinProviderDefinition[]
   providerConfigListeners?: readonly ProviderConfigChangeListener[]
   interactionPayloadOptimizers?: readonly AgentInteractionPayloadRegistration[]
+  skillDirectories?: readonly SkillDirectoryRegistration[]
   defaultAdapterType?: string
   defaultModel?: string
 }
@@ -48,6 +50,7 @@ export interface InstalledAgentIntegrations {
   providers: BuiltinProviderDefinition[]
   providerConfigListeners: ProviderConfigChangeListener[]
   interactionPayloadOptimizers: AgentInteractionPayloadRegistration[]
+  skillDirectories: SkillDirectoryRegistration[]
   defaultAdapterType: string | undefined
   defaultModel: string | undefined
 }
@@ -74,6 +77,7 @@ export function installAgentIntegrations(
     interactionPayloadOptimizers: integrations.flatMap((integration) => [
       ...(integration.interactionPayloadOptimizers ?? []),
     ]),
+    skillDirectories: integrations.flatMap((integration) => [...(integration.skillDirectories ?? [])]),
     defaultAdapterType:
       preferred?.defaultAdapterType ??
       integrations.find((integration) => integration.defaultAdapterType)?.defaultAdapterType,

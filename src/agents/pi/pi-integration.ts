@@ -8,6 +8,8 @@ import { PiSubagentRunner } from "./subagent-runner.ts"
 import { PiTitleGenerator } from "./pi-title-generator.ts"
 import type { AgentIntegrationContext } from "../agent-integration.ts"
 import { PiConversationStore } from "./pi-conversation-store.ts"
+import { homedir } from "node:os"
+import { join } from "node:path"
 
 /**
  * Builds the complete Pi contribution behind the generic integration
@@ -94,6 +96,10 @@ export function createPiAgentIntegration(context: AgentIntegrationContext): Agen
     ],
     providerConfigListeners: [modelConfig],
     interactionPayloadOptimizers: [{ channel: "pi", optimizer: optimizePiInteractionPayload }],
+    skillDirectories: [
+      { scope: "user", directory: () => join(homedir(), ".pi", "agent", "skills") },
+      { scope: "project", directory: (directory) => join(directory, ".pi", "skills") },
+    ],
     defaultAdapterType: "pi",
     defaultModel:
       providerConfig.snapshot().model ??

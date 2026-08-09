@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { spawn } from "bun"
 import { randomUUID } from "node:crypto"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { reserveFreePort } from "../helpers/free-port.ts"
@@ -48,6 +48,8 @@ describe("OpenCode v2 protocol", () => {
         DEFAULT_AGENT: "stub",
         DATABASE_PATH: ":memory:",
         PROVIDER_CONFIG_PATH: providerConfigPath,
+        HOME: configDirectory,
+        XDG_CONFIG_HOME: join(configDirectory, ".config"),
       },
     })
     for (let attempt = 0; attempt < 50; attempt++) {
@@ -151,8 +153,11 @@ describe("OpenCode v2 protocol", () => {
 
     const mcp = (await responses[4]!.json()) as { data: unknown[] }
     const resources = (await responses[5]!.json()) as { data: { resources: unknown[]; templates: unknown[] } }
+    const commands = (await responses[6]!.json()) as { data: Array<{ name: string }> }
     expect(mcp.data).toEqual([])
     expect(resources.data).toEqual({ resources: [], templates: [] })
+    expect(commands.data.some((command) => command.name === "compact")).toBe(false)
+    expect(commands.data.some((command) => command.name === "init")).toBe(false)
   })
 
   test("session create, get, list, agent/model switches, and active list", async () => {
@@ -298,6 +303,51 @@ describe("OpenCode v2 protocol", () => {
     expect(response.ok).toBe(true)
     const body = (await response.json()) as { data: { prompt: { text: string } } }
     expect(body.data.prompt.text).toBe("nested v2 protocol prompt")
+  })
+
+  test("fork creates a new session containing only messages before the selected user turn", async () => {
+    const created = await request("/api/session", {
+      method: "POST",
+      body: JSON.stringify({
+        agent: "stub",
+        model: { id: "default", providerID: "pi" },
+        location: { directory: process.cwd() },
+      }),
+    })
+    const source = (await created.json()) as { data: { id: string } }
+    const prompt = async (text: string) => {
+      const response = await request(`/api/session/${source.data.id}/prompt`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      })
+      expect(response.ok).toBe(true)
+      const body = (await response.json()) as { data: { id: string } }
+      expect((await request(`/api/session/${source.data.id}/wait`, { method: "POST" })).status).toBe(204)
+      return body.data.id
+    }
+    await prompt("fork contract first")
+    const boundaryMessageID = await prompt("fork contract second")
+
+    const forkResponse = await request(`/api/session/${source.data.id}/fork`, {
+      method: "POST",
+      body: JSON.stringify({ messageID: boundaryMessageID }),
+    })
+    expect(forkResponse.ok).toBe(true)
+    const forked = (await forkResponse.json()) as { data: { id: string; title: string } }
+    expect(forked.data.id).not.toBe(source.data.id)
+    expect(forked.data.title).toEndWith("(fork #1)")
+
+    const [sourceMessages, forkedMessages] = await Promise.all([
+      request(`/api/session/${source.data.id}/message`).then((response) => response.json()),
+      request(`/api/session/${forked.data.id}/message`).then((response) => response.json()),
+    ])
+    const sourceData = (sourceMessages as { data: Array<{ id: string }> }).data
+    const forkedData = (forkedMessages as { data: Array<{ id: string }> }).data
+    expect(sourceData).toHaveLength(4)
+    expect(forkedData).toHaveLength(2)
+    expect(forkedData.every((message) => !sourceData.some((sourceMessage) => sourceMessage.id === message.id))).toBe(
+      true,
+    )
   })
 
   test("context, durable history, and interrupt are available", async () => {
@@ -480,11 +530,67 @@ describe("OpenCode v2 protocol", () => {
     ])
     expect(((await list.json()) as { data: unknown[] }).data.length).toBeGreaterThan(0)
     expect(((await find.json()) as { data: unknown[] }).data.length).toBeGreaterThan(0)
-    expect(((await command.json()) as { data: unknown[] }).data.length).toBeGreaterThan(0)
-    expect(((await skill.json()) as { data: unknown[] }).data).toEqual([])
+    expect(Array.isArray(((await command.json()) as { data: unknown[] }).data)).toBe(true)
+    expect(Array.isArray(((await skill.json()) as { data: unknown[] }).data)).toBe(true)
     expect(((await reference.json()) as { data: unknown[] }).data).toEqual([])
     expect(read.ok).toBe(true)
     expect(await read.text()).toContain("opencode-server-adaptor")
+  })
+
+  test("project Skill is returned as a Skill and command and can be submitted through the Desktop command route", async () => {
+    const projectDirectory = join(configDirectory, "skill-project")
+    const skillDirectory = join(projectDirectory, ".pi", "skills", "review")
+    mkdirSync(skillDirectory, { recursive: true })
+    const skillPath = join(skillDirectory, "SKILL.md")
+    writeFileSync(
+      skillPath,
+      ["---", "name: review", "description: Review a target", "---", "Review $1 carefully using $ARGUMENTS.", ""].join(
+        "\n",
+      ),
+    )
+    const encodedDirectory = encodeURIComponent(projectDirectory)
+
+    const skillResponse = await request(`/api/skill?location%5Bdirectory%5D=${encodedDirectory}`)
+    const commandResponse = await request(`/api/command?location%5Bdirectory%5D=${encodedDirectory}`)
+    const skills = (await skillResponse.json()) as {
+      data: Array<{ name: string; description?: string; slash?: boolean; location: string; content: string }>
+    }
+    const commands = (await commandResponse.json()) as { data: Array<{ name: string; template: string }> }
+    expect(skills.data.find((skill) => skill.name === "review")).toEqual({
+      name: "review",
+      description: "Review a target",
+      slash: true,
+      location: skillPath,
+      content: "Review $1 carefully using $ARGUMENTS.",
+    })
+    expect(commands.data.find((command) => command.name === "review")?.template).toContain(
+      "Review $1 carefully using $ARGUMENTS.",
+    )
+    expect(commands.data.find((command) => command.name === "review")?.template).toContain(
+      `Skill base directory: ${skillDirectory}`,
+    )
+
+    const created = await request("/api/session", {
+      method: "POST",
+      body: JSON.stringify({
+        agent: "stub",
+        model: { id: "default", providerID: "pi" },
+        location: { directory: projectDirectory },
+      }),
+    })
+    const session = (await created.json()) as { data: { id: string } }
+    const invoked = await request(`/api/session/${session.data.id}/command`, {
+      method: "POST",
+      body: JSON.stringify({ command: "review", arguments: '"src/app.ts" strict' }),
+    })
+    expect(invoked.ok).toBe(true)
+    await request(`/api/session/${session.data.id}/wait`, { method: "POST" })
+    const history = (await (await request(`/api/session/${session.data.id}/message`)).json()) as {
+      data: Array<{ type: string; text?: string }>
+    }
+    const user = history.data.find((message) => message.type === "user")
+    expect(user?.text).toContain("Review src/app.ts strict carefully")
+    expect(user?.text).toContain(`Skill base directory: ${skillDirectory}`)
   })
 
   test("legacy v1-compatible file routes serve the desktop file tree", async () => {

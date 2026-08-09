@@ -24,6 +24,8 @@ import { PtyManager, type PtySocketData } from "./api/pty-manager.ts"
 import { requestDirectory } from "./api/request-directory.ts"
 import { DEFAULT_API_VERSION, type ApiVersion } from "./api/version.ts"
 import { PermissionRepository } from "./permission/index.ts"
+import { SkillService } from "./skill/skill-service.ts"
+import { CommandService } from "./skill/command-service.ts"
 
 export interface ServerStartOptions {
   hostname: string
@@ -233,6 +235,8 @@ export interface ServerContext {
   sessionService: SessionService
   sessionEvents: SessionEventStore
   ptys: PtyManager
+  skills: SkillService
+  commands: CommandService
   readiness: ServerReadiness
   logger: Logger
 }
@@ -312,8 +316,10 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
   const builtinProviders = installedIntegrations.providers
   const providerConfigListeners = installedIntegrations.providerConfigListeners
   const defaultAdapterType = installedIntegrations.defaultAdapterType ?? effectiveDefaultAgent
+  const skills = new SkillService(logger, { directories: installedIntegrations.skillDirectories })
+  const commands = new CommandService(skills)
 
-  const agentService = new AgentService(registry, sessions, messages, events, logger, config, permissions, {
+  const agentService = new AgentService(registry, sessions, messages, events, logger, config, permissions, skills, {
     encapsulateMessageParts: options?.msgPartEncap,
   })
   const sessionEvents = new SessionEventStore(db, logger, sessions)
@@ -328,6 +334,7 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
     providerConfig,
     builtinProviders,
     startupSessionIds,
+    commands,
   )
 
   agentService.recoverOnStartup()
@@ -384,6 +391,8 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
         ptys,
         defaultAdapterType,
         providerConfigListeners,
+        skills,
+        commands,
       }),
     )
     app.route("/", createV2PermissionRoutes({ sessions: sessionService, permissions, agentService, events }))
@@ -403,6 +412,8 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
     sessionService,
     sessionEvents,
     ptys,
+    skills,
+    commands,
     readiness,
     logger,
   }

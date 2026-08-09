@@ -97,6 +97,10 @@ export class PiRpcRuntime implements AgentRuntime {
       if (this.options.systemPrompt?.trim()) {
         args.push("--append-system-prompt", this.options.systemPrompt)
       }
+      args.push("--no-skills")
+      for (const skill of this.context.skills.skills) {
+        args.push("--skill", skill.location)
+      }
       for (const extensionPath of this.options.extensionPaths ?? []) {
         args.push("--extension", extensionPath)
       }
@@ -236,6 +240,48 @@ export class PiRpcRuntime implements AgentRuntime {
         forkedSessionId: forked.sessionId,
         forkedSessionFile: forked.sessionFile,
       },
+    })
+    return { backendSessionId: forked.sessionId }
+  }
+
+  async createSessionFork(input: { targetSessionId: string; messageId?: string }): Promise<AgentForkResult> {
+    if (!this.transport) throw new Error("Runtime is not started")
+    const store = this.options.conversationStore
+    if (!store) throw new Error("Pi conversation persistence is not configured")
+
+    const previous = await this.getPiSessionState()
+    if (!previous.sessionFile) throw new Error("Pi session file is unavailable; the conversation cannot be forked")
+    if (input.messageId) {
+      const entryId = store.getMessageEntryId(input.messageId)
+      if (!entryId) {
+        throw new Error(`Pi entry mapping is missing for OpenCode message '${input.messageId}'`)
+      }
+      const response = await this.transport.send({ type: "fork", entryId })
+      const data = response.data as { cancelled?: boolean } | undefined
+      if (data?.cancelled === true) throw new Error("Pi cancelled the session fork")
+    } else {
+      const response = await this.transport.send({ type: "clone" })
+      const data = response.data as { cancelled?: boolean } | undefined
+      if (data?.cancelled === true) throw new Error("Pi cancelled the session clone")
+    }
+
+    const forked = await this.getPiSessionState()
+    if (!forked.sessionFile) throw new Error("Pi did not return a session file after forking")
+
+    const restoredResponse = await this.transport.send({
+      type: "switch_session",
+      sessionPath: previous.sessionFile,
+    })
+    const restoredData = restoredResponse.data as { cancelled?: boolean } | undefined
+    if (restoredData?.cancelled === true) throw new Error("Pi cancelled restoring the source session after forking")
+    const restored = await this.getPiSessionState()
+    if (restored.sessionFile !== previous.sessionFile) {
+      throw new Error("Pi did not restore the source session after forking")
+    }
+
+    store.setSession(input.targetSessionId, {
+      activeSessionId: forked.sessionId,
+      activeSessionFile: forked.sessionFile,
     })
     return { backendSessionId: forked.sessionId }
   }

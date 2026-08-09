@@ -10,6 +10,8 @@ import type { ProviderConfigChangeListener } from "../../config/provider-config.
 import { buildProviders, type BuiltinProviderDefinition, type ProviderInfo, type ProviderModel } from "../provider.ts"
 import type { PtyManager } from "../pty-manager.ts"
 import { requestDirectory } from "../request-directory.ts"
+import type { SkillService } from "../../skill/skill-service.ts"
+import type { CommandService } from "../../skill/command-service.ts"
 
 interface McpInfo {
   name: string
@@ -41,6 +43,8 @@ export function createV2Routes(options: {
   ptys: PtyManager
   defaultAdapterType: string
   providerConfigListeners?: readonly ProviderConfigChangeListener[]
+  skills: SkillService
+  commands: CommandService
 }): Hono {
   const app = new Hono()
   const mcpServers = new Map<string, McpInfo>()
@@ -455,27 +459,14 @@ export function createV2Routes(options: {
     })
   })
 
-  app.get("/api/command", (c) => {
+  app.get("/api/command", async (c) => {
     return c.json({
       location: location(c),
-      data: [
-        {
-          name: "init",
-          template: "",
-          description: "Initialize a new project with opencode configuration",
-          subtask: false,
-        },
-        {
-          name: "compact",
-          template: "",
-          description: "Compact the conversation history",
-          subtask: false,
-        },
-      ],
+      data: await options.commands.list(directory(c)),
     })
   })
 
-  app.get("/api/skill", (c) => c.json({ location: location(c), data: [] }))
+  app.get("/api/skill", async (c) => c.json({ location: location(c), data: await options.skills.list(directory(c)) }))
   app.get("/api/reference", (c) => c.json({ location: location(c), data: [] }))
 
   app.post("/experimental/project/:projectID/copy", async (c) => {

@@ -377,6 +377,22 @@ export function createV2SessionRoutes(options: { service: SessionService; logger
     }
   })
 
+  app.post("/api/session/:sessionID/fork", async (c) => {
+    const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+    if (body?.messageID !== undefined && typeof body.messageID !== "string") {
+      return v2Error(c, new SessionServiceError("invalid_request", "messageID must be a string"))
+    }
+    try {
+      const session = await service.fork(
+        c.req.param("sessionID"),
+        typeof body?.messageID === "string" ? body.messageID : undefined,
+      )
+      return c.json({ data: toV2Session(session, service.messages.listMessages(session.id)) })
+    } catch (error) {
+      return v2Error(c, error)
+    }
+  })
+
   app.post("/api/session/:sessionID/agent", async (c) => {
     const body = await c.req.json<Record<string, unknown>>().catch(() => null)
     if (!body || typeof body.agent !== "string") {
@@ -508,6 +524,80 @@ export function createV2SessionRoutes(options: { service: SessionService; logger
         subtaskMode: typeof body?.subtaskMode === "string" ? body.subtaskMode : undefined,
         delivery: body?.delivery === "queue" ? "queue" : "steer",
         resume: typeof body?.resume === "boolean" ? body.resume : undefined,
+      })
+      return c.json({
+        data: {
+          admittedSeq: admitted.admittedSeq,
+          id: admitted.id,
+          sessionID: admitted.sessionID,
+          prompt: admitted.prompt,
+          delivery: admitted.delivery,
+          timeCreated: admitted.timeCreated,
+          promotedSeq: admitted.promotedSeq,
+        },
+      })
+    } catch (error) {
+      return v2Error(c, error)
+    }
+  })
+
+  app.post("/api/session/:sessionID/command", async (c) => {
+    const body = await c.req.json<Record<string, unknown>>().catch(() => null)
+    if (!body || typeof body.command !== "string" || !body.command.trim()) {
+      return v2Error(c, new SessionServiceError("invalid_request", "command is required"))
+    }
+    const rawFiles = Array.isArray(body.files)
+      ? body.files
+      : Array.isArray(body.parts)
+        ? body.parts.filter(
+            (part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "file",
+          )
+        : []
+    const files = rawFiles.map((value) => {
+      const file = value as Record<string, unknown>
+      return {
+        uri: String(file.uri ?? file.url ?? ""),
+        mime: typeof file.mime === "string" ? file.mime : undefined,
+        name: typeof file.name === "string" ? file.name : typeof file.filename === "string" ? file.filename : undefined,
+        description: typeof file.description === "string" ? file.description : undefined,
+        source:
+          file.source && typeof file.source === "object" && !Array.isArray(file.source)
+            ? (file.source as Record<string, unknown>)
+            : undefined,
+      }
+    })
+    if (files.some((file) => !file.uri)) {
+      return v2Error(c, new SessionServiceError("invalid_request", "files must contain a uri"))
+    }
+    const rawModel = body.model
+    const model =
+      rawModel && typeof rawModel === "object" && !Array.isArray(rawModel)
+        ? {
+            providerID: String((rawModel as Record<string, unknown>).providerID ?? ""),
+            modelID: String(
+              (rawModel as Record<string, unknown>).id ?? (rawModel as Record<string, unknown>).modelID ?? "",
+            ),
+            variant:
+              typeof (rawModel as Record<string, unknown>).variant === "string"
+                ? ((rawModel as Record<string, unknown>).variant as string)
+                : undefined,
+          }
+        : typeof rawModel === "string" && rawModel.includes("/")
+          ? {
+              providerID: rawModel.slice(0, rawModel.indexOf("/")),
+              modelID: rawModel.slice(rawModel.indexOf("/") + 1),
+              variant: typeof body.variant === "string" ? body.variant : undefined,
+            }
+          : undefined
+    try {
+      const admitted = await service.command(c.req.param("sessionID"), {
+        messageID:
+          typeof body.id === "string" ? body.id : typeof body.messageID === "string" ? body.messageID : undefined,
+        agent: typeof body.agent === "string" ? body.agent : undefined,
+        model,
+        command: body.command.trim(),
+        arguments: typeof body.arguments === "string" ? body.arguments : "",
+        files,
       })
       return c.json({
         data: {

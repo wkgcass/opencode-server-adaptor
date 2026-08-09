@@ -211,6 +211,7 @@ function createContext(sessionId: string): AgentRuntimeContext {
     directory: process.cwd(),
     logger,
     config: {},
+    skills: { revision: "empty", directory: process.cwd(), skills: [] },
   }
 }
 

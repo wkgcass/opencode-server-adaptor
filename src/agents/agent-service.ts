@@ -14,6 +14,7 @@ import type {
 import { createEvent } from "../event/index.ts"
 import type { AppConfig } from "../config/index.ts"
 import { SessionQueue } from "../runtime/session-queue.ts"
+import type { SkillCatalogSnapshot, SkillService } from "../skill/skill-service.ts"
 import { SubtaskManager, type SubtaskResult } from "../agents/subtask-manager.ts"
 import { subagentSessionTitle } from "./subagents/subagent-session.ts"
 import type { PermissionRepository } from "../permission/index.ts"
@@ -83,6 +84,7 @@ export class AgentService {
   private readonly logger: Logger
   private readonly config: AppConfig
   private readonly permissions: PermissionRepository
+  private readonly skills: SkillService
   private readonly globalQueue = new SessionQueue()
   private readonly partIdMap = new Map<string, Map<string, string>>()
   /**
@@ -110,6 +112,7 @@ export class AgentService {
     logger: Logger,
     config: AppConfig,
     permissions: PermissionRepository,
+    skills: SkillService,
     options?: { encapsulateMessageParts?: boolean },
   ) {
     this.registry = registry
@@ -119,6 +122,7 @@ export class AgentService {
     this.logger = logger
     this.config = config
     this.permissions = permissions
+    this.skills = skills
 
     this.assistantParts = new AssistantPartProjector(messages, events, {
       encapsulateParts: options?.encapsulateMessageParts,
@@ -232,11 +236,13 @@ export class AgentService {
     return m
   }
 
-  private async restartRuntimeIfModelChanged(
+  private async restartRuntimeIfConfigurationChanged(
     sessionId: string,
     adapter: AgentAdapter,
     model: AgentModel | undefined,
     pool: RuntimePool,
+    directory: string,
+    skills: SkillCatalogSnapshot,
   ): Promise<void> {
     const current = this.sessionModels.get(sessionId)
     const currentAdapterId = this.sessionRuntimeAdapters.get(sessionId)
@@ -244,7 +250,7 @@ export class AgentService {
     const modelChanged = Boolean(
       model && (!current || current.providerID !== model.providerID || current.modelID !== model.modelID),
     )
-    const nextRevision = adapter.getRuntimeRevision?.(model)
+    const nextRevision = adapter.getRuntimeRevision?.({ model, directory, skills })
     const configChanged = currentRevision !== nextRevision
     const adapterChanged = currentAdapterId !== adapter.id
     if (!modelChanged && !configChanged && !adapterChanged) {
@@ -315,12 +321,21 @@ export class AgentService {
         this.sessionModels.get(sessionId) ??
         (current.model ? { providerID: current.model.providerID, modelID: current.model.id } : undefined)
 
-      await this.restartRuntimeIfModelChanged(sessionId, adapter, selectedModel, pool)
+      const skills = await this.skills.snapshot(current.directory)
+      await this.restartRuntimeIfConfigurationChanged(
+        sessionId,
+        adapter,
+        selectedModel,
+        pool,
+        current.directory,
+        skills,
+      )
       const runtime = await pool.getOrCreate({
         sessionId,
         directory: current.directory,
         logger: this.logger.child({ sessionId, agent: current.agent }),
         config: await this.runtimeConfig(adapter, selectedModel),
+        skills,
       })
       if (!runtime.compact) {
         throw new Error(`Agent '${current.agent}' does not support session compaction`)
@@ -349,12 +364,14 @@ export class AgentService {
     const model =
       this.sessionModels.get(sessionId) ??
       (session.model ? { providerID: session.model.providerID, modelID: session.model.id } : undefined)
-    await this.restartRuntimeIfModelChanged(sessionId, adapter, model, pool)
+    const skills = await this.skills.snapshot(session.directory)
+    await this.restartRuntimeIfConfigurationChanged(sessionId, adapter, model, pool, session.directory, skills)
     const runtime = await pool.getOrCreate({
       sessionId,
       directory: session.directory,
       logger: this.logger.child({ sessionId, agent: session.agent }),
       config: await this.runtimeConfig(adapter, model),
+      skills,
     })
     return { runtime, pool }
   }
@@ -402,6 +419,30 @@ export class AgentService {
       this.events.publish(createEvent("session.updated", { sessionID: sessionId, info: updated }))
       pool.scheduleIdleCheck(sessionId)
       return updated
+    })
+  }
+
+  async createSessionFork(sourceSessionId: string, targetSessionId: string, messageId?: string): Promise<void> {
+    await this.globalQueue.run(sourceSessionId, async () => {
+      const source = this.sessions.get(sourceSessionId)
+      if (!source) throw new AgentConversationError(`Session not found: ${sourceSessionId}`, 404)
+      const target = this.sessions.get(targetSessionId)
+      if (!target) throw new AgentConversationError(`Session not found: ${targetSessionId}`, 404)
+      if (["busy", "running", "waiting_permission"].includes(source.status)) {
+        throw new AgentConversationError("Session is busy", 409)
+      }
+
+      const { runtime, pool } = await this.getConversationRuntime(sourceSessionId)
+      if (!runtime.createSessionFork) {
+        throw new AgentConversationError(`Agent '${source.agent}' does not support session forks`)
+      }
+      try {
+        await runtime.createSessionFork({ targetSessionId, ...(messageId ? { messageId } : {}) })
+      } catch (error) {
+        await pool.invalidate(sourceSessionId, runtime, "session_fork_failed")
+        throw new AgentConversationError(error instanceof Error ? error.message : String(error))
+      }
+      pool.scheduleIdleCheck(sourceSessionId)
     })
   }
 
@@ -479,13 +520,15 @@ export class AgentService {
     let promptRuntime: AgentRuntime | undefined
 
     try {
-      await this.restartRuntimeIfModelChanged(sessionId, adapter, model, pool)
+      const skills = await this.skills.snapshot(session.directory)
+      await this.restartRuntimeIfConfigurationChanged(sessionId, adapter, model, pool, session.directory, skills)
 
       const runtime = await pool.getOrCreate({
         sessionId,
         directory: session.directory,
         logger: this.logger.child({ sessionId, agent: agentId }),
         config: await this.runtimeConfig(adapter, model),
+        skills,
       })
       promptRuntime = runtime
 

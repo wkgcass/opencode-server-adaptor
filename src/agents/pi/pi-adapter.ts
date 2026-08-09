@@ -4,6 +4,7 @@ import type {
   AgentModel,
   AgentRuntime,
   AgentRuntimeContext,
+  AgentRuntimeRevisionInput,
 } from "../agent-adapter.ts"
 import { PiRpcRuntime } from "./pi-rpc-runtime.ts"
 import type { AppConfig } from "../../config/index.ts"
@@ -94,8 +95,8 @@ export class PiAgentAdapter implements AgentAdapter {
     }
   }
 
-  getRuntimeRevision(_model: AgentModel | undefined): number | undefined {
-    return this.modelConfig?.revision
+  getRuntimeRevision(input: AgentRuntimeRevisionInput): string {
+    return `${this.modelConfig?.revision ?? 0}:${input.skills.revision}`
   }
 
   async generateTitle(directory: string, prompt: string, model: AgentModel | undefined): Promise<string | null> {

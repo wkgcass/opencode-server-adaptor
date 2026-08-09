@@ -9,6 +9,8 @@ import type { MessageRepository, MessageWithParts, Part } from "../message/index
 import type { Session, SessionRepository } from "./index.ts"
 import { buildDefaultProviderMap, buildProviders, type BuiltinProviderDefinition } from "../provider/index.ts"
 import { runShellCommand } from "./shell-runner.ts"
+import type { CommandService } from "../skill/command-service.ts"
+import { CommandNotFoundError } from "../skill/command-service.ts"
 
 export interface SessionPromptPartInput extends Record<string, unknown> {
   type: string
@@ -33,6 +35,21 @@ export interface SessionShellRequest {
   agent?: string
   model?: { providerID: string; modelID: string; variant?: string }
   command: string
+}
+
+export interface SessionCommandRequest {
+  messageID?: string
+  agent?: string
+  model?: { providerID: string; modelID: string; variant?: string }
+  command: string
+  arguments: string
+  files?: Array<{
+    uri: string
+    mime?: string
+    name?: string
+    description?: string
+    source?: Record<string, unknown>
+  }>
 }
 
 export interface SessionPromptAdmission {
@@ -61,6 +78,12 @@ export class SessionServiceError extends Error {
   }
 }
 
+function forkedSessionTitle(title: string): string {
+  const match = title.match(/^(.+) \(fork #(\d+)\)$/)
+  if (!match) return `${title} (fork #1)`
+  return `${match[1]} (fork #${Number(match[2]) + 1})`
+}
+
 export class SessionService {
   private readonly unsubscribe: () => void
   private readonly projectedTerminalEvents = new Set<string>()
@@ -76,6 +99,7 @@ export class SessionService {
     private readonly providerConfig: ProviderConfigStore,
     private readonly builtinProviders: readonly BuiltinProviderDefinition[],
     private readonly startupSessionIds: ReadonlySet<string>,
+    private readonly commands: CommandService,
   ) {
     this.unsubscribe = events.subscribeInternal((event) => this.projectRuntimeEvent(event))
   }
@@ -193,6 +217,51 @@ export class SessionService {
     } catch (error) {
       throw this.conversationError(error)
     }
+  }
+
+  async fork(sessionID: string, messageID?: string): Promise<Session> {
+    const source = this.requireSession(sessionID)
+    if (["busy", "running", "waiting_permission"].includes(source.status)) {
+      throw new SessionServiceError("conflict", "Session is busy")
+    }
+    if (messageID) {
+      const message = this.messages.getMessage(messageID)
+      if (!message || message.sessionID !== sessionID) {
+        throw new SessionServiceError("message_not_found", `Message not found: ${messageID}`, { messageID })
+      }
+      if (message.role !== "user") {
+        throw new SessionServiceError("invalid_request", "Session forks require a user message", { messageID })
+      }
+    }
+
+    const target = this.sessions.create({
+      directory: source.directory,
+      title: forkedSessionTitle(source.title),
+      agent: source.agent,
+      model: source.model ? { ...source.model } : undefined,
+      metadata: source.metadata ? structuredClone(source.metadata) : undefined,
+      permission: source.permission ? structuredClone(source.permission) : undefined,
+      idFormat: this.sessions.getIdFormat(source.id),
+    })
+
+    try {
+      this.messages.cloneMessagesBefore(source.id, target.id, messageID)
+      await this.agentService.createSessionFork(source.id, target.id, messageID)
+    } catch (error) {
+      this.sessions.delete(target.id)
+      throw this.conversationError(error)
+    }
+
+    const forked = this.requireSession(target.id)
+    this.events.publish(createEvent("session.created", { sessionID: forked.id, info: forked }))
+    this.events.publish(
+      createEvent("session.forked", {
+        sessionID: forked.id,
+        sourceSessionID: source.id,
+        ...(messageID ? { messageID } : {}),
+      }),
+    )
+    return forked
   }
 
   async wait(sessionID: string, signal?: AbortSignal): Promise<void> {
@@ -471,6 +540,52 @@ export class SessionService {
       .findLast((message) => message.info.role === "assistant" && message.info.parentID === admitted.id)
     if (!terminal) throw new SessionServiceError("message_not_found", "Assistant message was not persisted")
     return terminal
+  }
+
+  async command(sessionID: string, input: SessionCommandRequest): Promise<SessionPromptAdmission> {
+    const session = this.requireSession(sessionID)
+    let command
+    try {
+      command = await this.commands.require(session.directory, input.command, input.arguments)
+    } catch (error) {
+      if (error instanceof CommandNotFoundError) {
+        throw new SessionServiceError("invalid_request", error.message, {
+          command: error.commandName,
+          available: error.available,
+        })
+      }
+      throw error
+    }
+
+    const model = command.model
+      ? { providerID: command.model.providerID, modelID: command.model.id, variant: command.model.variant }
+      : input.model
+    return this.prompt(sessionID, {
+      messageID: input.messageID,
+      agent: command.agent ?? input.agent,
+      model,
+      parts: [
+        {
+          type: "text",
+          text: command.template,
+          metadata: {
+            command: {
+              name: command.name,
+              source: command.source,
+              revision: command.revision,
+            },
+          },
+        },
+        ...(input.files ?? []).map((file) => ({
+          type: "file",
+          uri: file.uri,
+          mime: file.mime ?? "application/octet-stream",
+          name: file.name,
+          description: file.description,
+          source: file.source,
+        })),
+      ],
+    })
   }
 
   /**

@@ -44,8 +44,11 @@ v1/v2 的完整接口清单和设计说明见 [AGENTS.md](./AGENTS.md)。
   客户端，使其重新探测协议。v1 模式只是精简的配置与检查模式，不能用于正常对话和任务执行。v2 模式仍可查看
   provider/model，并可为已经存在的 provider 更新 API key。
 - provider 认证目前只可靠支持 API key，不支持完整的第三方 OAuth 登录、token 交换和刷新流程。
-- plugin、skill 和 reference 当前不会显示可用内容；交互式 question 尚未接入 Pi；MCP 配置不会启动真实 MCP server，
-  也不会提供 MCP 资源或模板。
+- Skill 会从 Pi 原生的全局目录 `~/.pi/agent/skills` 和当前工程的 `.pi/skills` 加载，也兼容 OpenCode、Agents 和
+  Claude 的常用 Skill 目录。Skill 会出现在 Desktop slash 菜单中，并交给 Pi 做原生自动发现；适配器自己的隔离 Pi
+  配置目录不会用于存放或扫描 Skill。
+- plugin 和 reference 当前不会显示可用内容；交互式 question 尚未接入 Pi；MCP 配置不会启动真实 MCP server，也不会提供
+  MCP 资源或模板。
 - “始终允许”的权限不会被保存，普通 Pi 工具也不会触发 OpenCode 的权限确认。具体安全边界见下方“工具权限与隔离”。
 - 不支持远程工作区；所有会话和文件操作都针对服务进程可直接访问的本地或 WSL 文件系统。
 - 会话回退只影响模型对话上下文，不恢复工作区文件。已经执行的写文件、编辑和 shell 副作用需要用户自行
@@ -179,7 +182,7 @@ opencode-server-adaptor [全局选项] <命令> [命令选项]
 | `--verbose`                 | 同全局 `--verbose`，可放在 `serve` 之前或之后。                                                                                                                                          |
 | `--disable-pty-token-check` | 跳过 PTY WebSocket 的 connect-ticket 校验，允许客户端不带 ticket 直接升级连接。仅用于兼容部分 OpenCode Desktop 版本的 PTY 连接问题（详见“启动服务”一节）；不要在对公网暴露的服务上使用。 |
 | `--api-version <VERSION>`   | 选择暴露的 API 协议版本，取值 `v1` 或 `v2`，默认 `v2`。详见上方“OpenCode 协议兼容”一节。                                                                                                 |
-| `--disable-v1-compatible`   | 不挂载兼容层路由（`GET /config`、`DELETE /session/:id`、`GET /file`、`GET /file/content`、`GET /find/file`）。关闭后 Desktop 文件树和相关兼容功能可能不可用。                              |
+| `--disable-v1-compatible`   | 不挂载兼容层路由（`GET /config`、`DELETE /session/:id`、`GET /file`、`GET /file/content`、`GET /find/file`）。关闭后 Desktop 文件树和相关兼容功能可能不可用。                            |
 | `--msg-part-encap`          | 将服务端生成的每个 assistant part 封装到独立 assistant message，用 message 顺序兼容 Desktop 的 v2 历史重载；默认关闭。用户 prompt 的 text/file/agent 等 part 不拆分。                    |
 
 ## 启动服务

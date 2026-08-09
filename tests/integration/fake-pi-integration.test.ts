@@ -117,6 +117,65 @@ describe("Fake Pi Integration", () => {
     await proc.exited
   })
 
+  test("v2 session fork creates an independent Pi branch and leaves the source branch active", async () => {
+    const createRes = await fetch(`${baseUrl}/api/session`, {
+      method: "POST",
+      headers: { Authorization: authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agent: "pi",
+        model: { id: "default", providerID: "pi" },
+        location: { directory: process.cwd() },
+      }),
+    })
+    expect(createRes.ok).toBe(true)
+    const source = (await createRes.json()) as { data: { id: string } }
+
+    const prompt = async (sessionID: string, text: string) => {
+      const response = await fetch(`${baseUrl}/api/session/${sessionID}/prompt`, {
+        method: "POST",
+        headers: { Authorization: authHeader, "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      })
+      expect(response.ok).toBe(true)
+      const admission = (await response.json()) as { data: { id: string } }
+      const waited = await fetch(`${baseUrl}/api/session/${sessionID}/wait`, {
+        method: "POST",
+        headers: { Authorization: authHeader },
+      })
+      expect(waited.status).toBe(204)
+      return admission.data.id
+    }
+
+    await prompt(source.data.id, "fork-backend-first")
+    const boundaryMessageID = await prompt(source.data.id, "fork-backend-second")
+    const forkRes = await fetch(`${baseUrl}/api/session/${source.data.id}/fork`, {
+      method: "POST",
+      headers: { Authorization: authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ messageID: boundaryMessageID }),
+    })
+    expect(forkRes.ok).toBe(true)
+    const forked = (await forkRes.json()) as { data: { id: string } }
+
+    await prompt(forked.data.id, "__recall_previous_prompt__")
+    await prompt(source.data.id, "__recall_previous_prompt__")
+    const [forkedHistory, sourceHistory] = await Promise.all([
+      fetch(`${baseUrl}/api/session/${forked.data.id}/message`, { headers: { Authorization: authHeader } }).then(
+        (response) => response.json(),
+      ),
+      fetch(`${baseUrl}/api/session/${source.data.id}/message`, { headers: { Authorization: authHeader } }).then(
+        (response) => response.json(),
+      ),
+    ])
+    const assistantText = (value: unknown) =>
+      (value as { data: Array<{ type: string; content?: Array<{ type: string; text?: string }> }> }).data
+        .filter((message) => message.type === "assistant")
+        .flatMap((message) => message.content ?? [])
+        .map((part) => part.text ?? "")
+        .join("\n")
+    expect(assistantText(forkedHistory)).toContain('Restored previous prompt: "fork-backend-first"')
+    expect(assistantText(sourceHistory)).toContain('Restored previous prompt: "fork-backend-second"')
+  }, 15_000)
+
   test("create session and send prompt to Fake Pi", async () => {
     const createRes = await fetch(`${baseUrl}/session`, {
       method: "POST",

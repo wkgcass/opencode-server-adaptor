@@ -1,6 +1,6 @@
 # Agent 接口设计
 
-本文档描述 `opencode-server-adaptor` 的后端扩展接口，以及主智能体、运行时和子智能体之间的职责边界。
+本文档描述 `opencode-server-adaptor` 的后端扩展接口，以及主智能体、运行时、子智能体和 Skill 之间的职责边界。
 
 项目目前只接入 Pi coding agent，但 OpenCode 路由、会话管理和消息持久化不直接依赖 Pi 类型。新增后端时，应通过
 本文档中的接口接入，不应把后端协议判断加入 OpenCode API 主流程。
@@ -20,14 +20,18 @@
 flowchart LR
     V2["OpenCode v2 路由<br/>(默认)"] --> Service["SessionService"]
     V1["OpenCode v1 路由<br/>(--api-version=v1)"] --> Service
+    V2 --> Skill["SkillService"]
     Permission["v2 权限路由"] --> PermissionRepo["PermissionRepository"]
     Service --> Server["统一会话与事件流程"]
     Service --> Repositories["Session / Message / Event 仓库"]
+    Service --> Command["CommandService"]
+    Service --> Skill
     Server --> Integration["AgentIntegration"]
     Server --> PermissionRepo
     Integration --> Adapter["AgentAdapter"]
     Adapter --> Runtime["AgentRuntime<br/>每个 OpenCode 会话"]
     Adapter --> Subagent["SubagentRunner"]
+    Command --> Skill
 
     Subagent --> Native["原生子智能体实现"]
     Subagent --> Manual["ManualSubagentRunner"]
@@ -106,14 +110,204 @@ ID 模式保存在 session 的内部 metadata 中，重启后继续生效；手�
 实际含 part 的 message 保存最终 `finish` 和 usage；错误也只归属该 terminal message。`session_idle` 是独立的执行终态，
 不得由任意单条 message 的完成推导。启动恢复仍以数据库中所有未完成 assistant message 为准，不依赖进程内映射。
 
-四个主要边界：
+六个主要边界：
 
-| 边界               | 生命周期     | 职责                                                          |
-| ------------------ | ------------ | ------------------------------------------------------------- |
-| `AgentIntegration` | 服务级       | 向服务贡献 adapter、factory、provider、配置监听器和日志优化器 |
-| `AgentAdapter`     | Agent 定义级 | 描述一种具体 Agent，校验配置并创建会话 Runtime                |
-| `AgentRuntime`     | 会话级       | 执行 prompt、终止运行、处理权限并产生统一事件                 |
-| `SubagentRunner`   | Adapter 级   | 发现和执行该 Agent 可用的子智能体                             |
+| 边界               | 生命周期     | 职责                                                           |
+| ------------------ | ------------ | -------------------------------------------------------------- |
+| `AgentIntegration` | 服务级       | 向服务贡献 adapter、factory、provider、配置监听器和日志优化器  |
+| `AgentAdapter`     | Agent 定义级 | 描述一种具体 Agent，校验配置并创建会话 Runtime                 |
+| `AgentRuntime`     | 会话级       | 执行 prompt、终止运行、处理权限并产生统一事件                  |
+| `SubagentRunner`   | Adapter 级   | 发现和执行该 Agent 可用的子智能体                              |
+| `SkillService`     | 目录级       | 发现、校验和解析 Skill；为列表、command 和自动调用提供同一真相 |
+| `CommandService`   | 目录级       | 合并普通 command 和 Skill，并解析 Desktop slash 调用           |
+
+## Skill 接入方案
+
+本节描述当前 Skill 接入接口。`GET /api/skill`、Skill 合并后的 `GET /api/command`、
+`POST /api/session/:sessionID/command` 和 Pi 自动发现均复用本节定义的目录快照；后续扩展不应把 Skill 发现或 command
+展开堆回 `v2.ts`。
+
+本设计以仓库目标协议 OpenCode `1.18.7` 为基线，同时核对了相邻 OpenCode `1.18.11` Desktop/App 和 Pi `0.82.0`
+源码。一个容易误判的客户端行为必须先固定下来：
+
+- Desktop 不读取 `/api/skill` 来构建 slash 菜单，而是读取 `/api/command`；命中 `/name` 后调用
+  `POST /api/session/:sessionID/command`。因此 Skill 必须同时进入 Skill catalog 和 Command catalog，不能只实现
+  `/api/skill`。
+
+### 核心原则
+
+- **一个能力真相来源**：客户端列表、客户端显式选择和模型自动调用必须使用同一次目录解析产生的目录项和稳定 ID。
+- **能力归应用层管理**：Skill 发现和 command 展开不是 HTTP 路由职责，也不是某个模型 provider 的配置。
+- **后端只做协议桥接**：Runtime 消费应用层给出的确定性 Skill snapshot；后端可以复用自己的 Skill 机制，但不能再独立扫描
+  一套目录。
+- **按 location 隔离**：Skill 依赖项目目录。缓存、revision 和错误状态至少以规范化后的 `directory` 为作用域。
+- **显式输入在 admission 时冻结**：command 展开的 Skill 正文、来源和 revision 与 user message 一起持久化；排队和恢复时不
+  重新读取变化后的文件。
+- **不新增 capability flag**：是否支持 Skill 由实际 snapshot 和后端映射决定，主流程不维护与真实方法脱节的布尔声明。
+
+`src/server.ts` 创建 `SkillService` 和依赖它的 `CommandService`，并显式注入 v2 路由、`SessionService` 与 `AgentService`。
+路由只做协议转换；目录扫描、冲突处理、模板展开和 snapshot 生成都留在应用层。
+
+### SkillService：发现与解析
+
+```ts
+export interface SkillInfo {
+  name: string
+  description?: string
+  slash: boolean
+  location: string
+  content: string
+}
+
+export interface ResolvedSkill extends SkillInfo {
+  baseDirectory: string
+  files: readonly string[]
+  digest: string
+  disableModelInvocation: boolean
+}
+
+export interface SkillCatalogSnapshot {
+  revision: string
+  directory: string
+  skills: readonly ResolvedSkill[]
+}
+
+export interface SkillService {
+  list(directory: string): Promise<readonly SkillInfo[]>
+  require(directory: string, name: string): Promise<ResolvedSkill>
+  snapshot(directory: string): Promise<SkillCatalogSnapshot>
+}
+```
+
+发现器读取 `SKILL.md` frontmatter 中的 `name` 和 `description`，正文作为 `content`；协议响应中的 `description` 虽为可选，
+但统一 catalog 按 Pi/Agent Skills 规范要求其非空，缺失时只记录诊断并排除该文件。同时识别 Pi 的可选
+`disable-model-invocation`，只控制自动模型发现，不影响 slash command。Pi 目录根部带 frontmatter 的单文件 `.md` 也按原生
+规则加载。至少兼容 OpenCode 使用的项目级
+`.opencode/{skill,skills}/**/SKILL.md`、`.agents/skills/**/SKILL.md`、`.claude/skills/**/SKILL.md`，以及对应的用户级目录。
+Pi integration 再由组合根固定贡献以下两个目录，不把 Pi 路径判断写进通用扫描器：
+
+- 用户共享目录：`~/.pi/agent/skills`；
+- 当前工程目录：`<ProjectDir>/.pi/skills`。
+
+这两个目录都遵循 Pi 的原生约定。`ProjectDir` 必须由 OpenCode directory/project 定位结果确定，不能使用服务进程的启动
+目录；它对应 Pi 原生 discovery 中的 `cwd`。最终获胜路径仍通过 `--skill` 显式传入 Pi，避免子进程的隔离配置影响用户级
+Skill，同时保证 API catalog 和 Pi catalog 一致。
+
+适配器给 Pi 子进程指定的 `agentDir` 位于自身状态目录，仅用来隔离 `models.json`、`auth.json` 和运行扩展；该目录不存放、
+扫描或复制 Skill，也不作为 Skill fallback。`SkillService` 应显式扫描上述用户共享目录和当前工程目录（目录不存在时视为空），
+完成去重和冲突裁决后，再把获胜文件传给 Pi。这样每个工程会同时看到用户共享 Skill 与工程私有 Skill，并且 API catalog
+与模型实际可用的 catalog 保持一致。
+
+同名 Skill 必须采用固定优先级并记录一条带两个 location 的警告；建议顺序为“显式配置路径 > 当前项目 > 用户目录 >
+内置”，同一层按规范化路径排序后后者覆盖前者。单个文件解析失败只排除该 Skill，并发布可诊断错误，不应让整个
+`GET /api/skill` 失败。
+
+`GET /api/skill` 直接映射 `SkillService.list(location.directory)`，返回 OpenCode `SkillV2Info`：
+
+```json
+{
+  "location": { "directory": "/workspace", "project": { "id": "...", "directory": "/workspace" } },
+  "data": [
+    {
+      "name": "review",
+      "description": "Review a change",
+      "slash": true,
+      "location": "/workspace/.agents/skills/review/SKILL.md",
+      "content": "..."
+    }
+  ]
+}
+```
+
+`/api/skill` 按协议返回完整 `content`，但 Desktop 的 slash 菜单并不消费该接口；真正给 Desktop 的显式入口由下面的
+`CommandService` 提供。可以按目录 revision 缓存已解析正文，并通过文件 watcher 失效缓存。
+
+### CommandService：Desktop 的显式 Skill 入口
+
+新增目录级 `CommandService`，将内置 command、用户 command 和可显式使用的 Skill 合并为 `GET /api/command` 的唯一
+数据源。OpenCode Desktop 当前的实际链路是：
+
+1. Desktop 请求 `GET /api/command` 并把返回项加入 slash 菜单；它不会为 Skill 单独请求 `/api/skill`。
+2. 用户输入 `/review args` 后，Desktop 发送 `POST /api/session/:sessionID/command`，只携带 command name、arguments、
+   agent/model 和附件，不发送服务端返回的 template。
+3. `SessionService.command()` 按 session directory 调用 `CommandService.require()`，在服务端解析 template 和参数，然后复用
+   普通 prompt admission/执行流程；route 不直接调用 Runtime。
+
+```ts
+export interface ResolvedCommand {
+  name: string
+  source: "command" | "skill"
+  description?: string
+  template: string
+  agent?: string
+  model?: ModelRef
+  subtask?: boolean
+  revision: string
+}
+
+export interface CommandService {
+  list(directory: string): Promise<readonly CommandV2Info[]>
+  require(directory: string, name: string, argumentsText: string): Promise<ResolvedCommand>
+}
+```
+
+Skill command template 为 Skill 正文加基础目录说明。参数展开与 OpenCode command 一致：支持 `$1`、`$2` 和
+`$ARGUMENTS`；没有占位符时把完整 arguments 追加到模板末尾。Skill source 不执行 command 模板的 shell substitution，Skill
+引用的脚本仍应由模型通过正常工具和权限生命周期执行。解析后的正文、source、name 和 revision 与 user message 一起持久化，
+保证 exact retry、排队和重启恢复不会重新读取变化后的文件。未知 command 返回 typed error，不能把 name 当文件路径使用。
+
+名称冲突必须确定化：先注册内置/配置 command，Skill 只在名称仍空闲时加入，因此普通 command 优先。`list()` 和
+`require()` 必须共享同一 catalog，禁止列表显示 A、执行却命中 B。
+
+当前公开 SDK 和 Desktop 没有实际调用结构化 `POST /api/session/:sessionID/skill`；OpenCode 新 core 中该操作仍标为
+`OperationUnavailableError`。因此本阶段不新增 speculative skill endpoint、`session.skill.activated` 事件或 Skill 专属 message；
+显式 Skill 使用现有 command/prompt/message 持久化链路即可。
+
+### Skill 自动调用
+
+自动调用不能在 `SessionService` 中用关键词预选。`SkillCatalogSnapshot.skills` 包含名称、描述、location 和 digest；Runtime
+根据后端能力把目录暴露给模型，完整正文仅在模型选中后读取。
+
+Pi `0.82.0` 的原生行为不是一个名为 `skill` 的工具，而是：把可模型调用的 Skill 以 XML catalog 加入 system prompt，提示
+模型使用 `read` 读取对应 `SKILL.md`；`disable-model-invocation: true` 的项不进入 catalog。它还支持显式
+`/skill:<name> args` 展开。该 catalog 只在 `read` 工具处于 active tools 时注入；禁用 `read` 的 agent 不得声称支持自动
+Skill。Pi adapter 应复用这一机制，但 Skill 路径必须来自 `SkillService`，不能让 Pi 再独立扫描一套目录。
+
+这意味着 Pi 的自动 Skill 使用会投影为普通 `read` 工具调用，而不是 OpenCode 原生实现中的 `skill` 卡片；相关权限也沿用
+现有 `read` 工具生命周期。该差异不影响 Desktop 的列表、slash command 或历史协议，不需要新增 Skill 专属 assistant part。
+
+### Pi 映射
+
+Pi 已支持 `--skill <path>`、`--no-skills` 和 Skill command 展开，接入时采用以下映射：
+
+- `PiAgentAdapter.createRuntime()` 从 `AgentRuntimeContext.skills.skills` 获取获胜 Skill 的确定性路径列表，以
+  `--no-skills --skill <path> ...` 启动 Pi。Pi `0.82.0` 的 `noSkills` 只关闭默认/package discovery，仍会合并显式 CLI path，
+  因此无需隔离目录；契约测试固定这一组合语义。只传冲突处理后的获胜路径，确保 `/api/skill`、`/api/command` 和 Pi catalog
+  一致。该列表来自 `~/.pi/agent/skills` 与 `<ProjectDir>/.pi/skills` 等 `SkillService` 已裁决的协议目录，不得从 adaptor
+  的 Pi `agentDir` 补充 Skill。
+- 显式 `/skill-name args` 已由 `CommandService` 在 admission 时展开成 Skill 正文快照；不要把原始 `/skill:<name>` 延迟到
+  Pi 执行时再读文件。Pi 原生 `/skill:<name>` 只作为行为参考或直接使用 Pi CLI 时的兼容入口。
+- Skill revision 改变时，在下一安全轮次前重建 Pi Runtime 并继续使用原 Pi session 文件。当前 Pi RPC 没有独立的远程资源重载
+  command；不能滥用 prompt 发送内部 `/reload` 来改变用户对话。
+- `plan` adapter 使用同一份 Skill snapshot。由于 plan 的 active tools 包含 `read`，Pi 会正常加入自动 Skill catalog；若某个
+  自定义 agent 禁用 `read`，则只保留客户端显式 command 路径。
+
+### 一致性、错误与安全约束
+
+- Skill catalog 使用原子 revision；一次 `SkillCatalogSnapshot` 内不能混合不同扫描批次的 metadata 和正文。
+- 未知 Skill 使用稳定的 `SkillNotFoundError`，并返回排序后的可用名称；不要降级成空 prompt 或 `UnknownError`。
+- Skill location、基础目录和附属文件都必须经过规范化路径检查；客户端传入的 Skill name 永远不能直接拼接为文件路径。
+- 列表可以缓存，但 command admission 必须确认 snapshot revision 仍有效；失效时重新解析整个 catalog，而不是只刷新单个文件。
+- 服务关闭时先停止接收 prompt，再停止 Runtime，最后关闭数据库；Skill watcher 和缓存失效监听器也要随服务关闭。
+
+### 实现与测试
+
+当前实现已完成 `SkillService`、Skill → command 合并、Desktop command admission、Runtime revision 和 Pi 显式 Skill path
+映射。测试覆盖目录优先级、坏 frontmatter、附件 revision、参数展开、Desktop slash 链路，以及 Pi 的
+`--no-skills --skill <path>` 启动参数。真实模型自动选择 Skill 的场景保留在真实 Pi 测试中验证。
+
+契约测试至少验证三条路径：Skill 同时出现在 `/api/skill` 和 `/api/command`；Desktop command 提交可执行、可 exact retry 并可
+重启重放；同一 Skill 可被 Pi 根据描述自动发现并通过 `read` 加载。真实 Pi 测试使用只读 Skill fixture，避免修改工作区。
 
 ## AgentIntegration：后端装配边界
 
@@ -126,6 +320,7 @@ export interface AgentIntegration {
   providers?: readonly BuiltinProviderDefinition[]
   providerConfigListeners?: readonly ProviderConfigChangeListener[]
   interactionPayloadOptimizers?: readonly AgentInteractionPayloadRegistration[]
+  skillDirectories?: readonly SkillDirectoryRegistration[]
   defaultAdapterType?: string
   defaultModel?: string
 }
@@ -147,6 +342,7 @@ export type AgentIntegrationFactory = (context: AgentIntegrationContext) => Agen
 - `providers`：提供给 OpenCode Desktop 的内置 provider/model 描述。
 - `providerConfigListeners`：`providers.yaml` 中 provider、model 或 API key 变化后的监听器。
 - `interactionPayloadOptimizers`：针对后端协议日志的可选优化器，用于去除重复快照等冗余内容。
+- `skillDirectories`：后端贡献的 Skill 目录。Pi 用它注册 `~/.pi/agent/skills` 和项目 `.pi/skills`。
 - `defaultAdapterType`：没有显式指定类型时，用于创建动态 Agent 的 adapter 类型。
 - `defaultModel`：提供给 OpenCode 客户端的默认模型标识，格式为 `provider/model`。
 
@@ -186,7 +382,7 @@ export interface AgentAdapter {
 
   validateConfig(input: unknown): Promise<AgentAdapterConfig>
   getRuntimeConfig?(model: AgentModel | undefined): AgentAdapterConfig
-  getRuntimeRevision?(model: AgentModel | undefined): string | number | undefined
+  getRuntimeRevision?(input: AgentRuntimeRevisionInput): string | number | undefined
   generateTitle?(directory: string, prompt: string, model: AgentModel | undefined): Promise<string | null>
   close?(): Promise<void>
   createRuntime(context: AgentRuntimeContext): Promise<AgentRuntime>
@@ -223,8 +419,17 @@ OpenCode 请求中的 model
 
 ### 配置修订
 
+```ts
+export interface AgentRuntimeRevisionInput {
+  model: AgentModel | undefined
+  directory: string
+  skills: SkillCatalogSnapshot
+}
+```
+
 `getRuntimeRevision()` 用于表示影响 Runtime 的外部配置版本，例如 `providers.yaml` 中的 provider、model 或 API key
-发生了变化。
+发生了变化。它同时收到当前目录的 Skill snapshot：不使用 Skill 的 Adapter 可以忽略其 revision；Pi Adapter 则把
+`skills.revision` 合入返回值，保证 Skill 目录变化后重建 Runtime。
 
 如果模型或 revision 与该 session 上次使用的值不同，主流程会停止旧 Runtime，然后按新配置创建 Runtime。返回值
 只需要在配置变化时发生变化，不需要是全局连续数字。
@@ -245,6 +450,7 @@ export interface AgentRuntime {
   prompt(input: PromptInput): Promise<void>
   compact?(input?: { customInstructions?: string }): Promise<AgentCompactionResult>
   fork?(input: { messageId: string }): Promise<AgentForkResult>
+  createSessionFork?(input: { targetSessionId: string; messageId?: string }): Promise<AgentForkResult>
   restoreFork?(): Promise<AgentForkResult>
   commitFork?(): Promise<void>
   abort(): Promise<void>
@@ -264,6 +470,7 @@ export interface AgentRuntimeContext {
   directory: string
   logger: AgentLogger
   config: Record<string, unknown>
+  skills: SkillCatalogSnapshot
 }
 ```
 
@@ -271,6 +478,7 @@ export interface AgentRuntimeContext {
 - `directory`：会话工作目录。
 - `logger`：带 session 和 Agent 上下文的日志接口。
 - `config`：Adapter 验证后的后端配置。
+- `skills`：创建该代 Runtime 时的不可变 Skill snapshot；后端据此配置显式路径和自动发现目录。
 
 ### 生命周期约定
 
@@ -321,6 +529,19 @@ OpenCode `/revert` 的 `partID` 仍会校验归属，但当前通用分支能力
 支持 `fork()` 的 Runtime 必须实现同组的 `restoreFork()` 和 `commitFork()`，确保 OpenCode 的 revert/unrevert
 生命周期完整。不支持对话分支的后端省略这些方法，主流程会返回 capability error。
 
+`createSessionFork()` 是与 revert 生命周期分开的新会话分支能力，由
+`POST /api/session/:sessionID/fork` 调用：
+
+- 主流程创建新的 OpenCode session，并只在仓库层复制边界消息之前的 messages/parts；复制时重映射全局唯一 ID，
+  不解析或构造任何后端 session/entry 标识。
+- `messageId` 指向 Desktop 选中的用户消息，该消息本身不复制；Desktop 会把它恢复到新会话输入框。省略时复制完整分支。
+- Runtime 必须直接创建独立的后端会话，并把它绑定到 `targetSessionId`。实现不得靠主流程重放历史 prompt 来模拟 fork。
+- 创建子分支后，源 Runtime 必须仍绑定并停留在原后端会话；子会话后续启动时直接恢复自己的后端分支。
+- 后端 fork 失败时主流程删除尚未发布的新 OpenCode session，且失效可能已被后端切换过的源 Runtime。
+
+该能力只复制会话历史，不设置 `parentID`，也不恢复或复制工作区文件。不支持该能力的后端省略
+`createSessionFork()`，接口返回 capability error。
+
 ```ts
 export interface AgentForkResult {
   backendSessionId: string
@@ -344,7 +565,8 @@ export interface PromptInput {
 }
 ```
 
-Runtime 映射后端事件时必须使用输入中的 OpenCode message ID，不能把后端内部 message ID 直接暴露给主流程。
+Runtime 映射后端事件时必须使用输入中的 OpenCode message ID，不能把后端内部 message ID 直接暴露给主流程。Skill revision
+在获取 Runtime 前检查，不需要把 Skill 正文或目录重复放入每个 `PromptInput`。
 
 ### AgentRuntimeEvent
 
@@ -403,6 +625,10 @@ Pi 在未发生分支时采用第一种方式：`PiRpcRuntime` 对 OpenCode sess
 已有的 JSON metadata 列中；Runtime 重启时优先通过该 session file 恢复分支，而不是重新打开稳定哈希所指向的旧
 session。fork 前的 session ID/file 会保留到 `restoreFork()` 或 `commitFork()` 为止。这些字段由 Pi integration
 独占，OpenCode Session/Message API 不会返回它们。
+
+调用 `createSessionFork()` 时，Pi Runtime 使用相同的 message 映射直接执行官方 `fork(entryId)`；完整克隆则调用
+`clone`。取得新 session ID/file 后立即用 `switch_session` 切回源 session，再把新身份保存到目标 OpenCode session。
+因此源 Runtime 不会被 Desktop 的新会话 fork 改成子分支。
 
 ## SubagentRunner：子智能体执行接口
 
@@ -570,6 +796,8 @@ createPiAgentIntegration
   或 Pi 专属通用 schema 字段。
 - `PiRpcRuntime.fork()` 使用持久化的 message 映射调用官方 `fork(entryId)`；`restoreFork()` 使用
   `switch_session`，重启时则从持久化的 fork session file 恢复。
+- `PiRpcRuntime.createSessionFork()` 调用官方 `fork(entryId)`/`clone` 创建独立 Pi session，随后切回源 session，
+  并把新 session 身份绑定到目标 OpenCode session。
 - `PiModelConfigStore` 将 YAML 中的 provider、model 和 API key 同步为 Pi 可读取的配置；provider 或 model 下的
   `custom.pi` 会原样深合并到生成的 Pi 配置对象。SQLite 不保存 provider 认证信息。
 - `PiManualSubagentBackend` 实现 Pi 的 fallback 子智能体进程调用和事件转换。
@@ -691,3 +919,12 @@ Factory 创建的 Adapter 必须使用 `input.id` 作为唯一标识，并正确
 - [`src/agents/subagents/manual-subagent-runner.ts`](src/agents/subagents/manual-subagent-runner.ts)：通用 fallback。
 - [`src/agents/subtask-manager.ts`](src/agents/subtask-manager.ts)：OpenCode 子 session 编排。
 - [`src/agents/pi/pi-integration.ts`](src/agents/pi/pi-integration.ts)：Pi 的完整接入装配。
+- [`../opencode/packages/app/src/context/global-sync/bootstrap.ts`](../opencode/packages/app/src/context/global-sync/bootstrap.ts)：
+  Desktop command catalog 加载路径。
+- [`../opencode/packages/app/src/components/prompt-input/submit.ts`](../opencode/packages/app/src/components/prompt-input/submit.ts)：
+  Desktop command 与 flat prompt 提交路径。
+- [`../opencode/packages/opencode/src/command/index.ts`](../opencode/packages/opencode/src/command/index.ts)：OpenCode command 和
+  Skill 合并语义。
+- [`../pi/packages/coding-agent/src/core/skills.ts`](../pi/packages/coding-agent/src/core/skills.ts)：Pi Skill 发现与 system prompt catalog。
+- [`../pi/packages/coding-agent/src/core/agent-session.ts`](../pi/packages/coding-agent/src/core/agent-session.ts)：Pi Skill command 展开与
+  system prompt 重建生命周期。
