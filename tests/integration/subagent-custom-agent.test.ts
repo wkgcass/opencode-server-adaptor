@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { homedir } from "node:os"
 import { reserveFreePort } from "../helpers/free-port.ts"
 import { createV2TestFetch } from "../helpers/v2-test-fetch.ts"
+import { waitForSessionIdle } from "../helpers/wait-for.ts"
 
 const fetch = createV2TestFetch()
 
@@ -46,6 +47,8 @@ describe("Subagent + Custom Agent Registration", () => {
         DEFAULT_AGENT: "pi",
         DATABASE_PATH: ":memory:",
         PI_CLI_PATH: `${BUN_BIN} ${FAKE_PI_PATH}`,
+        MAX_ACTIVE_AGENT_PROCESSES: "10",
+        MAX_GLOBAL_CONCURRENT_SUBTASKS: "12",
         PATH: `${homedir()}/.bun/bin:/usr/local/bin:/usr/bin:/bin`,
       },
     })
@@ -185,7 +188,7 @@ describe("Subagent + Custom Agent Registration", () => {
         body: JSON.stringify({ parts: [{ type: "text", text: "Hello custom agent" }] }),
       })
 
-      await Bun.sleep(5000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },
@@ -202,7 +205,7 @@ describe("Subagent + Custom Agent Registration", () => {
     }, 15000)
   })
 
-  describe("Subtask / Subagent", () => {
+  describe.concurrent("Subtask / Subagent", () => {
     test("prompt with subtask part creates SubtaskPart on user message and ToolPart on dedicated assistant message", async () => {
       const createRes = await fetch(`${baseUrl}/session`, {
         method: "POST",
@@ -230,7 +233,7 @@ describe("Subagent + Custom Agent Registration", () => {
         }),
       })
 
-      await Bun.sleep(8000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },
@@ -306,7 +309,7 @@ describe("Subagent + Custom Agent Registration", () => {
       })
       expect(promptRes.ok).toBe(true)
 
-      await Bun.sleep(8000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },
@@ -365,7 +368,7 @@ describe("Subagent + Custom Agent Registration", () => {
         }),
       })
 
-      await Bun.sleep(8000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },

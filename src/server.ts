@@ -58,17 +58,17 @@ export interface RequestTimeoutController {
 const STREAMING_EVENT_PATHS = new Set(["/api/event"])
 
 /**
- * Bun applies its idle timeout while a response body is streaming. SSE
- * connections are intentionally long-lived and may be quiet between
- * heartbeats, so they must opt out per request. Keeping this scoped to event
- * routes preserves the normal timeout protection for every REST endpoint.
+ * Bun applies its idle timeout while a response is quiet. SSE connections and
+ * session waits are intentionally long-lived, so they must opt out per
+ * request. Keeping this scoped to those routes preserves the normal timeout
+ * protection for every other REST endpoint.
  */
 export function configureStreamingRequestTimeout(request: Request, server: RequestTimeoutController): boolean {
-  if (request.method !== "GET") return false
   const path = new URL(request.url).pathname
-  if (!STREAMING_EVENT_PATHS.has(path) && !/^\/api\/session\/[^/]+\/event$/.test(path)) {
-    return false
-  }
+  const isEventStream =
+    request.method === "GET" && (STREAMING_EVENT_PATHS.has(path) || /^\/api\/session\/[^/]+\/event$/.test(path))
+  const isSessionWait = request.method === "POST" && /^\/api\/session\/[^/]+\/wait$/.test(path)
+  if (!isEventStream && !isSessionWait) return false
   server.timeout(request, 0)
   return true
 }

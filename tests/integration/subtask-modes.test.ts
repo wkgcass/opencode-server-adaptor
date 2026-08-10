@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { homedir } from "node:os"
 import { reserveFreePort } from "../helpers/free-port.ts"
 import { createV2TestFetch } from "../helpers/v2-test-fetch.ts"
+import { waitFor, waitForSessionIdle } from "../helpers/wait-for.ts"
 
 const fetch = createV2TestFetch()
 import { mkdtempSync } from "node:fs"
@@ -14,7 +15,7 @@ const CLI_PATH = join(import.meta.dir, "..", "..", "src", "cli.ts")
 const FAKE_PI_PATH = join(import.meta.dir, "..", "fixtures", "fake-pi", "fake-pi.ts")
 const BUN_BIN = join(homedir(), ".bun", "bin", "bun")
 
-describe("Subtask Modes (parallel / chain / usage)", () => {
+describe.concurrent("Subtask Modes (parallel / chain / usage)", () => {
   let port: number
   let password: string
   let proc: ReturnType<typeof spawn>
@@ -55,6 +56,8 @@ describe("Subtask Modes (parallel / chain / usage)", () => {
         SUBTASK_STDERR_LIMIT_BYTES: "65536",
         SUBTASK_TIMEOUT_MS: "30000",
         SUBTASK_AGENT_SCOPE: "both",
+        MAX_ACTIVE_AGENT_PROCESSES: "10",
+        MAX_GLOBAL_CONCURRENT_SUBTASKS: "12",
         PATH: `${homedir()}/.bun/bin:/usr/local/bin:/usr/bin:/bin`,
       },
     })
@@ -101,7 +104,7 @@ describe("Subtask Modes (parallel / chain / usage)", () => {
       }),
     })
 
-    await Bun.sleep(10000)
+    await waitForSessionIdle(baseUrl, authHeader, session.id, 30_000)
 
     const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
       headers: { Authorization: authHeader },
@@ -167,7 +170,7 @@ describe("Subtask Modes (parallel / chain / usage)", () => {
       }),
     })
 
-    await Bun.sleep(12000)
+    await waitForSessionIdle(baseUrl, authHeader, session.id, 30_000)
 
     const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
       headers: { Authorization: authHeader },
@@ -206,7 +209,7 @@ describe("Subtask Modes (parallel / chain / usage)", () => {
       }),
     })
 
-    await Bun.sleep(8000)
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
 
     const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
       headers: { Authorization: authHeader },
@@ -252,19 +255,36 @@ describe("Subtask Modes (parallel / chain / usage)", () => {
       }),
     })
 
-    await Bun.sleep(500)
+    await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/session/${session.id}/children`, {
+          headers: { Authorization: authHeader },
+        })
+        return (await response.json()) as Array<{ id: string; status: string }>
+      },
+      (children) => children.length === 2,
+      { description: `subtasks for session ${session.id}` },
+    )
 
     await fetch(`${baseUrl}/session/${session.id}/abort`, {
       method: "POST",
       headers: { Authorization: authHeader },
     })
 
-    await Bun.sleep(5000)
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
 
-    const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
-      headers: { Authorization: authHeader },
-    })
-    const children = (await childrenRes.json()) as Array<{ id: string; status: string }>
+    const children = await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/session/${session.id}/children`, {
+          headers: { Authorization: authHeader },
+        })
+        return (await response.json()) as Array<{ id: string; status: string }>
+      },
+      (sessions) =>
+        sessions.length === 2 &&
+        sessions.every((child) => ["idle", "aborted", "failed", "interrupted"].includes(child.status)),
+      { description: `subtasks for session ${session.id} to terminate` },
+    )
 
     expect(children.length).toBe(2)
     const hasTerminal = children.every(

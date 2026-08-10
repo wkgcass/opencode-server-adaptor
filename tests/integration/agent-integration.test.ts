@@ -3,10 +3,11 @@ import { spawn } from "bun"
 import { randomUUID } from "node:crypto"
 import { reserveFreePort } from "../helpers/free-port.ts"
 import { join } from "node:path"
+import { waitFor, waitForSessionIdle } from "../helpers/wait-for.ts"
 
 const CLI_PATH = join(import.meta.dir, "..", "..", "src", "cli.ts")
 
-describe("Agent Integration", () => {
+describe.concurrent("Agent Integration", () => {
   let port: number
   let password: string
   let proc: ReturnType<typeof spawn>
@@ -27,6 +28,7 @@ describe("Agent Integration", () => {
         OPENCODE_SERVER_USERNAME: "opencode",
         DEFAULT_AGENT: "stub",
         DATABASE_PATH: ":memory:",
+        MAX_ACTIVE_AGENT_PROCESSES: "10",
       },
     })
 
@@ -65,7 +67,7 @@ describe("Agent Integration", () => {
     })
     expect(promptRes.ok).toBe(true)
 
-    await Bun.sleep(2000)
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
 
     const msgRes = await fetch(`${baseUrl}/api/session/${session.id}/message?order=asc`, {
       headers: { Authorization: authHeader },
@@ -99,7 +101,7 @@ describe("Agent Integration", () => {
       body: JSON.stringify({ prompt: { text: "Hi" } }),
     })
 
-    await Bun.sleep(3000)
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
 
     const getRes = await fetch(`${baseUrl}/api/session/active`, {
       headers: { Authorization: authHeader },
@@ -127,7 +129,7 @@ describe("Agent Integration", () => {
       })
     }
 
-    await Bun.sleep(3000)
+    await Promise.all(sessions.map((session) => waitForSessionIdle(baseUrl, authHeader, session.id)))
 
     for (const s of sessions) {
       const res = await fetch(`${baseUrl}/api/session/${s.id}/message?order=asc`, {
@@ -164,7 +166,7 @@ describe("Agent Integration", () => {
 
     await Promise.all([p1, p2])
 
-    await Bun.sleep(4000)
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
 
     const msgRes = await fetch(`${baseUrl}/api/session/${session.id}/message?order=asc`, {
       headers: { Authorization: authHeader },
@@ -187,7 +189,14 @@ describe("Agent Integration", () => {
       body: JSON.stringify({ prompt: { text: "Long prompt" } }),
     })
 
-    await Bun.sleep(100)
+    await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/api/session/active`, { headers: { Authorization: authHeader } })
+        return ((await response.json()) as { data: Record<string, unknown> }).data
+      },
+      (active) => active[session.id] !== undefined,
+      { description: `session ${session.id} to become active` },
+    )
 
     const abortRes = await fetch(`${baseUrl}/api/session/${session.id}/interrupt`, {
       method: "POST",
@@ -195,7 +204,7 @@ describe("Agent Integration", () => {
     })
     expect(abortRes.ok).toBe(true)
 
-    await Bun.sleep(500)
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
 
     const getRes = await fetch(`${baseUrl}/api/session/active`, {
       headers: { Authorization: authHeader },

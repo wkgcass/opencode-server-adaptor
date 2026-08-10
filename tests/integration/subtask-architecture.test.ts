@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { homedir } from "node:os"
 import { reserveFreePort } from "../helpers/free-port.ts"
 import { createV2TestFetch } from "../helpers/v2-test-fetch.ts"
+import { waitFor, waitForSessionIdle } from "../helpers/wait-for.ts"
 
 const fetch = createV2TestFetch()
 import { mkdtempSync, rmSync } from "node:fs"
@@ -99,7 +100,7 @@ describe("Subtask Architecture", () => {
         }),
       })
 
-      await Bun.sleep(8000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
         headers: { Authorization: authHeader },
@@ -130,7 +131,7 @@ describe("Subtask Architecture", () => {
         }),
       })
 
-      await Bun.sleep(8000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
         headers: { Authorization: authHeader },
@@ -177,7 +178,7 @@ describe("Subtask Architecture", () => {
         }),
       })
 
-      await Bun.sleep(8000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },
@@ -224,7 +225,7 @@ describe("Subtask Architecture", () => {
         }),
       })
 
-      await Bun.sleep(15000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id, 25_000)
 
       const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
         headers: { Authorization: authHeader },
@@ -258,19 +259,36 @@ describe("Subtask Architecture", () => {
         }),
       })
 
-      await Bun.sleep(2000)
+      await waitFor(
+        async () => {
+          const response = await fetch(`${baseUrl}/session/${session.id}/children`, {
+            headers: { Authorization: authHeader },
+          })
+          return (await response.json()) as Array<{ id: string; status: string }>
+        },
+        (children) => children.length > 0,
+        { description: `subtask for session ${session.id}` },
+      )
 
       await fetch(`${baseUrl}/session/${session.id}/abort`, {
         method: "POST",
         headers: { Authorization: authHeader },
       })
 
-      await Bun.sleep(3000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
-      const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
-        headers: { Authorization: authHeader },
-      })
-      const children = (await childrenRes.json()) as Array<{ id: string; status: string }>
+      const children = await waitFor(
+        async () => {
+          const response = await fetch(`${baseUrl}/session/${session.id}/children`, {
+            headers: { Authorization: authHeader },
+          })
+          return (await response.json()) as Array<{ id: string; status: string }>
+        },
+        (sessions) =>
+          sessions.length === 0 ||
+          sessions.some((child) => ["idle", "aborted", "failed", "interrupted"].includes(child.status)),
+        { description: `subtask for session ${session.id} to terminate` },
+      )
 
       if (children.length > 0) {
         const childStatuses = children.map((c) => c.status)
@@ -308,7 +326,7 @@ describe("Subtask Architecture", () => {
         }),
       })
 
-      await Bun.sleep(8000)
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
 
       const childrenRes = await fetch(`${baseUrl}/session/${session.id}/children`, {
         headers: { Authorization: authHeader },

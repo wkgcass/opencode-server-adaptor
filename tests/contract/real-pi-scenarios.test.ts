@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { stringify } from "yaml"
 import { reserveFreePort } from "../helpers/free-port.ts"
 import { createV2TestFetch } from "../helpers/v2-test-fetch.ts"
+import { waitFor, waitForSessionIdle as waitForV2SessionIdle } from "../helpers/wait-for.ts"
 
 const fetch = createV2TestFetch()
 import { createMessageId } from "../../src/id/index.ts"
@@ -195,14 +196,7 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
   }
 
   async function waitForIdle(sessionId: string, timeoutMs = 120000): Promise<void> {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      const res = await fetch(`${baseUrl}/session/status`, { headers: { Authorization: authHeader } })
-      const body = (await res.json()) as Record<string, { type: string }>
-      if (body[sessionId]?.type === "idle") return
-      await Bun.sleep(2000)
-    }
-    throw new Error(`Session ${sessionId} did not become idle within ${timeoutMs}ms`)
+    await waitForV2SessionIdle(baseUrl, authHeader, sessionId, timeoutMs)
   }
 
   async function getMessages(sessionId: string): Promise<
@@ -745,13 +739,14 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     )
     await waitForIdle(sid, 180000)
 
-    let title = "Untitled"
-    const deadline = Date.now() + 120000
-    while (Date.now() < deadline && title === "Untitled") {
-      const res = await fetch(`${baseUrl}/session/${sid}`, { headers: { Authorization: authHeader } })
-      title = ((await res.json()) as { title: string }).title
-      if (title === "Untitled") await Bun.sleep(1000)
-    }
+    const title = await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/session/${sid}`, { headers: { Authorization: authHeader } })
+        return ((await response.json()) as { title: string }).title
+      },
+      (value) => value !== "Untitled",
+      { timeoutMs: 120_000, intervalMs: 100, description: `generated title for session ${sid}` },
+    )
     expect(title).not.toBe("Untitled")
     expect(title.length).toBeGreaterThan(0)
     expect([...title].length).toBeLessThanOrEqual(100)
@@ -767,8 +762,6 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
 
     await sendPrompt(sid, "Say hi")
 
-    // Should be busy shortly
-    await Bun.sleep(1000)
     const during = await fetch(`${baseUrl}/session/${sid}`, { headers: { Authorization: authHeader } })
     const duringBody = (await during.json()) as { status: string }
     // May already be idle if fast, but typically busy
@@ -785,7 +778,14 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     const sid = await createSession("Abort Test")
     await sendPrompt(sid, "Write a very long detailed essay about the history of computing, at least 500 words.")
 
-    await Bun.sleep(3000)
+    await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/session/${sid}`, { headers: { Authorization: authHeader } })
+        return ((await response.json()) as { status: string }).status
+      },
+      (status) => status === "busy" || status === "running",
+      { description: `session ${sid} to start before abort` },
+    )
 
     const abortRes = await fetch(`${baseUrl}/session/${sid}/abort`, {
       method: "POST",
@@ -911,23 +911,40 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
 
   test("SSE event stream serves events during prompt", async () => {
     const sid = await createSession("SSE Test")
-
-    const sseProc = Bun.spawn({
-      cmd: ["curl", "-s", "-N", "--max-time", "60", "-H", `Authorization: ${authHeader}`, `${baseUrl}/api/event`],
-      stdout: "pipe",
-      stderr: "pipe",
+    const response = await globalThis.fetch(`${baseUrl}/api/event`, {
+      headers: { Authorization: authHeader },
     })
+    expect(response.ok).toBe(true)
+    const reader = response.body!.getReader()
+    const decoder = new TextDecoder()
+    let output = ""
+    const readStream = (async () => {
+      while (true) {
+        const next = await reader.read()
+        if (next.done) return
+        output += decoder.decode(next.value, { stream: true })
+      }
+    })()
 
-    await Bun.sleep(500)
-
-    await sendPrompt(sid, "Say hello")
-
-    await waitForIdle(sid)
-
-    await Bun.sleep(1000)
-
-    const output = await new Response(sseProc.stdout).text()
-    sseProc.kill()
+    try {
+      await waitFor(
+        () => output,
+        (value) => value.includes('"type":"server.connected"'),
+        {
+          description: "SSE connection event",
+        },
+      )
+      await sendPrompt(sid, "Say hello")
+      await waitForIdle(sid)
+      await waitFor(
+        () => output,
+        (value) => value.includes('"type":"session.idle"') && value.includes(`"sessionID":"${sid}"`),
+        { description: `SSE idle event for session ${sid}` },
+      )
+    } finally {
+      await reader.cancel()
+      await readStream
+    }
 
     const eventLines = output.split("\n").filter((l) => l.startsWith("event: "))
     const dataLines = output.split("\n").filter((l) => l.startsWith("data: "))
@@ -1529,16 +1546,14 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     })
 
     // Wait until the child exists, then abort while its real PI process is active.
-    const childDeadline = Date.now() + 30000
-    let childStarted = false
-    while (Date.now() < childDeadline && !childStarted) {
-      const res = await fetch(`${baseUrl}/session/${sid}/children`, { headers: { Authorization: authHeader } })
-      const children = (await res.json()) as Array<{ id: string }>
-      childStarted = children.length > 0
-      if (!childStarted) await Bun.sleep(100)
-    }
-    expect(childStarted).toBe(true)
-    await Bun.sleep(500)
+    await waitFor(
+      async () => {
+        const response = await fetch(`${baseUrl}/session/${sid}/children`, { headers: { Authorization: authHeader } })
+        return (await response.json()) as Array<{ id: string; status: string }>
+      },
+      (children) => children.some((child) => child.status === "busy" || child.status === "running"),
+      { timeoutMs: 30_000, intervalMs: 100, description: `running subtask for session ${sid}` },
+    )
 
     const abortRes = await fetch(`${baseUrl}/session/${sid}/abort`, {
       method: "POST",
