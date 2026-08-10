@@ -246,8 +246,12 @@ describe("agent integrations", () => {
       }
 
       expect(assistants).toHaveLength(3)
-      expect(assistants.map((message) => message.parts.length)).toEqual([1, 1, 1])
-      expect(assistants.map((message) => message.parts[0]?.type)).toEqual(["text", "reasoning", "tool"])
+      expect(assistants.map((message) => message.parts.length)).toEqual([1, 1, 2])
+      expect(assistants.map((message) => message.parts.map((part) => part.type))).toEqual([
+        ["text"],
+        ["reasoning"],
+        ["tool", "tool"],
+      ])
       expect(assistants.map((message) => message.info.id)).toEqual(
         assistants.map((message) => message.info.id).toSorted(),
       )
@@ -270,8 +274,12 @@ describe("agent integrations", () => {
         data: Array<{ type: string; id: string; content?: Array<{ type: string }> }>
       }
       const projected = payload.data.filter((message) => message.type === "assistant")
-      expect(projected.map((message) => message.content?.length)).toEqual([1, 1, 1])
-      expect(projected.map((message) => message.content?.[0]?.type)).toEqual(["text", "reasoning", "tool"])
+      expect(projected.map((message) => message.content?.length)).toEqual([1, 1, 2])
+      expect(projected.map((message) => message.content?.map((part) => part.type))).toEqual([
+        ["text"],
+        ["reasoning"],
+        ["tool", "tool"],
+      ])
 
       adapter.releaseIdle()
       for (let attempt = 0; attempt < 100 && context.sessions.getStatus(session.id) !== "idle"; attempt++) {
@@ -447,6 +455,17 @@ class GatedEncapsulationRuntime implements AgentRuntime {
       input: { filePath: "/tmp/example" },
       output: "tool output",
       title: "read",
+    })
+    this.emit({
+      type: "tool_call_completed",
+      sessionId: this.sessionId,
+      messageId: input.assistantMessageId,
+      partId: "encap-tool-2",
+      callId: "call_encap_2",
+      tool: "write",
+      input: { filePath: "/tmp/example-2" },
+      output: "second tool output",
+      title: "write",
     })
     this.emit({
       type: "message_completed",

@@ -37,9 +37,10 @@
 
 所有会话接口共用同一个 `SessionService`、Runtime、消息仓库和事件处理流程。
 
-v2 Desktop 历史重载存在按重建 part ID 排序的版本可使用 `--msg-part-encap` 兼容：服务端生成的每个 assistant part
-分别放入同一 user turn 下的有序 sibling assistant message；用户 prompt part 不拆。该模式下 `message_completed` 统一
-完成整组 message，只有 terminal message 保存最终 finish/usage/error；session 是否完成仍只由 `session_idle` 决定。
+v2 Desktop 历史重载存在按重建 part ID 排序的版本可使用 `--msg-part-encap` 兼容：服务端生成的 assistant part 按连续
+相同类型分组，分别放入同一 user turn 下的有序 sibling assistant message；用户 prompt part 不拆。该模式下
+`message_completed` 统一完成整组 message，只有 terminal message 保存最终 finish/usage/error；session 是否完成仍只由
+`session_idle` 决定。
 
 ### Pi 后端设计
 

@@ -335,7 +335,7 @@ export function formatHelp(): string {
     "  --verbose                Print HTTP requests and debug logs to stderr",
     "  --disable-pty-token-check  Skip the PTY WebSocket connect-ticket check",
     "  --disable-v1-compatible   Do not mount the v1-compatible routes (GET /config, DELETE /session/:id)",
-    "  --msg-part-encap         Put each generated assistant part in its own message",
+    "  --msg-part-encap         Group consecutive assistant parts by type into messages",
     "  --api-version <VERSION>  API surface to expose: v1 or v2 (default: v2)",
     "",
     "ENVIRONMENT:",

@@ -98,12 +98,13 @@ ID 模式保存在 session 的内部 metadata 中，重启后继续生效；手�
 目录更新和 wide 切换会同步刷新，递归删除会清除父子 session 条目；SQLite 仍是重启后的持久化真相来源。其他 Session
 字段不进入该 cache。
 
-### 可选的单 Part Message 投影
+### 可选的同类型 Part Message 投影
 
 默认情况下，一次后端执行产生的 reasoning、text 和 tool part 都投影到 prompt 预先创建的 assistant message。
-`serve --msg-part-encap` 改用 `AssistantPartProjector`：第一项复用预创建 message，后续每个新 assistant part 创建一条
-同 parent user message 的有序 sibling message，从而保证 v2 历史加载即使在 message 内重排 part，也无法改变跨 part
-的时间顺序。客户端提交的 user message 及其 text/file/agent/subtask part 不拆分，否则会错误增加用户轮次。
+`serve --msg-part-encap` 改用 `AssistantPartProjector`：第一组复用预创建 message，后续 assistant part 与前一 part
+类型相同时继续写入当前 message，类型变化时才创建一条同 parent user message 的有序 sibling message。这样既能保证
+v2 历史加载不会改变不同类型 part 的先后顺序，也能减少连续同类型 part 产生的 message 数量。客户端提交的 user
+message 及其 text/file/agent/subtask part 不拆分，否则会错误增加用户轮次。
 
 该模式只改变 OpenCode 展示投影，不改变 Runtime 的 `PromptInput.assistantMessageId`；后端整轮仍使用原始 root message ID
 上报事件，投影器维护 root 到 sibling message 的进程内映射。`message_completed` 会统一关闭整组 message，只有最后一个

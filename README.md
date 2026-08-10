@@ -183,7 +183,7 @@ opencode-server-adaptor [全局选项] <命令> [命令选项]
 | `--disable-pty-token-check` | 跳过 PTY WebSocket 的 connect-ticket 校验，允许客户端不带 ticket 直接升级连接。仅用于兼容部分 OpenCode Desktop 版本的 PTY 连接问题（详见“启动服务”一节）；不要在对公网暴露的服务上使用。 |
 | `--api-version <VERSION>`   | 选择暴露的 API 协议版本，取值 `v1` 或 `v2`，默认 `v2`。详见上方“OpenCode 协议兼容”一节。                                                                                                 |
 | `--disable-v1-compatible`   | 不挂载兼容层路由（`GET /config`、`DELETE /session/:id`、`GET /file`、`GET /file/content`、`GET /find/file`）。关闭后 Desktop 文件树和相关兼容功能可能不可用。                            |
-| `--msg-part-encap`          | 将服务端生成的每个 assistant part 封装到独立 assistant message，用 message 顺序兼容 Desktop 的 v2 历史重载；默认关闭。用户 prompt 的 text/file/agent 等 part 不拆分。                    |
+| `--msg-part-encap`          | 将服务端生成的 assistant part 按连续相同类型分组并封装到独立 assistant message，用 message 顺序兼容 Desktop 的 v2 历史重载；默认关闭。用户 prompt 的 text/file/agent 等 part 不拆分。    |
 
 ## 启动服务
 

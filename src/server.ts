@@ -265,7 +265,7 @@ export interface ServerContextOptions {
    * Skips mounting the v1-compatible routes (GET /config, DELETE /session/:id).
    */
   disableV1Compatible?: boolean
-  /** Places each server-generated assistant part in its own sibling message. */
+  /** Groups consecutive server-generated assistant parts by type into sibling messages. */
   msgPartEncap?: boolean
 }
 

@@ -150,7 +150,9 @@ describe("OpenCode v2 subagent event ordering", () => {
     }
     const assistants = context.data.filter((message) => message.type === "assistant")
     const contents = assistants.flatMap((message) => message.content ?? [])
-    expect(assistants.every((message) => (message.content?.length ?? 0) <= 1)).toBe(true)
+    const projectedTypes = assistants.map((message) => [...new Set((message.content ?? []).map((part) => part.type))])
+    expect(projectedTypes.every((types) => types.length <= 1)).toBe(true)
+    expect(projectedTypes.map((types) => types[0])).toEqual(["reasoning", "tool", "text"])
     expect(contents.map((content) => content.type)).toEqual(["reasoning", "tool", "text"])
     expect(contents.filter((content) => content.type === "text")).toHaveLength(1)
     expect(assistants.filter((message) => message.finish !== undefined)).toHaveLength(1)

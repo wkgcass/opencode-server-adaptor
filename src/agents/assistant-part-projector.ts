@@ -16,10 +16,11 @@ export interface AssistantPartProjectorOptions {
  * Projects backend parts onto OpenCode assistant messages.
  *
  * The default projection keeps every part on the assistant message admitted
- * for the prompt. Encapsulation mode instead gives every assistant part its
- * own sibling message while retaining the original user message as parent.
- * Message completion remains an execution-level boundary: all siblings are
- * closed together, and only the terminal sibling owns finish/usage/error.
+ * for the prompt. Encapsulation mode instead groups consecutive assistant
+ * parts of the same type into sibling messages while retaining the original
+ * user message as parent. Message completion remains an execution-level
+ * boundary: all siblings are closed together, and only the terminal sibling
+ * owns finish/usage/error.
  */
 export class AssistantPartProjector {
   private readonly enabled: boolean
@@ -50,7 +51,8 @@ export class AssistantPartProjector {
 
     const group = this.requireGroup(sessionId, rootMessageId)
     let targetMessageId = group.messageIds.at(-1)!
-    if (this.messages.listParts(targetMessageId).length > 0) {
+    const previousPart = this.messages.listParts(targetMessageId).at(-1)
+    if (previousPart && previousPart.type !== type) {
       const root = this.requireAssistant(group.rootMessageId)
       const sibling = this.messages.createAssistantMessage(
         sessionId,
