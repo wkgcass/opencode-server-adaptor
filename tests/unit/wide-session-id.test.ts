@@ -42,13 +42,13 @@ describe("session-scoped wide ordered IDs", () => {
     })
 
     expect(user.id).toBe(clientMessageId)
-    expect(assistant.id).toMatch(/^msg_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(assistant.id).toMatch(/^msg-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
     expect(assistant.id > user.id).toBe(true)
-    expect(userPart.id).toMatch(/^prt_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
-    expect(assistantPart.id).toMatch(/^prt_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(userPart.id).toMatch(/^prt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(assistantPart.id).toMatch(/^prt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
 
     const durable = new SessionEventStore(db, logger, sessions).append(parent.id, "session.next.prompted", {})
-    expect(durable.id).toMatch(/^evt_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(durable.id).toMatch(/^evt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
 
     let liveEventId = ""
     const events = new EventBus(logger, undefined, (event) => {
@@ -57,14 +57,14 @@ describe("session-scoped wide ordered IDs", () => {
     })
     events.subscribeInternal((event) => (liveEventId = event.id))
     events.publish(createEvent("message.updated", { sessionID: parent.id, info: assistant }))
-    expect(liveEventId).toMatch(/^evt_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(liveEventId).toMatch(/^evt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
 
     const child = sessions.create({
       directory,
       parentId: parent.id,
       idFormat: sessions.getIdFormat(parent.id),
     })
-    expect(messages.createUserMessage(child.id, "pi").id.startsWith("msg_-")).toBe(true)
+    expect(messages.createUserMessage(child.id, "pi").id.startsWith("msg-")).toBe(true)
     db.close()
 
     const reopened = new DatabaseService(databasePath, logger)
@@ -72,7 +72,7 @@ describe("session-scoped wide ordered IDs", () => {
     const reopenedMessages = new MessageRepository(reopened, reopenedSessions)
     expect(reopenedSessions.getIdFormat(parent.id)).toBe("wide")
     expect(reopenedSessions.getIdFormat(child.id)).toBe("wide")
-    expect(reopenedMessages.createUserMessage(parent.id, "pi").id.startsWith("msg_-")).toBe(true)
+    expect(reopenedMessages.createUserMessage(parent.id, "pi").id.startsWith("msg-")).toBe(true)
     reopened.close()
   })
 

@@ -63,8 +63,8 @@ OpenCode `unrevert` 切回原会话。
 状态目录下的 `pi/models.json`。provider、model 和 API key 都只读取 YAML，不会从 SQLite 迁移。当前业务表只保留
 `sessions`、`messages`、`parts`、`permissions` 和 v2 断点续传使用的 `session_events`。
 
-session metadata 还保存内部有序 ID 模式。客户端消息 ID 以 `msg_-` 开头时，该 session 持久切换到由 44-bit
-逻辑毫秒时间戳和 12-bit 同毫秒计数器组成的 wide 排序格式，服务端后续生成 `msg_-`、`prt_-` 和 `evt_-`；subtask
+session metadata 还保存内部有序 ID 模式。客户端消息 ID 以 `msg-` 开头时，该 session 持久切换到由 44-bit
+逻辑毫秒时间戳和 12-bit 同毫秒计数器组成的 wide 排序格式，服务端后续生成 `msg-`、`prt-` 和 `evt-`；subtask
 子 session 继承该模式，但 `ses_`、权限、call、PTY 和 RPC ID 不切换。客户端显式提供的 message/part ID 仍原样保留。
 
 项目当前处于开发阶段，不维护数据库 migration 或 `_migrations` 表。代码只初始化最新 schema；已有数据库需要改表时，

@@ -86,7 +86,7 @@ describe("agent backend abstractions", () => {
         .listMessages(handle.childSessionId)
         .every(
           (message) =>
-            message.info.id.startsWith("msg_-") && message.parts.every((part) => part.id.startsWith("prt_-")),
+            message.info.id.startsWith("msg-") && message.parts.every((part) => part.id.startsWith("prt-")),
         ),
     ).toBe(true)
     expect(childAssistant?.parts).toEqual(

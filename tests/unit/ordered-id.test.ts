@@ -39,11 +39,11 @@ describe("OpenCode-compatible ordered identifiers", () => {
       createMessageId(timestamp - 2_000, "wide"),
     ]
 
-    expect(ids[0]).toMatch(/^msg_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
-    expect(ids[1]).toMatch(/^prt_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
-    expect(ids[2]).toMatch(/^evt_-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(ids[0]).toMatch(/^msg-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(ids[1]).toMatch(/^prt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
+    expect(ids[2]).toMatch(/^evt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
 
-    const values = ids.map((id) => BigInt(`0x${id.slice(5, 19)}`))
+    const values = ids.map((id) => BigInt(`0x${id.slice(4, 18)}`))
     expect(values.map((value) => value >> 12n)).toEqual(Array(4).fill(BigInt(timestamp)))
     expect(values.map((value) => value & 0xfffn)).toEqual([1n, 2n, 3n, 4n])
     expect(values).toEqual([...values].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)))
@@ -56,7 +56,7 @@ describe("OpenCode-compatible ordered identifiers", () => {
     const parent = createMessageId(1_760_000_000_000, "wide")
     const assistant = createMessageIdAfter(parent, "wide")
 
-    expect(assistant.startsWith("msg_-")).toBe(true)
+    expect(assistant.startsWith("msg-")).toBe(true)
     expect(assistant > parent).toBe(true)
   })
 
@@ -65,10 +65,10 @@ describe("OpenCode-compatible ordered identifiers", () => {
     const ids = Array.from({ length: 4_095 }, () => createMessageId(timestamp, "wide"))
     const carried = createMessageId(timestamp, "wide")
     const afterCarry = createMessageId(timestamp, "wide")
-    const firstValue = BigInt(`0x${ids[0]!.slice(5, 19)}`)
-    const lastValue = BigInt(`0x${ids.at(-1)!.slice(5, 19)}`)
-    const carriedValue = BigInt(`0x${carried.slice(5, 19)}`)
-    const afterCarryValue = BigInt(`0x${afterCarry.slice(5, 19)}`)
+    const firstValue = BigInt(`0x${ids[0]!.slice(4, 18)}`)
+    const lastValue = BigInt(`0x${ids.at(-1)!.slice(4, 18)}`)
+    const carriedValue = BigInt(`0x${carried.slice(4, 18)}`)
+    const afterCarryValue = BigInt(`0x${afterCarry.slice(4, 18)}`)
 
     expect(firstValue).toBe(BigInt(timestamp) * 4_096n + 1n)
     expect(firstValue >> 12n).toBe(BigInt(timestamp))

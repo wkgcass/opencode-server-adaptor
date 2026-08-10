@@ -78,15 +78,15 @@ session 单调递增的 durable sequence。订阅流程先注册实时监听，�
 
 ### 会话级有序 ID 格式
 
-默认继续生成 OpenCode 兼容的 legacy ID：`<prefix>_<12 hex><14 base62>`。当客户端提交的消息 ID 以 `msg_-`
+默认继续生成 OpenCode 兼容的 legacy ID：`<prefix>_<12 hex><14 base62>`。当客户端提交的消息 ID 以 `msg-`
 开头时，`SessionService` 将该 session 持久切换为 wide ID 模式；随后由服务端生成的消息、part、实时事件和 durable
-事件分别使用 `msg_-`、`prt_-` 和 `evt_-`。wide ID 格式为
-`<prefix>_-<14 hex><14 base62>`：前 14 位十六进制由 44-bit 逻辑毫秒时间戳和 12-bit 同毫秒计数器组成，即
+事件分别使用 `msg-`、`prt-` 和 `evt-`。wide ID 格式为
+`<prefix>-<14 hex><14 base62>`：前 14 位十六进制由 44-bit 逻辑毫秒时间戳和 12-bit 同毫秒计数器组成，即
 `logicalTimestamp * 4096 + counter`；同毫秒并发或系统时钟回拨时继续单调递增，
 随机尾部只负责降低跨进程冲突概率。
 
-`-` 的字典序低于 legacy ID 排序部分使用的十六进制字符，因此同一 session 混用两种格式时，wide ID 会排在 legacy
-ID 之前；正常用法是在会话第一条客户端消息即使用 `msg_-`，避免混用。
+`-` 的字典序低于 legacy ID 分隔符 `_`，因此同一 session 混用两种格式时，wide ID 会排在 legacy ID 之前；
+正常用法是在会话第一条客户端消息即使用 `msg-`，避免混用。
 
 ID 模式保存在 session 的内部 metadata 中，重启后继续生效；手动和模型原生 subtask 创建的子 session 继承父 session
 模式。session 本身在收到第一条消息前已经创建，因此其 `ses_` ID 不改写，子 session ID 也仍使用 legacy `ses_`；

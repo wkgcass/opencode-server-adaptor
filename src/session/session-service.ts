@@ -5,6 +5,7 @@ import type { ProviderConfigStore } from "../config/provider-config.ts"
 import type { EventBus, OpenCodeEvent } from "../event/index.ts"
 import { createEvent } from "../event/index.ts"
 import type { SessionEventStore } from "../event/session-event-store.ts"
+import { orderedIdFormat } from "../id/index.ts"
 import type { MessageRepository, MessageWithParts, Part } from "../message/index.ts"
 import type { Session, SessionRepository } from "./index.ts"
 import { buildDefaultProviderMap, buildProviders, type BuiltinProviderDefinition } from "../provider/index.ts"
@@ -689,7 +690,7 @@ export class SessionService {
   }
 
   private enableWideIdsFromMessage(sessionID: string, messageID: string | undefined): void {
-    if (messageID?.startsWith("msg_-")) this.sessions.enableWideIds(sessionID)
+    if (orderedIdFormat(messageID) === "wide") this.sessions.enableWideIds(sessionID)
   }
 
   requireSession(sessionID: string): Session {

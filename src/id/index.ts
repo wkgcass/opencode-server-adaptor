@@ -16,6 +16,7 @@ const WIDE_COUNTER_MAX = WIDE_COUNTER_SCALE - 1n
 const WIDE_TIMESTAMP_MAX = (1n << WIDE_TIMESTAMP_BITS) - 1n
 const WIDE_SORT_HEX_LENGTH = 14
 const WIDE_SORT_MAX = (1n << (WIDE_TIMESTAMP_BITS + WIDE_COUNTER_BITS)) - 1n
+const WIDE_SEPARATOR = "-"
 
 export type OrderedIdFormat = "legacy" | "wide"
 
@@ -94,7 +95,7 @@ function wideOrdered(
   wideCounter = nextCounter
 
   const sortable = direction === "descending" ? WIDE_SORT_MAX ^ value : value
-  return `${prefix}_-${sortable.toString(16).padStart(WIDE_SORT_HEX_LENGTH, "0")}${randomBase62(RANDOM_LENGTH)}`
+  return `${prefix}${WIDE_SEPARATOR}${sortable.toString(16).padStart(WIDE_SORT_HEX_LENGTH, "0")}${randomBase62(RANDOM_LENGTH)}`
 }
 
 function ordered(
@@ -107,7 +108,7 @@ function ordered(
 }
 
 function wideSortableValue(id: string, prefix: string): bigint | undefined {
-  const marker = `${prefix}_-`
+  const marker = `${prefix}${WIDE_SEPARATOR}`
   if (!id.startsWith(marker)) return undefined
   const body = id.slice(marker.length)
   if (!/^[0-9a-f]{14}[0-9A-Za-z]{14}$/.test(body)) return undefined
@@ -165,12 +166,22 @@ export function createEventId(timestamp?: number, format: OrderedIdFormat = "leg
 }
 
 export function orderedIdFormat(id: string | undefined): OrderedIdFormat {
-  return id?.startsWith("msg_-") || id?.startsWith("prt_-") || id?.startsWith("evt_-") ? "wide" : "legacy"
+  if (!id) return "legacy"
+  return [PREFIXES.message, PREFIXES.part, PREFIXES.event].some((prefix) =>
+    id.startsWith(`${prefix}${WIDE_SEPARATOR}`),
+  )
+    ? "wide"
+    : "legacy"
 }
 
 export function isOrderedId(id: string, prefix: keyof typeof PREFIXES): boolean {
-  const expectedPrefix = `${PREFIXES[prefix]}_`
-  if (!id.startsWith(expectedPrefix)) return false
-  const body = id.slice(expectedPrefix.length)
-  return /^[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(body) || /^-[0-9a-f]{14}[0-9A-Za-z]{14}$/.test(body)
+  const valuePrefix = PREFIXES[prefix]
+  const legacyMarker = `${valuePrefix}_`
+  if (id.startsWith(legacyMarker)) {
+    const body = id.slice(legacyMarker.length)
+    return /^[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(body)
+  }
+
+  const wideMarker = `${valuePrefix}${WIDE_SEPARATOR}`
+  return id.startsWith(wideMarker) && /^[0-9a-f]{14}[0-9A-Za-z]{14}$/.test(id.slice(wideMarker.length))
 }

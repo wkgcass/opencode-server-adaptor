@@ -212,7 +212,7 @@ describe("Fake Pi Integration", () => {
     expect(textParts[0]!.text).toContain("fake Pi response")
   }, 15000)
 
-  test("a msg_- client message switches the session to persistent wide IDs", async () => {
+  test("a msg- client message switches the session to persistent wide IDs", async () => {
     const headers = { Authorization: authHeader, "Content-Type": "application/json" }
     const createRes = await fetch(`${baseUrl}/session`, {
       method: "POST",
@@ -243,12 +243,12 @@ describe("Fake Pi Integration", () => {
       parts: Array<{ id: string }>
     }>
     expect(history).toHaveLength(4)
-    expect(history.every((message) => message.info.id.startsWith("msg_-"))).toBe(true)
+    expect(history.every((message) => message.info.id.startsWith("msg-"))).toBe(true)
     expect(
       history
         .filter((message) => message.info.role === "assistant")
         .flatMap((message) => message.parts)
-        .filter((part) => !part.id.startsWith("prt_-")),
+        .filter((part) => !part.id.startsWith("prt-")),
     ).toEqual([])
   }, 15000)
 
