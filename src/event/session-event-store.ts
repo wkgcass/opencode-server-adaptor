@@ -5,7 +5,9 @@ import type { Logger } from "../logging/index.ts"
 
 export interface SessionDurableEvent {
   id: string
+  created: number
   type: string
+  metadata?: Record<string, unknown>
   durable: {
     aggregateID: string
     seq: number
@@ -33,18 +35,20 @@ export class SessionEventStore {
     type: string,
     data: Record<string, unknown>,
     location?: { directory: string },
+    options?: { id?: string; created?: number; metadata?: Record<string, unknown> },
   ): SessionDurableEvent {
     const event = this.db.transaction(() => {
       const row = this.db
         .prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM session_events WHERE session_id = ?")
         .get(sessionID) as { seq: number }
-      const id = createEventId(undefined, this.idFormats?.getIdFormat(sessionID) ?? "legacy")
+      const id = options?.id ?? createEventId(undefined, this.idFormats?.getIdFormat(sessionID) ?? "legacy")
+      const created = options?.created ?? Date.now()
       const durable = { aggregateID: sessionID, seq: row.seq, version: 1 }
-      const stored = { durable, location, data }
+      const stored = { durable, location, data, metadata: options?.metadata }
       this.db
         .prepare("INSERT INTO session_events (session_id, seq, id, type, data, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(sessionID, row.seq, id, type, JSON.stringify(stored), Date.now())
-      return { id, type, durable, location, data }
+        .run(sessionID, row.seq, id, type, JSON.stringify(stored), created)
+      return { id, created, type, durable, location, data, metadata: options?.metadata }
     })
 
     for (const listener of this.listeners.get(sessionID) ?? []) {
@@ -91,12 +95,15 @@ function rowToEvent(row: SessionEventRow): SessionDurableEvent {
     durable?: SessionDurableEvent["durable"]
     location?: SessionDurableEvent["location"]
     data?: Record<string, unknown>
+    metadata?: Record<string, unknown>
   }
   return {
     id: row.id,
+    created: row.created_at,
     type: row.type,
     durable: stored.durable ?? { aggregateID: row.session_id, seq: row.seq, version: 1 },
     location: stored.location,
     data: stored.data ?? {},
+    metadata: stored.metadata,
   }
 }

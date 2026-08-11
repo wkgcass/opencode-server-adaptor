@@ -319,10 +319,21 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
   const skills = new SkillService(logger, { directories: installedIntegrations.skillDirectories })
   const commands = new CommandService(skills)
 
-  const agentService = new AgentService(registry, sessions, messages, events, logger, config, permissions, skills, {
-    encapsulateMessageParts: options?.msgPartEncap,
-  })
   const sessionEvents = new SessionEventStore(db, logger, sessions)
+  const agentService = new AgentService(
+    registry,
+    sessions,
+    messages,
+    events,
+    logger,
+    config,
+    permissions,
+    skills,
+    sessionEvents,
+    {
+      encapsulateMessageParts: options?.msgPartEncap,
+    },
+  )
   const sessionService = new SessionService(
     sessions,
     messages,

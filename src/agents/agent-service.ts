@@ -19,6 +19,8 @@ import { SubtaskManager, type SubtaskResult } from "../agents/subtask-manager.ts
 import { subagentSessionTitle } from "./subagents/subagent-session.ts"
 import type { PermissionRepository } from "../permission/index.ts"
 import { AssistantPartProjector } from "./assistant-part-projector.ts"
+import type { SessionEventStore } from "../event/session-event-store.ts"
+import { eventIdForMessageId } from "../id/index.ts"
 
 interface RuntimeSubtask {
   parentSessionId: string
@@ -53,6 +55,10 @@ interface SubtaskOutcome {
   usage?: SubtaskResult["usage"]
 }
 
+interface PendingCompactionProjection {
+  compactionMessageId: string
+}
+
 function runtimeSubtaskKey(parentSessionId: string, callId: string): string {
   return `${parentSessionId}\0${callId}`
 }
@@ -85,6 +91,7 @@ export class AgentService {
   private readonly config: AppConfig
   private readonly permissions: PermissionRepository
   private readonly skills: SkillService
+  private readonly sessionEvents: SessionEventStore
   private readonly globalQueue = new SessionQueue()
   private readonly partIdMap = new Map<string, Map<string, string>>()
   /**
@@ -103,6 +110,7 @@ export class AgentService {
   private readonly titleJobs = new Set<string>()
   private readonly runtimeSubtasks = new Map<string, RuntimeSubtask>()
   private readonly pendingStarts = new Map<string, Set<ReturnType<typeof setTimeout>>>()
+  private readonly pendingCompactions = new Map<string, PendingCompactionProjection>()
 
   constructor(
     registry: AgentAdapterRegistry,
@@ -113,6 +121,7 @@ export class AgentService {
     config: AppConfig,
     permissions: PermissionRepository,
     skills: SkillService,
+    sessionEvents: SessionEventStore,
     options?: { encapsulateMessageParts?: boolean },
   ) {
     this.registry = registry
@@ -123,6 +132,7 @@ export class AgentService {
     this.config = config
     this.permissions = permissions
     this.skills = skills
+    this.sessionEvents = sessionEvents
 
     this.assistantParts = new AssistantPartProjector(messages, events, {
       encapsulateParts: options?.encapsulateMessageParts,
@@ -1061,6 +1071,90 @@ export class AgentService {
     }
   }
 
+  private publishCurrentSessionEvent(
+    sessionId: string,
+    type: string,
+    data: Record<string, unknown>,
+    options?: { id?: string; created?: number; metadata?: Record<string, unknown> },
+  ): void {
+    const session = this.sessions.get(sessionId)
+    const event = this.sessionEvents.append(
+      sessionId,
+      type,
+      data,
+      session ? { directory: session.directory } : undefined,
+      options,
+    )
+    this.events.publish(
+      {
+        id: event.id,
+        created: event.created,
+        type: event.type,
+        metadata: event.metadata,
+        durable: event.durable,
+        properties: event.data,
+      },
+      session?.directory,
+    )
+  }
+
+  private startCompactionProjection(
+    sessionId: string,
+    reason: "auto" | "manual",
+    backendReason: string,
+  ): PendingCompactionProjection | null {
+    const session = this.sessions.get(sessionId)
+    if (!session) return null
+    const existing = this.pendingCompactions.get(sessionId)
+    if (existing) return existing
+
+    const model =
+      this.sessionModels.get(sessionId) ??
+      (session.model ? { providerID: session.model.providerID, modelID: session.model.id } : undefined)
+    const projection = this.messages.startCompactionProjection({
+      sessionId,
+      agent: session.agent,
+      model,
+      reason,
+    })
+    const pending = {
+      compactionMessageId: projection.compaction.id,
+    }
+    this.pendingCompactions.set(sessionId, pending)
+
+    this.publishCurrentSessionEvent(
+      sessionId,
+      "session.synthetic",
+      {
+        sessionID: sessionId,
+        text: projection.synthetic.text,
+        description: projection.synthetic.description,
+        metadata: projection.synthetic.metadata,
+      },
+      {
+        id: eventIdForMessageId(projection.synthetic.id),
+        created: projection.synthetic.time.created,
+        metadata: { source: "compaction" },
+      },
+    )
+    this.publishCurrentSessionEvent(
+      sessionId,
+      "session.compaction.started",
+      {
+        sessionID: sessionId,
+        reason,
+        recent: "",
+        inputID: projection.compaction.id,
+      },
+      {
+        id: eventIdForMessageId(projection.compaction.id),
+        created: projection.compaction.time.created,
+        metadata: { backendReason },
+      },
+    )
+    return pending
+  }
+
   private publishProjectedMessages(messageIds: string[]): void {
     for (const messageId of messageIds) {
       this.publishMessageParts(messageId)
@@ -1848,41 +1942,83 @@ export class AgentService {
         }
 
         case "compaction_started": {
-          this.events.publish(
-            createEvent("session.compaction.started", {
-              sessionID: sessionId,
-              reason: event.reason,
-              backendReason: event.backendReason,
-            }),
-          )
+          this.startCompactionProjection(sessionId, event.reason, event.backendReason ?? event.reason)
           break
         }
 
         case "compaction_completed": {
-          this.events.publish(
-            createEvent("session.compaction.completed", {
+          const pending =
+            this.pendingCompactions.get(sessionId) ??
+            this.startCompactionProjection(sessionId, event.reason, event.backendReason ?? event.reason)
+          if (!pending) break
+          const completed = this.messages.completeCompactionProjection(pending.compactionMessageId, {
+            summary: event.result.summary,
+            usage: event.result.usage,
+          })
+          if (!completed) {
+            this.pendingCompactions.delete(sessionId)
+            throw new Error(`Compaction projection not found: ${pending.compactionMessageId}`)
+          }
+          this.publishCurrentSessionEvent(
+            sessionId,
+            "session.compaction.ended",
+            {
               sessionID: sessionId,
               reason: event.reason,
-              backendReason: event.backendReason,
-              result: event.result,
-              willRetry: event.willRetry ?? false,
-            }),
+              text: completed.compaction.summary,
+              recent: completed.compaction.recent,
+            },
+            {
+              metadata: {
+                backendReason: event.backendReason,
+                willRetry: event.willRetry ?? false,
+                firstKeptEntryId: event.result.firstKeptEntryId,
+                tokensBefore: event.result.tokensBefore,
+                estimatedTokensAfter: event.result.estimatedTokensAfter,
+              },
+            },
           )
+          this.publishMessage(completed.assistant.id)
+          this.publishMessageParts(completed.assistant.id)
           this.events.publish(createEvent("session.compacted", { sessionID: sessionId }))
+          this.pendingCompactions.delete(sessionId)
           break
         }
 
         case "compaction_failed": {
-          this.events.publish(
-            createEvent("session.compaction.failed", {
+          const pending = this.pendingCompactions.get(sessionId)
+          if (pending) this.messages.failCompactionProjection(pending.compactionMessageId, event.error)
+          this.publishCurrentSessionEvent(
+            sessionId,
+            "session.compaction.failed",
+            {
               sessionID: sessionId,
               reason: event.reason,
-              backendReason: event.backendReason,
-              error: event.error,
-              aborted: event.aborted ?? false,
-              willRetry: event.willRetry ?? false,
+              error: { type: "unknown", message: event.error },
+              inputID: pending?.compactionMessageId,
+            },
+            {
+              metadata: {
+                backendReason: event.backendReason,
+                aborted: event.aborted ?? false,
+                willRetry: event.willRetry ?? false,
+              },
+            },
+          )
+          // Current-protocol compaction failure updates the session source,
+          // while the legacy session.error event is what Desktop surfaces in
+          // its notification/error UI. Publish both projections from the same
+          // application-layer failure boundary.
+          this.events.publish(
+            createEvent("session.error", {
+              sessionID: sessionId,
+              error: {
+                name: "UnknownError",
+                data: { message: event.error },
+              },
             }),
           )
+          this.pendingCompactions.delete(sessionId)
           break
         }
 

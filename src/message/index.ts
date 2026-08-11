@@ -41,9 +41,36 @@ export interface AssistantMessage {
     }
   }
   finish?: string
+  metadata?: Record<string, unknown>
 }
 
-export type Message = UserMessage | AssistantMessage
+/** Hidden turn anchor used by current OpenCode clients for server-generated context. */
+export interface SyntheticMessage {
+  id: string
+  sessionID: string
+  role: "synthetic"
+  time: { created: number }
+  text: string
+  description?: string
+  metadata?: Record<string, unknown>
+}
+
+/** First-class current-protocol record that Desktop projects as the compaction divider. */
+export interface CompactionMessage {
+  id: string
+  sessionID: string
+  role: "compaction"
+  time: { created: number }
+  status: "running" | "completed" | "failed"
+  reason: "auto" | "manual"
+  summary: string
+  recent: string
+  anchorMessageID: string
+  error?: { type: "unknown"; message: string }
+  metadata?: Record<string, unknown>
+}
+
+export type Message = UserMessage | AssistantMessage | SyntheticMessage | CompactionMessage
 
 export interface TextPart {
   id: string
@@ -134,6 +161,32 @@ export interface SessionIdFormatResolver {
 
 function rowToMessage(row: MessageRow): Message {
   const data = JSON.parse(row.data) as Record<string, unknown>
+  if (row.role === "synthetic") {
+    return {
+      id: row.id,
+      sessionID: row.session_id,
+      role: "synthetic",
+      time: { created: row.created_at },
+      text: (data.text as string) ?? "",
+      description: data.description as string | undefined,
+      metadata: data.metadata as Record<string, unknown> | undefined,
+    }
+  }
+  if (row.role === "compaction") {
+    return {
+      id: row.id,
+      sessionID: row.session_id,
+      role: "compaction",
+      time: { created: row.created_at },
+      status: data.status === "completed" || data.status === "failed" ? data.status : "running",
+      reason: data.reason === "auto" ? "auto" : "manual",
+      summary: (data.summary as string) ?? "",
+      recent: (data.recent as string) ?? "",
+      anchorMessageID: (data.anchorMessageID as string) ?? "",
+      error: data.error as CompactionMessage["error"],
+      metadata: data.metadata as Record<string, unknown> | undefined,
+    }
+  }
   if (row.role === "user") {
     return {
       id: row.id,
@@ -169,6 +222,7 @@ function rowToMessage(row: MessageRow): Message {
     },
     error: data.error as AssistantMessage["error"],
     finish: data.finish as string | undefined,
+    metadata: data.metadata as Record<string, unknown> | undefined,
   }
 }
 
@@ -415,6 +469,209 @@ export class MessageRepository {
       cost: 0,
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
     }
+  }
+
+  /**
+   * Persist the hidden turn anchor and running compaction marker together.
+   * The marker is a message rather than a transport-only event so history
+   * reload and live projection share the same source of truth.
+   */
+  startCompactionProjection(input: {
+    sessionId: string
+    agent: string
+    model?: { providerID: string; modelID: string }
+    reason: "auto" | "manual"
+    syntheticMessageId?: string
+    compactionMessageId?: string
+    created?: number
+  }): { synthetic: SyntheticMessage; compaction: CompactionMessage } {
+    const created = input.created ?? Date.now()
+    const format = this.idFormat(input.sessionId)
+    const syntheticId = input.syntheticMessageId ?? createMessageId(created, format)
+    const compactionId = input.compactionMessageId ?? createMessageIdAfter(syntheticId, format)
+    const providerID = input.model?.providerID ?? input.agent
+    const modelID = input.model?.modelID ?? "default"
+    const syntheticData = {
+      text: "The conversation context was compacted.",
+      description: "Conversation compacted",
+      metadata: { compaction: true },
+    }
+    const compactionData = {
+      status: "running",
+      reason: input.reason,
+      summary: "",
+      recent: "",
+      anchorMessageID: syntheticId,
+    }
+
+    this.db.transaction(() => {
+      this.db
+        .prepare(
+          "INSERT INTO messages (id, session_id, role, created_at, completed_at, parent_id, model_id, provider_id, agent, data) VALUES (?, ?, 'synthetic', ?, NULL, NULL, ?, ?, ?, ?)",
+        )
+        .run(syntheticId, input.sessionId, created, modelID, providerID, input.agent, JSON.stringify(syntheticData))
+      this.db
+        .prepare(
+          "INSERT INTO messages (id, session_id, role, created_at, completed_at, parent_id, model_id, provider_id, agent, data) VALUES (?, ?, 'compaction', ?, NULL, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          compactionId,
+          input.sessionId,
+          created,
+          syntheticId,
+          modelID,
+          providerID,
+          input.agent,
+          JSON.stringify(compactionData),
+        )
+    })
+
+    return {
+      synthetic: {
+        id: syntheticId,
+        sessionID: input.sessionId,
+        role: "synthetic",
+        time: { created },
+        ...syntheticData,
+      },
+      compaction: {
+        id: compactionId,
+        sessionID: input.sessionId,
+        role: "compaction",
+        time: { created },
+        status: "running",
+        reason: input.reason,
+        summary: "",
+        recent: "",
+        anchorMessageID: syntheticId,
+      },
+    }
+  }
+
+  completeCompactionProjection(
+    compactionId: string,
+    result: {
+      summary: string
+      recent?: string
+      usage?: {
+        cost?: number
+        input?: number
+        output?: number
+        cacheRead?: number
+        cacheWrite?: number
+        total?: number
+      }
+    },
+  ): { compaction: CompactionMessage; assistant: AssistantMessage; text: TextPart } | null {
+    const row = this.db
+      .prepare("SELECT * FROM messages WHERE id = ? AND role = 'compaction'")
+      .get(compactionId) as MessageRow | null
+    if (!row) return null
+    const current = rowToMessage(row)
+    if (current.role !== "compaction") return null
+
+    const created = Date.now()
+    const assistantId = createMessageIdAfter(compactionId, this.idFormat(row.session_id))
+    const partId = createPartId(created, this.idFormat(row.session_id))
+    const summary = result.summary
+    const recent = result.recent ?? ""
+    const compactionData = {
+      ...(JSON.parse(row.data) as Record<string, unknown>),
+      status: "completed",
+      summary,
+      recent,
+    }
+    const session = this.db.prepare("SELECT directory FROM sessions WHERE id = ?").get(row.session_id) as {
+      directory: string
+    } | null
+    const directory = session?.directory ?? process.cwd()
+    const assistantData = {
+      mode: "compaction",
+      metadata: { compaction: { messageID: compactionId } },
+      path: { cwd: directory, root: directory },
+      cost: result.usage?.cost ?? 0,
+      tokens: {
+        total: result.usage?.total,
+        input: result.usage?.input ?? 0,
+        output: result.usage?.output ?? 0,
+        reasoning: 0,
+        cache: { read: result.usage?.cacheRead ?? 0, write: result.usage?.cacheWrite ?? 0 },
+      },
+      finish: "stop",
+    }
+    const partData = {
+      text: summary,
+      time: { start: created, end: created },
+      metadata: { compaction: { messageID: compactionId } },
+    }
+
+    this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE messages SET data = ?, completed_at = ? WHERE id = ?")
+        .run(JSON.stringify(compactionData), created, compactionId)
+      this.db
+        .prepare(
+          "INSERT INTO messages (id, session_id, role, created_at, completed_at, parent_id, model_id, provider_id, agent, data) VALUES (?, ?, 'assistant', ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(
+          assistantId,
+          row.session_id,
+          created,
+          created,
+          current.anchorMessageID,
+          row.model_id,
+          row.provider_id,
+          row.agent,
+          JSON.stringify(assistantData),
+        )
+      this.db
+        .prepare(
+          "INSERT INTO parts (id, session_id, message_id, type, data, created_at) VALUES (?, ?, ?, 'text', ?, ?)",
+        )
+        .run(partId, row.session_id, assistantId, JSON.stringify(partData), created)
+    })
+
+    return {
+      compaction: { ...current, status: "completed", summary, recent },
+      assistant: {
+        id: assistantId,
+        sessionID: row.session_id,
+        role: "assistant",
+        time: { created, completed: created },
+        parentID: current.anchorMessageID,
+        modelID: row.model_id ?? "default",
+        providerID: row.provider_id ?? row.agent,
+        mode: "compaction",
+        agent: row.agent,
+        path: { cwd: directory, root: directory },
+        cost: assistantData.cost,
+        tokens: assistantData.tokens,
+        finish: "stop",
+        metadata: assistantData.metadata,
+      },
+      text: {
+        id: partId,
+        sessionID: row.session_id,
+        messageID: assistantId,
+        type: "text",
+        ...partData,
+      },
+    }
+  }
+
+  failCompactionProjection(compactionId: string, message: string): CompactionMessage | null {
+    const row = this.db
+      .prepare("SELECT * FROM messages WHERE id = ? AND role = 'compaction'")
+      .get(compactionId) as MessageRow | null
+    if (!row) return null
+    const current = rowToMessage(row)
+    if (current.role !== "compaction") return null
+    const error = { type: "unknown" as const, message }
+    const data = { ...(JSON.parse(row.data) as Record<string, unknown>), status: "failed", error }
+    this.db
+      .prepare("UPDATE messages SET data = ?, completed_at = ? WHERE id = ?")
+      .run(JSON.stringify(data), Date.now(), compactionId)
+    return { ...current, status: "failed", error }
   }
 
   getMessage(id: string): Message | null {

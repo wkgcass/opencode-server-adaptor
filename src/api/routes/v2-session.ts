@@ -85,6 +85,40 @@ export function toV2Session(session: Session, messages: MessageWithParts[] = [])
 }
 
 export function toV2Message(message: MessageWithParts) {
+  if (message.info.role === "synthetic") {
+    return {
+      id: message.info.id,
+      time: message.info.time,
+      text: message.info.text,
+      description: message.info.description,
+      metadata: message.info.metadata,
+      type: "synthetic" as const,
+    }
+  }
+
+  if (message.info.role === "compaction") {
+    const base = {
+      id: message.info.id,
+      time: message.info.time,
+      reason: message.info.reason,
+      metadata: message.info.metadata,
+      type: "compaction" as const,
+    }
+    if (message.info.status === "failed") {
+      return {
+        ...base,
+        status: "failed" as const,
+        error: message.info.error ?? { type: "unknown" as const, message: "Compaction failed" },
+      }
+    }
+    return {
+      ...base,
+      status: message.info.status,
+      summary: message.info.summary,
+      recent: message.info.recent,
+    }
+  }
+
   if (message.info.role === "user") {
     const text = message.parts
       .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text")
@@ -124,6 +158,7 @@ export function toV2Message(message: MessageWithParts) {
         id: part.id,
         text: part.text,
         time: part.time ? { created: part.time.start, completed: part.time.end } : undefined,
+        metadata: part.metadata,
       })
       continue
     }
@@ -148,6 +183,7 @@ export function toV2Message(message: MessageWithParts) {
     finish: message.info.finish,
     cost: message.info.cost,
     tokens: message.info.tokens,
+    metadata: message.info.metadata,
     error: message.info.error ? { type: "unknown" as const, message: message.info.error.data.message } : undefined,
   }
 }

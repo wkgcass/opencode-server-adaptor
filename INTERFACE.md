@@ -586,8 +586,14 @@ Runtime 使用统一事件联合类型向主流程发送状态。当前事件分
 - 消息：`message_completed`，可携带 token、缓存和费用信息。
 
 主流程负责将消息内容事件持久化为 OpenCode message/part，并把所有事件发布为 Desktop 兼容 SSE。后端实现只负责
-正确映射事件。压缩成功时主流程还会发布 OpenCode 标准 `session.compacted`；同时发布
-`session.compaction.started/completed/failed`，让客户端取得完整生命周期和后端统计。
+正确映射事件。压缩开始时，主流程原子保存 synthetic 锚点和一等 compaction 消息；完成后更新 compaction 的 summary，
+并保存 `mode: "compaction"` 的 assistant summary。assistant message 及其 text part 均通过
+`metadata.compaction.messageID` 关联 compaction 消息；v2 消息列表也返回该 assistant，使会话重载后仍能直接取得 summary
+消息。
+
+压缩成功时主流程还会发布 OpenCode 标准 `session.compacted`；current 协议发布持久的
+`session.compaction.started/ended/failed`，让客户端取得完整生命周期和后端统计。Runtime 层的统一事件名仍为
+`compaction_started/completed/failed`。
 
 `session_error` 表示后端报告的运行诊断。默认是当前消息的终态错误；`fatal: false` 表示诊断本身不终止消息或
 Runtime，例如 Pi 扩展报错后仍可能继续处理输入。`messageId` 对消息内错误是必需的；启动期扩展错误等 session 级

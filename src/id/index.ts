@@ -165,11 +165,19 @@ export function createEventId(timestamp?: number, format: OrderedIdFormat = "leg
   return ordered(PREFIXES.event, "ascending", timestamp, format)
 }
 
+/**
+ * Current OpenCode session reducers derive synthetic/compaction message IDs
+ * from their durable event IDs by replacing only the ordered-ID prefix. Keep
+ * the inverse mapping here so persisted messages and live event projections
+ * converge on the same identity.
+ */
+export function eventIdForMessageId(messageId: string): string {
+  return messageId.replace(/^msg(?=[_-])/, PREFIXES.event)
+}
+
 export function orderedIdFormat(id: string | undefined): OrderedIdFormat {
   if (!id) return "legacy"
-  return [PREFIXES.message, PREFIXES.part, PREFIXES.event].some((prefix) =>
-    id.startsWith(`${prefix}${WIDE_SEPARATOR}`),
-  )
+  return [PREFIXES.message, PREFIXES.part, PREFIXES.event].some((prefix) => id.startsWith(`${prefix}${WIDE_SEPARATOR}`))
     ? "wide"
     : "legacy"
 }

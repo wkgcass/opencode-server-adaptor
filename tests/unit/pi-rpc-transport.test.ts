@@ -21,7 +21,7 @@ const silentLogger = {
 
 const emptySkills = (directory: string) => ({ revision: "empty", directory, skills: [] })
 
-function createTestRuntime(sessionId: string): PiRpcRuntime {
+function createTestRuntime(sessionId: string, rpcTimeoutMs = 2000): PiRpcRuntime {
   return new PiRpcRuntime(
     {
       sessionId,
@@ -34,7 +34,7 @@ function createTestRuntime(sessionId: string): PiRpcRuntime {
       cliPath: `"${process.execPath}" "${fakePi}"`,
       args: ["--mode", "rpc"],
       sessionDir: "/tmp",
-      rpcTimeoutMs: 2000,
+      rpcTimeoutMs,
       startTimeoutMs: 2000,
     },
   )
@@ -217,6 +217,75 @@ describe("PiRpcTransport", () => {
     await expect(transport.send({ type: "not_a_real_command" })).rejects.toThrow(
       "Pi RPC command 'not_a_real_command' failed",
     )
+  })
+
+  test("projects a compact RPC failure when Pi omits compaction lifecycle events", async () => {
+    const runtime = createTestRuntime("runtime-compact-rpc-failure")
+    const events: AgentRuntimeEvent[] = []
+    const unsubscribe = runtime.subscribe((event) => events.push(event))
+
+    try {
+      await runtime.start()
+      await expect(runtime.compact({ customInstructions: "__fail_compact__" })).rejects.toThrow(
+        "Turn prefix summarization failed: fake provider error",
+      )
+      expect(events).toContainEqual({
+        type: "compaction_started",
+        sessionId: "runtime-compact-rpc-failure",
+        reason: "manual",
+        backendReason: "manual",
+      })
+      expect(events).toContainEqual({
+        type: "compaction_failed",
+        sessionId: "runtime-compact-rpc-failure",
+        reason: "manual",
+        backendReason: "manual",
+        error: "Pi RPC command 'compact' failed: Turn prefix summarization failed: fake provider error",
+        aborted: false,
+        willRetry: false,
+      })
+    } finally {
+      unsubscribe()
+      await runtime.stop()
+    }
+  })
+
+  test("accepts a successful compaction_end when the later compact response conflicts", async () => {
+    const runtime = createTestRuntime("runtime-compact-terminal-success")
+    const events: AgentRuntimeEvent[] = []
+    const unsubscribe = runtime.subscribe((event) => events.push(event))
+
+    try {
+      await runtime.start()
+      const result = await runtime.compact({ customInstructions: "__compact_event_success_response_failure__" })
+      expect(result.summary).toBe("Fake compacted conversation summary")
+      expect(events.map((event) => event.type)).toEqual([
+        "session_started",
+        "compaction_started",
+        "compaction_completed",
+      ])
+      expect(events.some((event) => event.type === "compaction_failed")).toBe(false)
+    } finally {
+      unsubscribe()
+      await runtime.stop()
+    }
+  })
+
+  test("does not apply the short-command RPC timeout to an active compaction", async () => {
+    const runtime = createTestRuntime("runtime-slow-compaction", 200)
+    const events: AgentRuntimeEvent[] = []
+    const unsubscribe = runtime.subscribe((event) => events.push(event))
+
+    try {
+      await runtime.start()
+      const result = await runtime.compact({ customInstructions: "__slow_compact__" })
+      expect(result.summary).toBe("Fake compacted conversation summary")
+      expect(events.some((event) => event.type === "compaction_completed")).toBe(true)
+      expect(events.some((event) => event.type === "compaction_failed")).toBe(false)
+    } finally {
+      unsubscribe()
+      await runtime.stop()
+    }
   })
 
   test("passes an environment overlay to Pi", async () => {

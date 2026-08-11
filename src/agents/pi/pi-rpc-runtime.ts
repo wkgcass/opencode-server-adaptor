@@ -44,6 +44,12 @@ interface PiSessionEntry {
   }
 }
 
+type CompactionTerminalOutcome =
+  | { sequence: number; result: AgentCompactionResult }
+  | { sequence: number; error: string }
+
+const COMPACTION_TERMINAL_GRACE_MS = 500
+
 export class PiRpcRuntime implements AgentRuntime {
   private transport: PiRpcTransport | null = null
   private readonly listeners = new Set<(event: AgentRuntimeEvent) => void>()
@@ -65,6 +71,9 @@ export class PiRpcRuntime implements AgentRuntime {
   private currentPromptStarted = false
   private terminalStateCheckFailures = 0
   private compactionEventsSeen = 0
+  private compactionTerminalEventsSeen = 0
+  private compactionTerminalOutcome: CompactionTerminalOutcome | null = null
+  private readonly compactionTerminalWaiters = new Set<(outcome: CompactionTerminalOutcome) => void>()
   private readonly pendingUiRequests = new Map<
     string,
     {
@@ -332,27 +341,88 @@ export class PiRpcRuntime implements AgentRuntime {
   async compact(input?: { customInstructions?: string }): Promise<AgentCompactionResult> {
     if (!this.transport) throw new Error("Runtime is not started")
     const seenBefore = this.compactionEventsSeen
-    const response = await this.transport.send({
-      type: "compact",
-      ...(input?.customInstructions?.trim() ? { customInstructions: input.customInstructions.trim() } : {}),
-    })
-    const result = this.normalizeCompactionResult(response.data)
-    if (this.compactionEventsSeen === seenBefore) {
-      this.emit({
-        type: "compaction_started",
-        sessionId: this.context.sessionId,
-        reason: "manual",
-        backendReason: "manual",
-      })
-      this.emit({
-        type: "compaction_completed",
-        sessionId: this.context.sessionId,
-        reason: "manual",
-        backendReason: "manual",
-        result,
-      })
+    const terminalSeenBefore = this.compactionTerminalEventsSeen
+    try {
+      const response = await this.transport.send(
+        {
+          type: "compact",
+          ...(input?.customInstructions?.trim() ? { customInstructions: input.customInstructions.trim() } : {}),
+        },
+        // Compaction is a long-running model operation. Pi owns its provider
+        // timeout and reports completion/failure through compaction_end; the
+        // generic short-command RPC deadline must not turn an active large
+        // compaction into a false failure. Process exit and user abort remain
+        // authoritative termination paths.
+        { timeoutMs: null },
+      )
+      const eventOutcome =
+        this.compactionTerminalOutcome && this.compactionTerminalOutcome.sequence > terminalSeenBefore
+          ? this.compactionTerminalOutcome
+          : undefined
+      if (eventOutcome) {
+        if ("result" in eventOutcome) return eventOutcome.result
+        throw new Error(eventOutcome.error)
+      }
+      const result = this.normalizeCompactionResult(response.data)
+      if (this.compactionEventsSeen === seenBefore) {
+        this.emit({
+          type: "compaction_started",
+          sessionId: this.context.sessionId,
+          reason: "manual",
+          backendReason: "manual",
+        })
+        this.emit({
+          type: "compaction_completed",
+          sessionId: this.context.sessionId,
+          reason: "manual",
+          backendReason: "manual",
+          result,
+        })
+      }
+      return result
+    } catch (error) {
+      let eventOutcome =
+        this.compactionTerminalOutcome && this.compactionTerminalOutcome.sequence > terminalSeenBefore
+          ? this.compactionTerminalOutcome
+          : undefined
+      if (!eventOutcome && this.compactionEventsSeen > seenBefore) {
+        eventOutcome = await this.waitForCompactionTerminal(terminalSeenBefore)
+      }
+      if (eventOutcome && "result" in eventOutcome) {
+        // compaction_end is Pi's authoritative lifecycle boundary. A few Pi
+        // builds can emit a successful result and then reject the command
+        // response; reporting that late response as a failure makes Desktop
+        // show an error after the summary has already been committed.
+        this.logger.warn("Pi compact RPC failed after a successful compaction_end; accepting the terminal result", {
+          sessionId: this.context.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return eventOutcome.result
+      }
+      // Some Pi versions return only a failed RPC response and omit the
+      // compaction_end event. Normalize that command-level failure into the
+      // same runtime lifecycle used by native/automatic compaction failures.
+      if (this.compactionTerminalEventsSeen === terminalSeenBefore) {
+        if (this.compactionEventsSeen === seenBefore) {
+          this.emit({
+            type: "compaction_started",
+            sessionId: this.context.sessionId,
+            reason: "manual",
+            backendReason: "manual",
+          })
+        }
+        this.emit({
+          type: "compaction_failed",
+          sessionId: this.context.sessionId,
+          reason: "manual",
+          backendReason: "manual",
+          error: error instanceof Error ? error.message : String(error),
+          aborted: false,
+          willRetry: false,
+        })
+      }
+      throw error
     }
-    return result
   }
 
   async respondToPermission(requestId: string, response: PermissionResponse): Promise<void> {
@@ -418,32 +488,37 @@ export class PiRpcRuntime implements AgentRuntime {
     }
     if (event.type === "compaction_end") {
       this.compactionEventsSeen++
+      this.compactionTerminalEventsSeen++
       const backendReason = typeof event.reason === "string" ? event.reason : "manual"
       const reason = backendReason === "manual" ? "manual" : "auto"
       if (event.result && typeof event.result === "object") {
+        const result = this.normalizeCompactionResult(event.result)
+        this.recordCompactionTerminal({ sequence: this.compactionTerminalEventsSeen, result })
         const delivered = this.emit({
           type: "compaction_completed",
           sessionId: this.context.sessionId,
           reason,
           backendReason,
-          result: this.normalizeCompactionResult(event.result),
+          result,
           willRetry: event.willRetry === true,
         })
         if (!delivered) {
           this.warnUnprojectedPiEvent(event, "runtime_delivery", "Pi Runtime has no accepting event subscriber")
         }
       } else {
+        const error =
+          typeof event.errorMessage === "string"
+            ? event.errorMessage
+            : event.aborted === true
+              ? "Compaction was aborted"
+              : "Compaction failed"
+        this.recordCompactionTerminal({ sequence: this.compactionTerminalEventsSeen, error })
         const delivered = this.emit({
           type: "compaction_failed",
           sessionId: this.context.sessionId,
           reason,
           backendReason,
-          error:
-            typeof event.errorMessage === "string"
-              ? event.errorMessage
-              : event.aborted === true
-                ? "Compaction was aborted"
-                : "Compaction failed",
+          error,
           aborted: event.aborted === true,
           willRetry: event.willRetry === true,
         })
@@ -701,6 +776,31 @@ export class PiRpcRuntime implements AgentRuntime {
       } catch {}
     }
     return delivered > 0
+  }
+
+  private recordCompactionTerminal(outcome: CompactionTerminalOutcome): void {
+    this.compactionTerminalOutcome = outcome
+    for (const resolve of this.compactionTerminalWaiters) resolve(outcome)
+    this.compactionTerminalWaiters.clear()
+  }
+
+  private waitForCompactionTerminal(afterSequence: number): Promise<CompactionTerminalOutcome | undefined> {
+    const current = this.compactionTerminalOutcome
+    if (current && current.sequence > afterSequence) return Promise.resolve(current)
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout>
+      const onTerminal = (outcome: CompactionTerminalOutcome) => {
+        if (outcome.sequence <= afterSequence) return
+        clearTimeout(timer)
+        this.compactionTerminalWaiters.delete(onTerminal)
+        resolve(outcome)
+      }
+      this.compactionTerminalWaiters.add(onTerminal)
+      timer = setTimeout(() => {
+        this.compactionTerminalWaiters.delete(onTerminal)
+        resolve(undefined)
+      }, COMPACTION_TERMINAL_GRACE_MS)
+    })
   }
 
   private async getPiSessionState(): Promise<PiSessionState> {

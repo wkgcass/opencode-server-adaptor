@@ -215,10 +215,11 @@ interface RpcCommand {
 
 let pendingPermissionId: string | null = null
 
-function sendResponse(id: string | undefined, command: string, success: boolean, data?: unknown): void {
+function sendResponse(id: string | undefined, command: string, success: boolean, data?: unknown, error?: string): void {
   const msg: Record<string, unknown> = { type: "response", command, success }
   if (id) msg.id = id
   if (data !== undefined) msg.data = data
+  if (error !== undefined) msg.error = error
   process.stdout.write(JSON.stringify(msg) + "\n")
   log(`sent response: ${command} success=${success}`)
 }
@@ -332,6 +333,10 @@ async function handleCommand(cmd: RpcCommand): Promise<void> {
     }
 
     case "compact": {
+      if (cmd.customInstructions === "__fail_compact__" || persistedPrompts.at(-1)?.includes("__fail_compact__")) {
+        sendResponse(cmd.id, "compact", false, undefined, "Turn prefix summarization failed: fake provider error")
+        break
+      }
       const result = {
         summary: "Fake compacted conversation summary",
         firstKeptEntryId: "fake-kept-entry",
@@ -348,7 +353,29 @@ async function handleCommand(cmd: RpcCommand): Promise<void> {
         details: { customInstructions: cmd.customInstructions },
       }
       sendEvent({ type: "compaction_start", reason: "manual" })
+      if (cmd.customInstructions === "__slow_compact__") {
+        await Bun.sleep(350)
+        sendEvent({ type: "compaction_end", reason: "manual", result, aborted: false, willRetry: false })
+        sendResponse(cmd.id, "compact", true, result)
+        break
+      }
+      if (
+        cmd.customInstructions === "__compact_response_failure_event_success__" ||
+        persistedPrompts.at(-1)?.includes("__compact_response_failure_event_success__")
+      ) {
+        sendResponse(cmd.id, "compact", false, undefined, "Early compact response failure")
+        await Bun.sleep(25)
+        sendEvent({ type: "compaction_end", reason: "manual", result, aborted: false, willRetry: false })
+        break
+      }
       sendEvent({ type: "compaction_end", reason: "manual", result, aborted: false, willRetry: false })
+      if (
+        cmd.customInstructions === "__compact_event_success_response_failure__" ||
+        persistedPrompts.at(-1)?.includes("__compact_event_success_response_failure__")
+      ) {
+        sendResponse(cmd.id, "compact", false, undefined, "Late compact response failure")
+        break
+      }
       sendResponse(cmd.id, "compact", true, result)
       break
     }

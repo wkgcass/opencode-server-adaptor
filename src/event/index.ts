@@ -3,7 +3,14 @@ import { createEventId, orderedIdFormat, type OrderedIdFormat } from "../id/inde
 
 export interface OpenCodeEvent {
   id: string
+  created?: number
   type: string
+  metadata?: Record<string, unknown>
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
   properties: Record<string, unknown>
 }
 
@@ -16,7 +23,14 @@ export interface GlobalEvent {
 
 export interface CurrentOpenCodeEvent {
   id: string
+  created?: number
   type: string
+  metadata?: Record<string, unknown>
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
   data: Record<string, unknown>
   location?: {
     directory: string
@@ -197,7 +211,10 @@ export function createEvent(type: string, properties: Record<string, unknown>): 
 export function toCurrentOpenCodeEvent(event: GlobalEvent): CurrentOpenCodeEvent {
   return {
     id: event.payload.id,
+    ...(event.payload.created === undefined ? {} : { created: event.payload.created }),
     type: event.payload.type,
+    ...(event.payload.metadata ? { metadata: event.payload.metadata } : {}),
+    ...(event.payload.durable ? { durable: event.payload.durable } : {}),
     data: event.payload.properties,
     ...(event.directory ? { location: { directory: event.directory } } : {}),
   }

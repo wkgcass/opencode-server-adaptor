@@ -20,6 +20,7 @@ async function waitForSseEvent(
 ): Promise<any> {
   const decoder = new TextDecoder()
   let buffer = ""
+  const observed: string[] = []
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now()
@@ -41,10 +42,11 @@ async function waitForSseEvent(
         .join("\n")
       if (!data) continue
       const event = JSON.parse(data)
+      observed.push(event.type ?? event.payload?.type ?? "unknown")
       if (predicate(event)) return event
     }
   }
-  throw new Error(`Timed out waiting for SSE event after ${timeoutMs}ms`)
+  throw new Error(`Timed out waiting for SSE event after ${timeoutMs}ms; observed: ${observed.join(", ")}`)
 }
 
 async function waitForSessionIdle(baseUrl: string, authHeader: string, sessionId: string): Promise<void> {
@@ -432,7 +434,7 @@ describe("Fake Pi Integration", () => {
     expect(assistantText).toContain('Restored previous prompt: "first-context"')
   }, 30000)
 
-  test("client-initiated compaction invokes Pi and publishes the canonical compacted event", async () => {
+  test("client-initiated compaction persists and publishes the Desktop projection", async () => {
     const createRes = await fetch(`${baseUrl}/session`, {
       method: "POST",
       headers: { Authorization: authHeader, "Content-Type": "application/json" },
@@ -441,12 +443,12 @@ describe("Fake Pi Integration", () => {
     const session = (await createRes.json()) as { id: string }
 
     const controller = new AbortController()
-    const eventRes = await fetch(`${baseUrl}/global/event`, {
+    const eventRes = await fetch(`${baseUrl}/api/event`, {
       headers: { Authorization: authHeader },
       signal: controller.signal,
     })
     const reader = eventRes.body!.getReader()
-    await waitForSseEvent(reader, (event) => event.payload?.type === "server.connected")
+    await waitForSseEvent(reader, (event) => event.type === "server.connected")
 
     try {
       const compactPromise = fetch(`${baseUrl}/session/${session.id}/summarize`, {
@@ -458,18 +460,165 @@ describe("Fake Pi Integration", () => {
           customInstructions: "Focus on changed files",
         }),
       })
-      const compacted = await waitForSseEvent(
-        reader,
-        (event) => event.payload?.type === "session.compacted" && event.payload?.properties?.sessionID === session.id,
-      )
+      let started: any
+      const ended = await waitForSseEvent(reader, (event) => {
+        if (event.type === "session.compaction.started" && event.data?.sessionID === session.id) started = event
+        return event.type === "session.compaction.ended" && event.data?.sessionID === session.id
+      })
       const response = await compactPromise
       expect(response.ok).toBe(true)
       expect(await response.json()).toBe(true)
-      expect(compacted.payload.properties.sessionID).toBe(session.id)
+      expect(started).toMatchObject({
+        created: expect.any(Number),
+        durable: { aggregateID: session.id, version: 1 },
+        data: { sessionID: session.id, reason: "manual", recent: "", inputID: expect.any(String) },
+      })
+      expect(ended).toMatchObject({
+        created: expect.any(Number),
+        durable: { aggregateID: session.id, version: 1 },
+        data: {
+          sessionID: session.id,
+          reason: "manual",
+          text: "Fake compacted conversation summary",
+          recent: "",
+        },
+      })
+
+      const historyResponse = await fetch(`${baseUrl}/api/session/${session.id}/message?order=asc&limit=200`, {
+        headers: { Authorization: authHeader },
+      })
+      const history = (await historyResponse.json()) as { data: Array<Record<string, any>> }
+      expect(history.data.slice(-3).map((message) => message.type)).toEqual(["synthetic", "compaction", "assistant"])
+      expect(history.data.at(-2)).toMatchObject({
+        id: started.data.inputID,
+        status: "completed",
+        reason: "manual",
+        summary: "Fake compacted conversation summary",
+      })
+      expect(history.data.at(-1)).toMatchObject({
+        type: "assistant",
+        metadata: { compaction: { messageID: started.data.inputID } },
+        content: [
+          {
+            type: "text",
+            text: "Fake compacted conversation summary",
+            metadata: { compaction: { messageID: started.data.inputID } },
+          },
+        ],
+        finish: "stop",
+      })
     } finally {
       await reader.cancel()
       controller.abort()
     }
+  }, 15000)
+
+  test("client-initiated compact RPC failure publishes both lifecycle and visible session errors", async () => {
+    const createRes = await fetch(`${baseUrl}/session`, {
+      method: "POST",
+      headers: { Authorization: authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Compact Failure Test", agent: "pi" }),
+    })
+    const session = (await createRes.json()) as { id: string }
+    await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
+      method: "POST",
+      headers: { Authorization: authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ parts: [{ type: "text", text: "__fail_compact__" }] }),
+    })
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
+
+    const controller = new AbortController()
+    const eventRes = await fetch(`${baseUrl}/api/event`, {
+      headers: { Authorization: authHeader },
+      signal: controller.signal,
+    })
+    const reader = eventRes.body!.getReader()
+    await waitForSseEvent(reader, (event) => event.type === "server.connected")
+
+    try {
+      const compactPromise = fetch(`${baseUrl}/api/session/${session.id}/compact`, {
+        method: "POST",
+        headers: { Authorization: authHeader },
+      })
+      let failed: any
+      const visibleError = await waitForSseEvent(reader, (event) => {
+        if (event.type === "session.compaction.failed" && event.data?.sessionID === session.id) failed = event
+        return event.type === "session.error" && event.data?.sessionID === session.id
+      })
+      const response = await compactPromise
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({
+        _tag: "InvalidRequestError",
+        message: expect.stringContaining("Turn prefix summarization failed: fake provider error"),
+      })
+      expect(failed).toMatchObject({
+        data: {
+          sessionID: session.id,
+          reason: "manual",
+          error: {
+            type: "unknown",
+            message: expect.stringContaining("Turn prefix summarization failed: fake provider error"),
+          },
+        },
+      })
+      expect(visibleError).toMatchObject({
+        data: {
+          sessionID: session.id,
+          error: {
+            name: "UnknownError",
+            data: { message: expect.stringContaining("Turn prefix summarization failed: fake provider error") },
+          },
+        },
+      })
+
+      const historyResponse = await fetch(`${baseUrl}/api/session/${session.id}/message?order=asc&limit=200`, {
+        headers: { Authorization: authHeader },
+      })
+      const history = (await historyResponse.json()) as { data: Array<Record<string, any>> }
+      expect(history.data.slice(-2).map((message) => message.type)).toEqual(["synthetic", "compaction"])
+      expect(history.data.at(-1)).toMatchObject({ status: "failed", reason: "manual" })
+    } finally {
+      await reader.cancel()
+      controller.abort()
+    }
+  }, 15000)
+
+  test("successful compaction_end wins over a conflicting late compact response", async () => {
+    const createRes = await fetch(`${baseUrl}/session`, {
+      method: "POST",
+      headers: { Authorization: authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({ title: "Compact Terminal Result Test", agent: "pi" }),
+    })
+    const session = (await createRes.json()) as { id: string }
+    await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
+      method: "POST",
+      headers: { Authorization: authHeader, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        parts: [{ type: "text", text: "__compact_response_failure_event_success__" }],
+      }),
+    })
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
+
+    const response = await fetch(`${baseUrl}/api/session/${session.id}/compact`, {
+      method: "POST",
+      headers: { Authorization: authHeader },
+    })
+    expect(response.status).toBe(204)
+
+    const historyResponse = await fetch(`${baseUrl}/api/session/${session.id}/message?order=asc&limit=200`, {
+      headers: { Authorization: authHeader },
+    })
+    const history = (await historyResponse.json()) as { data: Array<Record<string, any>> }
+    expect(history.data.slice(-3).map((message) => message.type)).toEqual(["synthetic", "compaction", "assistant"])
+    expect(history.data.at(-2)).toMatchObject({
+      status: "completed",
+      summary: "Fake compacted conversation summary",
+    })
+    expect(history.data.at(-1)).toMatchObject({
+      type: "assistant",
+      metadata: { compaction: { messageID: history.data.at(-2)?.id } },
+      content: [{ type: "text", text: "Fake compacted conversation summary" }],
+    })
   }, 15000)
 
   test("Pi auto-compaction is surfaced with its automatic reason", async () => {
@@ -480,12 +629,12 @@ describe("Fake Pi Integration", () => {
     })
     const session = (await createRes.json()) as { id: string }
     const controller = new AbortController()
-    const eventRes = await fetch(`${baseUrl}/global/event`, {
+    const eventRes = await fetch(`${baseUrl}/api/event`, {
       headers: { Authorization: authHeader },
       signal: controller.signal,
     })
     const reader = eventRes.body!.getReader()
-    await waitForSseEvent(reader, (event) => event.payload?.type === "server.connected")
+    await waitForSseEvent(reader, (event) => event.type === "server.connected")
 
     try {
       await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
@@ -495,14 +644,14 @@ describe("Fake Pi Integration", () => {
       })
       const event = await waitForSseEvent(
         reader,
-        (item) =>
-          item.payload?.type === "session.compaction.completed" && item.payload?.properties?.sessionID === session.id,
+        (item) => item.type === "session.compaction.ended" && item.data?.sessionID === session.id,
       )
-      expect(event.payload.properties).toMatchObject({
+      expect(event.data).toMatchObject({
         sessionID: session.id,
         reason: "auto",
-        backendReason: "threshold",
+        text: "Fake automatic compacted conversation summary",
       })
+      expect(event.metadata).toMatchObject({ backendReason: "threshold" })
     } finally {
       await reader.cancel()
       controller.abort()

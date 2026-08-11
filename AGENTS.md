@@ -163,7 +163,7 @@ provider:
 | `MAX_ACTIVE_AGENT_PROCESSES`         | `3`       | 同时存活的 Pi 子进程上限。                            |
 | `AGENT_IDLE_TIMEOUT_MS`              | `300000`  | Agent 进程空闲回收超时（毫秒）。                      |
 | `AGENT_START_TIMEOUT_MS`             | `30000`   | Agent 进程启动超时。                                  |
-| `AGENT_RPC_TIMEOUT_MS`               | `120000`  | 与 Agent 进程单次 RPC 调用超时。                      |
+| `AGENT_RPC_TIMEOUT_MS`               | `120000`  | Agent 短命令 RPC 超时；原生压缩由后端报告终态。       |
 | `MAX_GLOBAL_CONCURRENT_SUBTASKS`     | `8`       | 全局并发子任务上限。                                  |
 | `MAX_CONCURRENT_SUBTASKS_PER_PARENT` | `4`       | 单个父任务并发子任务上限。                            |
 | `MAX_SUBTASK_DEPTH`                  | `3`       | 子任务嵌套最大深度。                                  |

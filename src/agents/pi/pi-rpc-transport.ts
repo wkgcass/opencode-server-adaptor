@@ -35,7 +35,7 @@ export interface PiTransportOptions {
 interface PendingRequest {
   resolve: (response: PiRpcResponse) => void
   reject: (error: Error) => void
-  timer: ReturnType<typeof setTimeout>
+  timer?: ReturnType<typeof setTimeout>
 }
 
 export class PiRpcTransport {
@@ -264,7 +264,7 @@ export class PiRpcTransport {
       if (id) {
         const pending = this.pending.get(id)
         if (pending) {
-          clearTimeout(pending.timer)
+          if (pending.timer) clearTimeout(pending.timer)
           this.pending.delete(id)
           if (response.success) {
             pending.resolve(response)
@@ -364,15 +364,19 @@ export class PiRpcTransport {
     }
   }
 
-  async send(command: PiRpcCommand): Promise<PiRpcResponse> {
+  async send(command: PiRpcCommand, options?: { timeoutMs?: number | null }): Promise<PiRpcResponse> {
     const id = command.id ?? `req_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`
     const cmdWithId = { ...command, id }
+    const timeoutMs = options?.timeoutMs === undefined ? this.options.rpcTimeoutMs : options.timeoutMs
 
     return new Promise<PiRpcResponse>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new Error(`RPC command '${command.type}' timed out after ${this.options.rpcTimeoutMs}ms`))
-      }, this.options.rpcTimeoutMs)
+      const timer =
+        timeoutMs === null
+          ? undefined
+          : setTimeout(() => {
+              this.pending.delete(id)
+              reject(new Error(`RPC command '${command.type}' timed out after ${timeoutMs}ms`))
+            }, timeoutMs)
 
       this.pending.set(id, { resolve, reject, timer })
 
@@ -382,7 +386,7 @@ export class PiRpcTransport {
           writeResult.then(
             () => this.logger.debug("Sent RPC command", { id, type: command.type }),
             (err: unknown) => {
-              clearTimeout(timer)
+              if (timer) clearTimeout(timer)
               this.pending.delete(id)
               reject(new Error(`Failed to write to Pi stdin: ${err instanceof Error ? err.message : String(err)}`))
             },
@@ -391,7 +395,7 @@ export class PiRpcTransport {
           this.logger.debug("Sent RPC command", { id, type: command.type })
         }
       } catch (err) {
-        clearTimeout(timer)
+        if (timer) clearTimeout(timer)
         this.pending.delete(id)
         reject(err instanceof Error ? err : new Error(String(err)))
       }
@@ -421,7 +425,7 @@ export class PiRpcTransport {
     this.proc = null
     const error = new Error(`Pi subprocess exited with code ${code}`)
     for (const [, pending] of this.pending) {
-      clearTimeout(pending.timer)
+      if (pending.timer) clearTimeout(pending.timer)
       pending.reject(error)
     }
     this.pending.clear()
@@ -442,7 +446,7 @@ export class PiRpcTransport {
 
     if (!this.proc) {
       for (const [, pending] of this.pending) {
-        clearTimeout(pending.timer)
+        if (pending.timer) clearTimeout(pending.timer)
         pending.reject(new Error("Transport closed"))
       }
       this.pending.clear()
@@ -478,7 +482,7 @@ export class PiRpcTransport {
     } catch {}
 
     for (const [, pending] of this.pending) {
-      clearTimeout(pending.timer)
+      if (pending.timer) clearTimeout(pending.timer)
       pending.reject(new Error("Transport closed"))
     }
     this.pending.clear()
