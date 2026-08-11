@@ -98,18 +98,21 @@ ID 模式保存在 session 的内部 metadata 中，重启后继续生效；手�
 目录更新和 wide 切换会同步刷新，递归删除会清除父子 session 条目；SQLite 仍是重启后的持久化真相来源。其他 Session
 字段不进入该 cache。
 
-### 可选的同类型 Part Message 投影
+### Assistant Part Message 投影
 
-默认情况下，一次后端执行产生的 reasoning、text 和 tool part 都投影到 prompt 预先创建的 assistant message。
-`serve --msg-part-encap` 改用 `AssistantPartProjector`：第一组复用预创建 message，后续 assistant part 与前一 part
-类型相同时继续写入当前 message，类型变化时才创建一条同 parent user message 的有序 sibling message。这样既能保证
-v2 历史加载不会改变不同类型 part 的先后顺序，也能减少连续同类型 part 产生的 message 数量。客户端提交的 user
-message 及其 text/file/agent/subtask part 不拆分，否则会错误增加用户轮次。
+部分 v2 客户端会在同一 message 内按重建后的 part ID 排序，可能在历史加载时改变 reasoning、tool 和 text 的先后顺序。
+因此默认投影下，第一组 assistant part 复用 prompt 预创建的 message；后续 part 与前一 part 类型相同时继续写入当前
+message，类型变化时创建一条同 parent user message 的有序 sibling message。客户端提交的 user message 及其
+text/file/agent/subtask part 不拆分，否则会错误增加用户轮次。
 
-该模式只改变 OpenCode 展示投影，不改变 Runtime 的 `PromptInput.assistantMessageId`；后端整轮仍使用原始 root message ID
-上报事件，投影器维护 root 到 sibling message 的进程内映射。`message_completed` 会统一关闭整组 message，只有最后一个
-实际含 part 的 message 保存最终 `finish` 和 usage；错误也只归属该 terminal message。`session_idle` 是独立的执行终态，
-不得由任意单条 message 的完成推导。启动恢复仍以数据库中所有未完成 assistant message 为准，不依赖进程内映射。
+默认投影只改变 OpenCode 展示结构，不改变 Runtime 的 `PromptInput.assistantMessageId`；后端整轮仍使用原始 root message
+ID 上报事件，`AssistantPartProjector` 维护 root 到 sibling message 的进程内映射。`message_completed` 会统一关闭整组
+message，只有最后一个实际含 part 的 message 保存最终 `finish` 和 usage；错误也只归属该 terminal message。
+
+指定 `serve --msg-part-encap` 后，一次请求产生的所有 assistant part 都保留在预创建的单条 response message 中，不再
+生成 sibling message。该模式适用于要求一次请求与一次响应一一对应的调用方，但在上述 v2 客户端中可能出现 part 顺序
+错乱。两种模式下 `session_idle` 都是独立的执行终态，不得由任意单条 message 的完成推导；启动恢复仍以数据库中所有
+未完成 assistant message 为准，不依赖进程内映射。
 
 六个主要边界：
 

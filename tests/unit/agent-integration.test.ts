@@ -156,29 +156,30 @@ describe("agent integrations", () => {
       })
       expect(response.status).toBe(200)
 
-      let assistant = context.messages
+      let assistants = context.messages
         .listMessages(session.id)
-        .find((message) => message.info.role === "assistant" && message.info.time.completed !== undefined)
-      for (let attempt = 0; attempt < 100 && !assistant; attempt++) {
+        .filter((message) => message.info.role === "assistant" && message.info.time.completed !== undefined)
+      for (let attempt = 0; attempt < 100 && assistants.length !== 3; attempt++) {
         await Bun.sleep(10)
-        assistant = context.messages
+        assistants = context.messages
           .listMessages(session.id)
-          .find((message) => message.info.role === "assistant" && message.info.time.completed !== undefined)
+          .filter((message) => message.info.role === "assistant" && message.info.time.completed !== undefined)
       }
 
-      expect(assistant?.parts).toContainEqual(
+      const parts = assistants.flatMap((message) => message.parts)
+      expect(parts).toContainEqual(
         expect.objectContaining({
           type: "text",
           text: "delta survived",
         }),
       )
-      expect(assistant?.parts).toContainEqual(
+      expect(parts).toContainEqual(
         expect.objectContaining({
           type: "reasoning",
           text: "reasoning survived",
         }),
       )
-      expect(assistant?.parts).toContainEqual(
+      expect(parts).toContainEqual(
         expect.objectContaining({
           type: "tool",
           callID: "call-without-start",
@@ -190,7 +191,7 @@ describe("agent integrations", () => {
       )
       expect(
         context.messages.listMessages(session.id).filter((message) => message.info.role === "assistant"),
-      ).toHaveLength(1)
+      ).toHaveLength(3)
       expect(context.sessions.get(session.id)?.title).toBe("Backend-updated title")
     } finally {
       await context.agentService.closeAll()
@@ -198,7 +199,7 @@ describe("agent integrations", () => {
     }
   })
 
-  test("encapsulates generated assistant parts without completing the session early", async () => {
+  test("encapsulates one response's generated assistant parts in one message without completing the session early", async () => {
     const directory = mkdtempSync(join(tmpdir(), "agent-part-encap-"))
     cleanup.push(directory)
     const adapter = new GatedEncapsulationAdapter()
@@ -237,7 +238,7 @@ describe("agent integrations", () => {
       for (
         let attempt = 0;
         attempt < 100 &&
-        (assistants.length !== 3 ||
+        (assistants.length !== 1 ||
           assistants.some((message) => message.info.role !== "assistant" || message.info.time.completed === undefined));
         attempt++
       ) {
@@ -245,12 +246,10 @@ describe("agent integrations", () => {
         assistants = context.messages.listMessages(session.id).filter((message) => message.info.role === "assistant")
       }
 
-      expect(assistants).toHaveLength(3)
-      expect(assistants.map((message) => message.parts.length)).toEqual([1, 1, 2])
+      expect(assistants).toHaveLength(1)
+      expect(assistants.map((message) => message.parts.length)).toEqual([4])
       expect(assistants.map((message) => message.parts.map((part) => part.type))).toEqual([
-        ["text"],
-        ["reasoning"],
-        ["tool", "tool"],
+        ["text", "reasoning", "tool", "tool"],
       ])
       expect(assistants.map((message) => message.info.id)).toEqual(
         assistants.map((message) => message.info.id).toSorted(),
@@ -260,12 +259,12 @@ describe("agent integrations", () => {
       ).toBe(true)
       expect(
         assistants.map((message) => (message.info.role === "assistant" ? message.info.finish : undefined)),
-      ).toEqual([undefined, undefined, "stop"])
+      ).toEqual(["stop"])
       expect(
         assistants.map((message) => (message.info.role === "assistant" ? message.info.tokens.input : undefined)),
-      ).toEqual([0, 0, 12])
+      ).toEqual([12])
       expect(assistants.map((message) => (message.info.role === "assistant" ? message.info.cost : undefined))).toEqual([
-        0, 0, 0.01,
+        0.01,
       ])
       expect(context.sessions.getStatus(session.id)).toBe("busy")
 
@@ -274,11 +273,9 @@ describe("agent integrations", () => {
         data: Array<{ type: string; id: string; content?: Array<{ type: string }> }>
       }
       const projected = payload.data.filter((message) => message.type === "assistant")
-      expect(projected.map((message) => message.content?.length)).toEqual([1, 1, 2])
+      expect(projected.map((message) => message.content?.length)).toEqual([4])
       expect(projected.map((message) => message.content?.map((part) => part.type))).toEqual([
-        ["text"],
-        ["reasoning"],
-        ["tool", "tool"],
+        ["text", "reasoning", "tool", "tool"],
       ])
 
       adapter.releaseIdle()

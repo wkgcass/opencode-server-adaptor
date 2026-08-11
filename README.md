@@ -53,16 +53,18 @@ v1/v2 的完整接口清单和设计说明见 [AGENTS.md](./AGENTS.md)。
 - 不支持远程工作区；所有会话和文件操作都针对服务进程可直接访问的本地或 WSL 文件系统。
 - 会话回退只影响模型对话上下文，不恢复工作区文件。已经执行的写文件、编辑和 shell 副作用需要用户自行
   通过版本控制或其他方式恢复。
-- 部分 Desktop 版本在重新加载历史消息后，推理、工具调用和文本的显示顺序可能与实时过程不同。需要时可使用
-  `--msg-part-encap` 兼容这些版本，但会增加消息数量，并降低长会话的加载和翻页效率。
+- v2 API 在客户端侧可能按同一 message 内重建后的 part ID 排序，导致重新加载历史消息后，推理、工具调用和文本的
+  显示顺序与实时过程不同。服务默认优先按连续相同类型拆成多条 assistant response message；如果调用方要求一次请求
+  只对应一条响应 message，可以使用 `--msg-part-encap` 将本轮多个 part 包裹在同一 message 内，但上述客户端可能出现
+  part 顺序错乱。
 
 综合上述兼容情况，在日常连接 OpenCode Desktop、且服务仅运行于可信本机环境时，推荐使用：
 
 ```bash
-opencode-server-adaptor serve --disable-pty-token-check --msg-part-encap
+opencode-server-adaptor serve --disable-pty-token-check
 ```
 
-这组参数优先保证终端连接和历史消息显示兼容；如果服务会暴露给其他主机或不可信用户，不应使用
+这个参数用于保证终端连接兼容；如果服务会暴露给其他主机或不可信用户，不应使用
 `--disable-pty-token-check`。
 
 ### 工具权限与隔离
@@ -174,16 +176,16 @@ opencode-server-adaptor [全局选项] <命令> [命令选项]
 
 ### serve 选项
 
-| 选项                        | 说明                                                                                                                                                                                     |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--hostname <HOST>`         | 监听地址，默认 `127.0.0.1`。                                                                                                                                                             |
-| `--port <PORT>`             | 监听端口，默认 `4096`，取值 `0`–`65535`。                                                                                                                                                |
-| `--cors <ORIGIN>`           | 允许的 CORS 来源，可重复指定。                                                                                                                                                           |
-| `--verbose`                 | 同全局 `--verbose`，可放在 `serve` 之前或之后。                                                                                                                                          |
-| `--disable-pty-token-check` | 跳过 PTY WebSocket 的 connect-ticket 校验，允许客户端不带 ticket 直接升级连接。仅用于兼容部分 OpenCode Desktop 版本的 PTY 连接问题（详见“启动服务”一节）；不要在对公网暴露的服务上使用。 |
-| `--api-version <VERSION>`   | 选择暴露的 API 协议版本，取值 `v1` 或 `v2`，默认 `v2`。详见上方“OpenCode 协议兼容”一节。                                                                                                 |
-| `--disable-v1-compatible`   | 不挂载兼容层路由（`GET /config`、`DELETE /session/:id`、`GET /file`、`GET /file/content`、`GET /find/file`）。关闭后 Desktop 文件树和相关兼容功能可能不可用。                            |
-| `--msg-part-encap`          | 将服务端生成的 assistant part 按连续相同类型分组并封装到独立 assistant message，用 message 顺序兼容 Desktop 的 v2 历史重载；默认关闭。用户 prompt 的 text/file/agent 等 part 不拆分。    |
+| 选项                        | 说明                                                                                                                                                                                                  |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--hostname <HOST>`         | 监听地址，默认 `127.0.0.1`。                                                                                                                                                                          |
+| `--port <PORT>`             | 监听端口，默认 `4096`，取值 `0`–`65535`。                                                                                                                                                             |
+| `--cors <ORIGIN>`           | 允许的 CORS 来源，可重复指定。                                                                                                                                                                        |
+| `--verbose`                 | 同全局 `--verbose`，可放在 `serve` 之前或之后。                                                                                                                                                       |
+| `--disable-pty-token-check` | 跳过 PTY WebSocket 的 connect-ticket 校验，允许客户端不带 ticket 直接升级连接。仅用于兼容部分 OpenCode Desktop 版本的 PTY 连接问题（详见“启动服务”一节）；不要在对公网暴露的服务上使用。              |
+| `--api-version <VERSION>`   | 选择暴露的 API 协议版本，取值 `v1` 或 `v2`，默认 `v2`。详见上方“OpenCode 协议兼容”一节。                                                                                                              |
+| `--disable-v1-compatible`   | 不挂载兼容层路由（`GET /config`、`DELETE /session/:id`、`GET /file`、`GET /file/content`、`GET /find/file`）。关闭后 Desktop 文件树和相关兼容功能可能不可用。                                         |
+| `--msg-part-encap`          | 将一次请求产生的所有 assistant part 包裹在同一条响应 message 内，实现一次请求对应一次响应；默认关闭。默认模式按连续相同类型拆成多条 assistant message，以避免部分 v2 客户端在同 message 内重排 part。 |
 
 ## 启动服务
 
@@ -202,15 +204,16 @@ opencode-server-adaptor serve --api-version=v1 --hostname 127.0.0.1 --port 4096
 
 v1 模式下挂载 v1 路由和兼容层，v2 的 `/api/*` 接口不可用；v2 模式下挂载 v2 路由和兼容层，v1 专属接口不可用。
 
-如果使用的 Desktop 在切换标签页、重载历史后按 part ID 重新排序，导致 reasoning、工具和文本顺序与实时流不同，可以启用：
+默认模式优先将连续同类型的 assistant part 分组为多条响应 message，以规避部分 v2 客户端在同一 message 内按 part ID
+重排而导致的顺序错乱。如果调用方要求一次请求只对应一次响应，可以启用：
 
 ```bash
 opencode-server-adaptor serve --msg-part-encap --hostname 127.0.0.1 --port 4096
 ```
 
-该模式下，同一用户轮次仍可对应多条 assistant message，但每条最多包含一个 part。中间 message 不携带最终
-`finish`/usage；最后一条 message 保存整轮的终态和 usage。所有 message 完成不会提前结束执行，服务仍只在后端运行真正
-settled 后将 session 切换为 `idle`。这会增加 message 数量和历史分页开销，因此仅建议用于需要该兼容行为的客户端。
+该模式下，同一用户轮次只对应一条 assistant message，其中可以包含 reasoning、tool、text 等多个 part；该 message
+保存整轮的 `finish`、usage 和错误。服务仍只在后端运行真正 settled 后将 session 切换为 `idle`。这一模式会减少消息
+数量和历史分页开销，但在上述 v2 客户端中可能出现 part 顺序错乱，因此只建议在需要请求/响应一一对应时使用。
 
 也可以直接从源码启动：
 

@@ -27,7 +27,6 @@ describe("OpenCode v2 subagent event ordering", () => {
         "127.0.0.1",
         "--port",
         String(port),
-        "--msg-part-encap",
       ],
       stdout: "pipe",
       stderr: "pipe",
@@ -54,7 +53,7 @@ describe("OpenCode v2 subagent event ordering", () => {
     await processHandle.exited
   })
 
-  test("encapsulated child messages retain generated part order without duplicating terminal output", async () => {
+  test("default child messages retain generated part order without duplicating terminal output", async () => {
     const eventController = new AbortController()
     const eventResponse = await fetch(`${baseUrl}/api/event`, { signal: eventController.signal })
     const reader = eventResponse.body!.getReader()

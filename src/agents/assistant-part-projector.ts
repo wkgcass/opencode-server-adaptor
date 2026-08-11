@@ -15,15 +15,15 @@ export interface AssistantPartProjectorOptions {
 /**
  * Projects backend parts onto OpenCode assistant messages.
  *
- * The default projection keeps every part on the assistant message admitted
- * for the prompt. Encapsulation mode instead groups consecutive assistant
- * parts of the same type into sibling messages while retaining the original
- * user message as parent. Message completion remains an execution-level
- * boundary: all siblings are closed together, and only the terminal sibling
- * owns finish/usage/error.
+ * By default, consecutive assistant parts of the same type are grouped into
+ * sibling messages while retaining the original user message as parent. Part
+ * encapsulation mode keeps every part on the single assistant message admitted
+ * for the prompt. Message completion remains an execution-level boundary: all
+ * siblings are closed together, and only the terminal sibling owns
+ * finish/usage/error.
  */
 export class AssistantPartProjector {
-  private readonly enabled: boolean
+  private readonly encapsulateParts: boolean
   private readonly groups = new Map<string, MessageGroup>()
   private readonly rootByMessage = new Map<string, string>()
   private readonly rootsBySession = new Map<string, Set<string>>()
@@ -33,11 +33,11 @@ export class AssistantPartProjector {
     private readonly events: EventBus,
     options?: AssistantPartProjectorOptions,
   ) {
-    this.enabled = options?.encapsulateParts ?? false
+    this.encapsulateParts = options?.encapsulateParts ?? false
   }
 
   isEnabled(): boolean {
-    return this.enabled
+    return this.encapsulateParts
   }
 
   createPart(
@@ -47,7 +47,7 @@ export class AssistantPartProjector {
     data: Omit<Part, "id" | "sessionID" | "messageID" | "type">,
     requestedId?: string,
   ): Part {
-    if (!this.enabled) return this.messages.createPart(sessionId, rootMessageId, type, data, requestedId)
+    if (this.encapsulateParts) return this.messages.createPart(sessionId, rootMessageId, type, data, requestedId)
 
     const group = this.requireGroup(sessionId, rootMessageId)
     let targetMessageId = group.messageIds.at(-1)!
@@ -71,7 +71,7 @@ export class AssistantPartProjector {
   }
 
   messageIds(messageId: string): string[] {
-    if (!this.enabled) return [messageId]
+    if (this.encapsulateParts) return [messageId]
     const root = this.rootByMessage.get(messageId) ?? messageId
     return [...(this.groups.get(root)?.messageIds ?? [messageId])]
   }

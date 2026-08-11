@@ -224,10 +224,7 @@ export function verboseLoggingMiddleware(logger: Logger) {
       {
         omitPayload: method === "GET" && (path === "/api/session" || path === "/api/session/active"),
         mutedPayload:
-          method === "GET" &&
-          status >= 200 &&
-          status < 300 &&
-          /^\/api\/session\/[^/]+\/message\/?$/.test(path),
+          method === "GET" && status >= 200 && status < 300 && /^\/api\/session\/[^/]+\/message\/?$/.test(path),
       },
     )
   }
@@ -274,7 +271,7 @@ export interface ServerContextOptions {
    * Skips mounting the v1-compatible routes (GET /config, DELETE /session/:id).
    */
   disableV1Compatible?: boolean
-  /** Groups consecutive server-generated assistant parts by type into sibling messages. */
+  /** Keeps all server-generated assistant parts for one request in a single response message. */
   msgPartEncap?: boolean
 }
 

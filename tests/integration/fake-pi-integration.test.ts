@@ -1294,11 +1294,12 @@ describe("Fake Pi Integration", () => {
       "Inspect the fake project and report the child shell result",
     )
 
-    const childAssistant = childMessages.find((message) => message.info.role === "assistant")
-    expect(childAssistant?.info.time.completed).toBeNumber()
-    expect(childAssistant?.parts.find((part) => part.type === "reasoning")?.text).toBe("Inspecting child workspace.")
-    expect(childAssistant?.parts.find((part) => part.type === "text")?.text).toBe("Child inspection complete.")
-    expect(childAssistant?.parts.find((part) => part.type === "tool" && part.tool === "bash")).toMatchObject({
+    const childAssistants = childMessages.filter((message) => message.info.role === "assistant")
+    expect(childAssistants.every((message) => typeof message.info.time.completed === "number")).toBe(true)
+    const childParts = childAssistants.flatMap((message) => message.parts)
+    expect(childParts.find((part) => part.type === "reasoning")?.text).toBe("Inspecting child workspace.")
+    expect(childParts.find((part) => part.type === "text")?.text).toBe("Child inspection complete.")
+    expect(childParts.find((part) => part.type === "tool" && part.tool === "bash")).toMatchObject({
       state: {
         status: "completed",
         output: "child",
@@ -1427,13 +1428,14 @@ describe("Fake Pi Integration", () => {
       info: { role: string; time: { completed?: number } }
       parts: Array<{ type: string; text?: string; time?: { start: number; end?: number } }>
     }>
-    const assistant = messages.find((message) => message.info.role === "assistant")
+    const assistants = messages.filter((message) => message.info.role === "assistant")
+    const assistantParts = assistants.flatMap((message) => message.parts)
 
     expect(updated.status).toBe("idle")
-    expect(assistant?.info.time.completed).toBeNumber()
-    expect(assistant?.parts.find((part) => part.type === "reasoning")?.text).toContain("analyze")
-    expect(assistant?.parts.find((part) => part.type === "text")?.text).toContain("fake Pi response")
-    for (const part of assistant?.parts.filter((item) => item.type === "reasoning" || item.type === "text") ?? []) {
+    expect(assistants.every((message) => typeof message.info.time.completed === "number")).toBe(true)
+    expect(assistantParts.find((part) => part.type === "reasoning")?.text).toContain("analyze")
+    expect(assistantParts.find((part) => part.type === "text")?.text).toContain("fake Pi response")
+    for (const part of assistantParts.filter((item) => item.type === "reasoning" || item.type === "text")) {
       expect(part.time?.end).toBeNumber()
     }
   }, 10000)

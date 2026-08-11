@@ -136,19 +136,18 @@ describe("Tool Call + Permission + Reasoning (Fake Pi)", () => {
         parts: Array<{ id: string; type: string; text?: string; time?: { start: number; end?: number } }>
       }>
 
-      const assistant = messages.find((m) => m.info.role === "assistant")
-      expect(assistant).toBeDefined()
+      const assistantMessages = messages.filter((message) => message.info.role === "assistant")
+      expect(assistantMessages.length).toBeGreaterThanOrEqual(2)
 
-      const reasoningParts = assistant!.parts.filter((p) => p.type === "reasoning")
+      const reasoningParts = assistantMessages.flatMap((message) => message.parts).filter((p) => p.type === "reasoning")
       expect(reasoningParts.length).toBeGreaterThanOrEqual(1)
       expect(reasoningParts[0]!.text).toContain("analyze")
       expect(reasoningParts[0]!.time?.start).toBeNumber()
       expect(reasoningParts[0]!.time?.end).toBeNumber()
 
-      const desktopSortedParts = [...assistant!.parts].sort((left, right) => left.id.localeCompare(right.id))
-      expect(desktopSortedParts.findIndex((part) => part.type === "reasoning")).toBeLessThan(
-        desktopSortedParts.findIndex((part) => part.type === "text"),
-      )
+      expect(
+        assistantMessages.findIndex((message) => message.parts.some((part) => part.type === "reasoning")),
+      ).toBeLessThan(assistantMessages.findIndex((message) => message.parts.some((part) => part.type === "text")))
 
       await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
         method: "POST",
@@ -163,13 +162,15 @@ describe("Tool Call + Permission + Reasoning (Fake Pi)", () => {
       messages = (await continuedRes.json()) as typeof messages
       expect(messages.map((message) => message.info.id)).toEqual([...messages].map((message) => message.info.id).sort())
       const assistants = messages.filter((message) => message.info.role === "assistant")
-      expect(assistants).toHaveLength(2)
+      expect(assistants).toHaveLength(4)
+      expect(assistants.map((message) => [...new Set(message.parts.map((part) => part.type))])).toEqual([
+        ["reasoning"],
+        ["text"],
+        ["reasoning"],
+        ["text"],
+      ])
       for (const continuedAssistant of assistants) {
-        const sorted = [...continuedAssistant.parts].sort((left, right) => left.id.localeCompare(right.id))
-        expect(sorted.findIndex((part) => part.type === "reasoning")).toBeLessThan(
-          sorted.findIndex((part) => part.type === "text"),
-        )
-        for (const reasoning of sorted.filter((part) => part.type === "reasoning")) {
+        for (const reasoning of continuedAssistant.parts.filter((part) => part.type === "reasoning")) {
           expect(reasoning.time?.start).toBeNumber()
           expect(reasoning.time?.end).toBeNumber()
         }
@@ -432,8 +433,11 @@ describe("Tool Call + Permission + Reasoning (Fake Pi)", () => {
       const assistantMessages = messages.filter((m) => m.info.role === "assistant")
       expect(assistantMessages.length).toBeGreaterThanOrEqual(2)
 
-      // Each should have at least one tool part
-      for (const msg of assistantMessages) {
+      const toolMessages = assistantMessages.filter((message) => message.parts.some((part) => part.type === "tool"))
+      expect(toolMessages.length).toBeGreaterThanOrEqual(2)
+
+      // Each tool response group should have at least one tool part
+      for (const msg of toolMessages) {
         const toolParts = msg.parts.filter((p) => p.type === "tool")
         expect(toolParts.length).toBeGreaterThanOrEqual(1)
       }

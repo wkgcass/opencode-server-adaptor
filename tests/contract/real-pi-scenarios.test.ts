@@ -43,6 +43,32 @@ interface RealPiProviderConfig {
   }>
 }
 
+interface RealPiMessage {
+  info: {
+    id: string
+    role: string
+    time?: { created: number; completed?: number }
+    providerID?: string
+    modelID?: string
+  }
+  parts: Array<{
+    id: string
+    type: string
+    text?: string
+    time?: { start: number; end?: number }
+    tool?: string
+    state?: {
+      status: string
+      input?: Record<string, unknown>
+      output?: string
+      error?: string
+      title?: string
+      metadata?: Record<string, unknown>
+      time?: { start: number; end?: number }
+    }
+  }>
+}
+
 function readRealPiModelsFile(): { providers: Record<string, RealPiProviderConfig> } {
   return JSON.parse(readFileSync(PI_MODELS_PATH, "utf8"))
 }
@@ -199,36 +225,32 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     await waitForV2SessionIdle(baseUrl, authHeader, sessionId, timeoutMs)
   }
 
-  async function getMessages(sessionId: string): Promise<
-    Array<{
-      info: {
-        id: string
-        role: string
-        time?: { created: number; completed?: number }
-        providerID?: string
-        modelID?: string
-      }
-      parts: Array<{
-        id: string
-        type: string
-        text?: string
-        time?: { start: number; end?: number }
-        tool?: string
-        state?: {
-          status: string
-          input?: Record<string, unknown>
-          output?: string
-          error?: string
-          title?: string
-          metadata?: Record<string, unknown>
-          time?: { start: number; end?: number }
-        }
-      }>
-    }>
-  > {
+  async function getMessages(sessionId: string): Promise<RealPiMessage[]> {
     const res = await fetch(`${baseUrl}/session/${sessionId}/message`, { headers: { Authorization: authHeader } })
     expect(res.ok).toBe(true)
     return (await res.json()) as any
+  }
+
+  function assistantMessages(messages: RealPiMessage[]): RealPiMessage[] {
+    return messages.filter((message) => message.info.role === "assistant")
+  }
+
+  function assistantParts(messages: RealPiMessage[]): RealPiMessage["parts"] {
+    return assistantMessages(messages).flatMap((message) => message.parts)
+  }
+
+  function lastAssistantTurnParts(messages: RealPiMessage[]): RealPiMessage["parts"] {
+    let start = 0
+    for (let index = messages.length - 1; index >= 0; index--) {
+      if (messages[index]?.info.role === "user") {
+        start = index + 1
+        break
+      }
+    }
+    return messages
+      .slice(start)
+      .filter((message) => message.info.role === "assistant")
+      .flatMap((message) => message.parts)
   }
 
   // ===== 基础功能 =====
@@ -320,16 +342,16 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     expect(promptRes.status).toBe(204)
     await waitForIdle(sid, 120000)
     const messages = await getMessages(sid)
-    const assistant = messages.find((message) => message.info.role === "assistant")
-    expect(assistant).toBeDefined()
+    const assistants = assistantMessages(messages)
+    expect(assistants.length).toBeGreaterThan(0)
     // The assistant message must be routed through the aliased YAML provider.
-    expect(assistant!.info.providerID).toBe(aliasProvider)
-    expect(assistant!.info.modelID).toBe(realPiModel.model)
+    expect(assistants.every((message) => message.info.providerID === aliasProvider)).toBe(true)
+    expect(assistants.every((message) => message.info.modelID === realPiModel.model)).toBe(true)
     // A non-empty text response proves the Pi backend actually resolved and
     // called the aliased provider (an unknown/unusable provider yields an empty
     // error response). The real model may not echo the exact marker, so we only
     // assert that it produced real content.
-    const assistantText = assistant!.parts
+    const assistantText = assistantParts(messages)
       .filter((part) => part.type === "text")
       .map((part) => part.text)
       .join("")
@@ -363,10 +385,7 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     const messages = await getMessages(sid)
     expect(messages.length).toBeGreaterThanOrEqual(2)
 
-    const assistant = messages.find((m) => m.info.role === "assistant")
-    expect(assistant).toBeDefined()
-
-    const textParts = assistant!.parts.filter((p) => p.type === "text")
+    const textParts = assistantParts(messages).filter((p) => p.type === "text")
     expect(textParts.length).toBeGreaterThan(0)
 
     const fullText = textParts.map((p) => p.text).join("")
@@ -381,8 +400,7 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     await waitForIdle(sid)
 
     const messages = await getMessages(sid)
-    const assistant = messages.find((m) => m.info.role === "assistant")
-    const textParts = assistant!.parts.filter((p) => p.type === "text")
+    const textParts = assistantParts(messages).filter((p) => p.type === "text")
     const fullText = textParts.map((p) => p.text).join("")
     expect(fullText.length).toBeGreaterThan(0)
     console.log("  Chinese response:", fullText.slice(0, 150))
@@ -397,15 +415,16 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     await waitForIdle(sid)
 
     const messages = await getMessages(sid)
-    const assistant = messages.find((m) => m.info.role === "assistant")
-    expect(assistant).toBeDefined()
+    const assistants = assistantMessages(messages)
+    const parts = assistantParts(messages)
+    expect(assistants.length).toBeGreaterThan(0)
 
-    const reasoningParts = assistant!.parts.filter((p) => p.type === "reasoning")
-    const textParts = assistant!.parts.filter((p) => p.type === "text")
+    const reasoningParts = parts.filter((p) => p.type === "reasoning")
+    const textParts = parts.filter((p) => p.type === "text")
 
     console.log(
       "  Part types:",
-      assistant!.parts.map((p) => p.type),
+      parts.map((p) => p.type),
     )
     console.log("  Reasoning parts:", reasoningParts.length)
     console.log("  Text parts:", textParts.length)
@@ -418,9 +437,8 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
         expect(part.time?.start).toBeNumber()
         expect(part.time?.end).toBeNumber()
       }
-      const desktopOrder = [...assistant!.parts].sort((left, right) => left.id.localeCompare(right.id))
-      expect(desktopOrder.findIndex((part) => part.type === "reasoning")).toBeLessThan(
-        desktopOrder.findIndex((part) => part.type === "text"),
+      expect(assistants.findIndex((message) => message.parts.some((part) => part.type === "reasoning"))).toBeLessThan(
+        assistants.findIndex((message) => message.parts.some((part) => part.type === "text")),
       )
     }
 
@@ -441,15 +459,13 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     await waitForIdle(sid)
 
     const messages = await getMessages(sid)
-    const assistant = messages.find((m) => m.info.role === "assistant")
-    expect(assistant).toBeDefined()
-
-    const toolParts = assistant!.parts.filter((p) => p.type === "tool")
-    const textParts = assistant!.parts.filter((p) => p.type === "text")
+    const parts = assistantParts(messages)
+    const toolParts = parts.filter((p) => p.type === "tool")
+    const textParts = parts.filter((p) => p.type === "text")
 
     console.log(
       "  Part types:",
-      assistant!.parts.map((p) => p.type),
+      parts.map((p) => p.type),
     )
     console.log("  Tool parts:", toolParts.length)
 
@@ -480,15 +496,13 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     await waitForIdle(sid)
 
     const messages = await getMessages(sid)
-    const assistant = messages.find((m) => m.info.role === "assistant")
-    expect(assistant).toBeDefined()
-
-    const toolParts = assistant!.parts.filter((p) => p.type === "tool")
-    const textParts = assistant!.parts.filter((p) => p.type === "text")
+    const parts = assistantParts(messages)
+    const toolParts = parts.filter((p) => p.type === "tool")
+    const textParts = parts.filter((p) => p.type === "text")
 
     console.log(
       "  Part types:",
-      assistant!.parts.map((p) => p.type),
+      parts.map((p) => p.type),
     )
 
     expect(toolParts.length).toBeGreaterThanOrEqual(1)
@@ -632,10 +646,11 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     const childPrompt = childUser?.parts.find((part) => part.type === "text")?.text
     expect(childPrompt).toContain("package.json")
     expect(childPrompt?.toLowerCase()).toContain("package name")
-    const childAssistant = childMessages.find((message) => message.info.role === "assistant")
-    expect(childAssistant?.info.time?.completed).toBeNumber()
+    const childAssistants = assistantMessages(childMessages)
+    expect(childAssistants.every((message) => typeof message.info.time?.completed === "number")).toBe(true)
     expect(
-      childAssistant?.parts
+      childAssistants
+        .flatMap((message) => message.parts)
         .filter((part) => part.type === "text")
         .map((part) => part.text)
         .join(""),
@@ -657,11 +672,11 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     expect(messages.length).toBeGreaterThanOrEqual(4)
     expect(messages.map((message) => message.info.id)).toEqual([...messages].map((message) => message.info.id).sort())
 
-    const assistantMessages = messages.filter((m) => m.info.role === "assistant")
-    expect(assistantMessages.length).toBeGreaterThanOrEqual(2)
+    const assistants = assistantMessages(messages)
+    expect(messages.filter((message) => message.info.role === "user")).toHaveLength(2)
+    expect(assistants.length).toBeGreaterThanOrEqual(2)
 
-    const lastAssistant = assistantMessages[assistantMessages.length - 1]!
-    const textParts = lastAssistant.parts.filter((p) => p.type === "text")
+    const textParts = lastAssistantTurnParts(messages).filter((p) => p.type === "text")
     const fullText = textParts.map((p) => p.text).join("")
     console.log("  Last response:", fullText.slice(0, 150))
     expect(fullText.toLowerCase()).toContain("42")
@@ -691,8 +706,7 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
 
     const messages = await getMessages(sid)
     expect(messages.length).toBeGreaterThanOrEqual(4)
-    const lastAssistant = messages.filter((message) => message.info.role === "assistant").at(-1)
-    const restoredText = lastAssistant?.parts
+    const restoredText = lastAssistantTurnParts(messages)
       .filter((part) => part.type === "text")
       .map((part) => part.text ?? "")
       .join("")
@@ -717,7 +731,8 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     }
 
     const assistants = messages.filter((message) => message.info.role === "assistant")
-    expect(assistants.length).toBe(3)
+    expect(messages.filter((message) => message.info.role === "user")).toHaveLength(3)
+    expect(assistants.length).toBeGreaterThanOrEqual(3)
     const output = assistants
       .flatMap((message) => message.parts)
       .filter((part) => part.type === "text")
@@ -864,11 +879,12 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     const msgs1 = await getMessages(sid)
     const msgs2 = await getMessages(sid)
 
-    const a1 = msgs1.find((m) => m.info.role === "assistant")
-    const a2 = msgs2.find((m) => m.info.role === "assistant")
-
-    const tools1 = a1!.parts.filter((p) => p.type === "tool").map((p) => p.id)
-    const tools2 = a2!.parts.filter((p) => p.type === "tool").map((p) => p.id)
+    const tools1 = assistantParts(msgs1)
+      .filter((p) => p.type === "tool")
+      .map((p) => p.id)
+    const tools2 = assistantParts(msgs2)
+      .filter((p) => p.type === "tool")
+      .map((p) => p.id)
     expect(tools1.length).toBeGreaterThanOrEqual(1)
     expect(tools1).toEqual(tools2)
   }, 120000)
@@ -1102,9 +1118,7 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     await waitForIdle(session.id, 120000)
 
     const messages = await getMessages(session.id)
-    const assistant = messages.find((m) => m.info.role === "assistant")
-    expect(assistant).toBeDefined()
-    const textParts = assistant!.parts.filter((p) => p.type === "text")
+    const textParts = assistantParts(messages).filter((p) => p.type === "text")
     expect(textParts.length).toBeGreaterThan(0)
 
     const fullText = textParts.map((p) => p.text).join("")
