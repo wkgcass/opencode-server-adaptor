@@ -50,6 +50,11 @@ export function createEventRoutes(options: { events: EventBus; logger: Logger })
 
         const onAbort = () => cleanup("client_abort")
 
+        const logEvent = (event: Event) => {
+          if ((event as { type?: unknown }).type === "server.heartbeat") return
+          logger.interaction("opencode", "out", { kind: "SSE message", path }, event)
+        }
+
         const flush = () => {
           if (closed) return
           while (queue.length > 0) {
@@ -74,7 +79,7 @@ export function createEventRoutes(options: { events: EventBus; logger: Logger })
           cleanup("client_abort")
           return
         }
-        logger.interaction("opencode", "out", { kind: "SSE message", path }, connected)
+        logEvent(connected)
         queue.push(format(connected))
         flush()
         if (closed) return
@@ -86,7 +91,7 @@ export function createEventRoutes(options: { events: EventBus; logger: Logger })
         const stopSubscription = subscribe((event) => {
           if (closed) return
           try {
-            logger.interaction("opencode", "out", { kind: "SSE message", path }, event)
+            logEvent(event)
             queue.push(format(event))
             flush()
           } catch (error) {
@@ -103,7 +108,7 @@ export function createEventRoutes(options: { events: EventBus; logger: Logger })
           if (closed) return
           try {
             const heartbeat = makeHeartbeat()
-            logger.interaction("opencode", "out", { kind: "SSE message", path }, heartbeat)
+            logEvent(heartbeat)
             queue.push(format(heartbeat))
             flush()
           } catch (error) {

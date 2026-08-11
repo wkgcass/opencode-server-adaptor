@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Hono } from "hono"
 import { Logger } from "../../src/logging/index.ts"
 import { verboseLoggingMiddleware } from "../../src/server.ts"
-import { EventBus } from "../../src/event/index.ts"
+import { createEvent, EventBus } from "../../src/event/index.ts"
 import { createEventRoutes } from "../../src/api/routes/event.ts"
 import { optimizePiInteractionPayload } from "../../src/agents/pi/pi-interaction-payload.ts"
 import { registerInteractionPayloadOptimizer } from "../../src/logging/interaction-payload.ts"
@@ -10,9 +10,9 @@ import { registerInteractionPayloadOptimizer } from "../../src/logging/interacti
 registerInteractionPayloadOptimizer("pi", optimizePiInteractionPayload)
 
 const ANSI_BLUE = "\u001b[94m"
-const ANSI_CYAN = "\u001b[96m"
 const ANSI_MAGENTA = "\u001b[95m"
 const ANSI_WHITE = "\u001b[97m"
+const ANSI_GRAY = "\u001b[90m"
 const ANSI_ORANGE = "\u001b[38;5;208m"
 
 function capturingLogger(options?: { verbose?: boolean }): { logger: Logger; output: () => string } {
@@ -106,7 +106,7 @@ describe("human-readable verbose interaction logging", () => {
     expect(output).toContain("url=/echo?source=desktop")
     expect(output).toContain('"message":"完整请求"')
     expect(output).toContain('"parts":[{"type":"text","text":"hello"}]')
-    expect(output).toContain(`${ANSI_CYAN}`)
+    expect(output.split(ANSI_BLUE)).toHaveLength(3)
     expect(output).toContain("[OpenCode Response ←]")
     expect(output).toContain("Response Payload:")
     expect(output).toContain("status=201")
@@ -117,6 +117,30 @@ describe("human-readable verbose interaction logging", () => {
     expect(output.match(/\[OpenCode Response ←]/g)).toHaveLength(1)
     expect(output.match(/Request Payload:/g)).toHaveLength(1)
     expect(output.match(/Response Payload:/g)).toHaveLength(1)
+  })
+
+  test("GET /api/health suppresses its request and the entire successful response interaction", async () => {
+    const successful = capturingLogger()
+    const successfulApp = new Hono()
+    successfulApp.use("*", verboseLoggingMiddleware(successful.logger))
+    successfulApp.get("/api/health", (c) => c.json({ healthy: true }))
+
+    const successfulResponse = await successfulApp.request("/api/health")
+    expect(successfulResponse.status).toBe(200)
+    expect(await successfulResponse.json()).toEqual({ healthy: true })
+    expect(successful.output()).toBe("")
+
+    const failed = capturingLogger()
+    const failedApp = new Hono()
+    failedApp.use("*", verboseLoggingMiddleware(failed.logger))
+    failedApp.get("/api/health", (c) => c.json({ status: "starting" }, 503))
+
+    const failedResponse = await failedApp.request("/api/health")
+    expect(failedResponse.status).toBe(503)
+    expect(failed.output()).not.toContain("[OpenCode Request →]")
+    expect(failed.output()).toContain("[OpenCode Response ←]")
+    expect(failed.output()).toContain("status=503")
+    expect(failed.output()).toContain('Response Payload: {"status":"starting"}')
   })
 
   test("v2 active-session polling logs response metadata but suppresses its repetitive payload", async () => {
@@ -172,7 +196,7 @@ describe("human-readable verbose interaction logging", () => {
     expect(output).not.toContain("payload must not be logged")
   })
 
-  test("session message responses stay complete on the wire but use compact verbose logs", async () => {
+  test("session message logs omit verbose conversation and tool payload fields", async () => {
     const capture = capturingLogger()
     const app = new Hono()
     app.use("*", verboseLoggingMiddleware(capture.logger))
@@ -189,6 +213,10 @@ describe("human-readable verbose interaction logging", () => {
                 id: "prt_1",
                 type: "text",
                 text: "complete response that must remain on the HTTP wire",
+                metadata: {
+                  output: "metadata output that must remain on the HTTP wire only",
+                  preserved: "useful metadata",
+                },
               },
             ],
           },
@@ -199,15 +227,69 @@ describe("human-readable verbose interaction logging", () => {
 
     const response = await app.request("/api/session/ses_1/message?directory=%2Fworkspace")
     expect(response.status).toBe(200)
-    const body = (await response.json()) as { data: Array<{ content: Array<{ text: string }> }> }
+    const body = (await response.json()) as {
+      data: Array<{ content: Array<{ text: string; metadata: { output: string } }> }>
+    }
     expect(body.data[0]!.content[0]!.text).toBe("complete response that must remain on the HTTP wire")
+    expect(body.data[0]!.content[0]!.metadata.output).toBe("metadata output that must remain on the HTTP wire only")
 
     const output = capture.output()
-    expect(output).toContain('"textLength":51')
+    expect(output).toContain("[OpenCode Response ←]")
+    expect(output).toContain("url=/api/session/ses_1/message?directory=%2Fworkspace")
+    expect(output).toContain("status=200")
+    expect(output).toContain(`${ANSI_GRAY}Response Payload:`)
+    expect(output).toContain("msg_1")
+    expect(output).toContain("prt_1")
     expect(output).not.toContain("complete response that must remain on the HTTP wire")
+    expect(output).toContain("useful metadata")
+    expect(output).not.toContain("metadata output that must remain on the HTTP wire only")
   })
 
-  test("SSE logs the complete event at the point it is written", async () => {
+  test("failed session message responses retain their diagnostic payload", async () => {
+    const capture = capturingLogger()
+    const app = new Hono()
+    app.use("*", verboseLoggingMiddleware(capture.logger))
+    app.get("/api/session/:id/message", (c) => c.json({ error: "history lookup failed" }, 500))
+
+    const response = await app.request("/api/session/ses_1/message")
+    expect(response.status).toBe(500)
+
+    const output = capture.output()
+    expect(output).toContain(`${ANSI_WHITE}Response Payload:`)
+    expect(output).toContain("history lookup failed")
+  })
+
+  test("command catalog responses stay complete on the wire but omit templates from verbose logs", async () => {
+    const capture = capturingLogger()
+    const app = new Hono()
+    app.use("*", verboseLoggingMiddleware(capture.logger))
+    app.get("/api/command", (c) =>
+      c.json({
+        location: { directory: "/workspace" },
+        data: [
+          {
+            name: "review",
+            description: "Review a target",
+            template: "complete Skill instructions that should remain on the HTTP wire only",
+            subtask: false,
+          },
+        ],
+      }),
+    )
+
+    const response = await app.request("/api/command?location%5Bdirectory%5D=%2Fworkspace")
+    const body = (await response.json()) as { data: Array<{ template: string }> }
+    expect(body.data[0]!.template).toBe("complete Skill instructions that should remain on the HTTP wire only")
+
+    const output = capture.output()
+    expect(output).toContain("Response Payload:")
+    expect(output).toContain('"name":"review"')
+    expect(output).toContain('"description":"Review a target"')
+    expect(output).not.toContain("complete Skill instructions that should remain on the HTTP wire only")
+    expect(output).not.toContain('"template"')
+  })
+
+  test("SSE logs complete events but suppresses server heartbeat interactions", async () => {
     const capture = capturingLogger()
     const events = new EventBus(capture.logger)
     const app = createEventRoutes({ events, logger: capture.logger })
@@ -217,6 +299,12 @@ describe("human-readable verbose interaction logging", () => {
     try {
       const first = await reader.read()
       expect(new TextDecoder().decode(first.value)).toContain("server.connected")
+      events.publish(createEvent("server.heartbeat", {}))
+      const heartbeat = await reader.read()
+      expect(new TextDecoder().decode(heartbeat.value)).toContain("server.heartbeat")
+      events.publish(createEvent("session.updated", { sessionID: "ses_1" }))
+      const sessionUpdated = await reader.read()
+      expect(new TextDecoder().decode(sessionUpdated.value)).toContain("session.updated")
     } finally {
       await reader.cancel()
       events.close()
@@ -226,6 +314,10 @@ describe("human-readable verbose interaction logging", () => {
     expect(output).toContain("kind=SSE message")
     expect(output).toContain("path=/api/event")
     expect(output).toContain('"type":"server.connected"')
+    expect(output).toContain('"type":"session.updated"')
+    expect(output).not.toContain('"type":"server.heartbeat"')
+    expect(output.match(/\[OpenCode Response ←]/g)).toHaveLength(2)
+    expect(output.match(/Response Payload:/g)).toHaveLength(2)
   })
 
   test("escapes embedded newlines so every payload remains on one physical line", () => {

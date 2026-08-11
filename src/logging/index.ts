@@ -5,6 +5,11 @@ export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR"
 export type InteractionChannel = string
 export type InteractionDirection = "in" | "out"
 
+export interface InteractionLogOptions {
+  omitPayload?: boolean
+  mutedPayload?: boolean
+}
+
 const LEVEL_PRIORITY: Record<LogLevel, number> = {
   DEBUG: 10,
   INFO: 20,
@@ -24,7 +29,6 @@ const ANSI = {
   white: "\u001b[97m",
   gray: "\u001b[90m",
   blue: "\u001b[94m",
-  cyan: "\u001b[96m",
   magenta: "\u001b[95m",
   orange: "\u001b[38;5;208m",
   red: "\u001b[91m",
@@ -109,19 +113,19 @@ export class Logger {
   /**
    * Emit a complete wire message when --verbose is active. The colored first
    * line is deliberately compact metadata; the untruncated payload is emitted
-   * as compact JSON on one separate white line so terminal output stays easy
-   * to scan and copy.
+   * as compact JSON on a separate line so terminal output stays easy to scan
+   * and copy. Callers may mute repetitive payloads without hiding them.
    */
   interaction(
     channel: InteractionChannel,
     direction: InteractionDirection,
     metadata: Record<string, unknown>,
     payload: unknown,
-    options?: { omitPayload?: boolean },
+    options?: InteractionLogOptions,
   ): void {
     if (!this.printLogs || !this.verbose) return
     const isAgentChannel = channel !== "opencode"
-    const color = isAgentChannel ? ANSI.magenta : direction === "in" ? ANSI.blue : ANSI.cyan
+    const color = isAgentChannel ? ANSI.magenta : ANSI.blue
     const label = isAgentChannel
       ? channel.charAt(0).toUpperCase() + channel.slice(1)
       : direction === "in"
@@ -133,9 +137,10 @@ export class Logger {
     const header = details ? ` ${details}` : ""
     const optimizedPayload = optimizeInteractionPayload(channel, metadata, payload)
     const metadataLine = `${color}${new Date().toISOString()} [${label} ${arrow}]${header}${ANSI.reset}\n`
+    const payloadColor = options?.mutedPayload ? ANSI.gray : ANSI.white
     const payloadLine = options?.omitPayload
       ? ""
-      : `${ANSI.white}${payloadLabel}: ${jsonPayload(optimizedPayload)}${ANSI.reset}\n`
+      : `${payloadColor}${payloadLabel}: ${jsonPayload(optimizedPayload)}${ANSI.reset}\n`
     this.stream.write(metadataLine + payloadLine)
   }
 
@@ -191,7 +196,7 @@ export class ChildLogger {
     direction: InteractionDirection,
     metadata: Record<string, unknown>,
     payload: unknown,
-    options?: { omitPayload?: boolean },
+    options?: InteractionLogOptions,
   ): void {
     this.parent.interaction(channel, direction, { ...this.fields, ...metadata }, payload, options)
   }

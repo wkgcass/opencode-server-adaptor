@@ -172,28 +172,32 @@ export function verboseLoggingMiddleware(logger: Logger) {
     const path = c.req.path
     const request = c.req.raw as Request
     const query = new URL(request.url).search
-    let requestText = ""
-    try {
-      requestText = await request.clone().text()
-    } catch (error) {
-      requestText = `<unable to read request body: ${error instanceof Error ? error.message : String(error)}>`
+    const suppressHealthRequest = method === "GET" && path === "/api/health"
+    if (!suppressHealthRequest) {
+      let requestText = ""
+      try {
+        requestText = await request.clone().text()
+      } catch (error) {
+        requestText = `<unable to read request body: ${error instanceof Error ? error.message : String(error)}>`
+      }
+      logger.interaction(
+        "opencode",
+        "in",
+        {
+          kind: "HTTP request",
+          method,
+          url: path + query,
+          headers: interactionHeaders(request.headers),
+        },
+        payloadFromText(requestText, request.headers.get("content-type") ?? undefined),
+      )
     }
-    logger.interaction(
-      "opencode",
-      "in",
-      {
-        kind: "HTTP request",
-        method,
-        url: path + query,
-        headers: interactionHeaders(request.headers),
-      },
-      payloadFromText(requestText, request.headers.get("content-type") ?? undefined),
-    )
 
     await next()
 
     const duration = Date.now() - start
     const status = c.res.status
+    if (suppressHealthRequest && status === 200) return
     const response = c.res as Response
     const contentType = response.headers.get("content-type") ?? undefined
     const isEventStream = contentType?.toLowerCase().includes("text/event-stream") ?? false
@@ -219,6 +223,11 @@ export function verboseLoggingMiddleware(logger: Logger) {
       responsePayload,
       {
         omitPayload: method === "GET" && (path === "/api/session" || path === "/api/session/active"),
+        mutedPayload:
+          method === "GET" &&
+          status >= 200 &&
+          status < 300 &&
+          /^\/api\/session\/[^/]+\/message\/?$/.test(path),
       },
     )
   }

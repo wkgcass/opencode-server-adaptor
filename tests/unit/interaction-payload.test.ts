@@ -384,7 +384,59 @@ describe("verbose interaction payload design", () => {
     })
   })
 
-  test("OpenCode v2 message envelopes and durable SSE events receive the same compact logging treatment", () => {
+  test("OpenCode v2 message logs omit verbose conversation and tool payload fields", () => {
+    const payload = {
+      data: [
+        {
+          id: "msg_user",
+          type: "user",
+          time: { created: 1 },
+          text: "a complete v2 user prompt",
+          files: [{ uri: "file:///tmp/example" }],
+        },
+        {
+          id: "msg_assistant",
+          type: "assistant",
+          time: { created: 2, completed: 3 },
+          summary: { title: "message summary to omit", body: "summary body to omit" },
+          agent: "pi",
+          model: { id: "model", providerID: "provider" },
+          finish: "stop",
+          content: [
+            { type: "text", id: "text_1", text: "a complete v2 answer" },
+            {
+              type: "tool",
+              id: "call_1",
+              name: "bash",
+              state: {
+                status: "completed",
+                input: {
+                  command: "state input command to omit",
+                  content: "state input content to omit",
+                  path: "state input path to omit",
+                  filePath: "state input filePath to omit",
+                  cwd: "/workspace",
+                },
+                content: [{ type: "text", text: "state content text to omit", mime: "text/plain" }],
+                result: "state result to omit",
+                metadata: {
+                  output: "state metadata output to omit",
+                  partialOutput: "state metadata partial output to omit",
+                  preserved: "state metadata to preserve",
+                },
+                error: { name: "ToolError", message: "state error message to omit", code: "E_TOOL" },
+              },
+              metadata: {
+                output: "metadata output to omit",
+                partialOutput: "metadata partial output to omit",
+                truncation: { content: "large tool output", truncated: true },
+              },
+            },
+          ],
+        },
+      ],
+      cursor: { next: "opaque" },
+    }
     const response = optimizeInteractionPayload(
       "opencode",
       {
@@ -393,43 +445,7 @@ describe("verbose interaction payload design", () => {
         url: "/api/session/ses_1/message?limit=50",
         status: 200,
       },
-      {
-        data: [
-          {
-            id: "msg_user",
-            type: "user",
-            time: { created: 1 },
-            text: "a complete v2 user prompt",
-            files: [{ uri: "file:///tmp/example" }],
-          },
-          {
-            id: "msg_assistant",
-            type: "assistant",
-            time: { created: 2, completed: 3 },
-            agent: "pi",
-            model: { id: "model", providerID: "provider" },
-            finish: "stop",
-            content: [
-              { type: "text", id: "text_1", text: "a complete v2 answer" },
-              {
-                type: "tool",
-                id: "call_1",
-                name: "bash",
-                state: {
-                  status: "completed",
-                  content: [{ type: "text", text: "large tool output" }],
-                  result: "large tool output",
-                },
-                metadata: {
-                  partialOutput: "large tool output",
-                  truncation: { content: "large tool output", truncated: true },
-                },
-              },
-            ],
-          },
-        ],
-        cursor: { next: "opaque" },
-      },
+      payload,
     )
     expect(response).toEqual({
       data: [
@@ -437,8 +453,7 @@ describe("verbose interaction payload design", () => {
           id: "msg_user",
           type: "user",
           time: { created: 1 },
-          textLength: 25,
-          fileCount: 1,
+          files: [{ uri: "file:///tmp/example" }],
         },
         {
           id: "msg_assistant",
@@ -448,17 +463,20 @@ describe("verbose interaction payload design", () => {
           model: { id: "model", providerID: "provider" },
           finish: "stop",
           content: [
-            { type: "text", id: "text_1", textLength: 20 },
+            { type: "text", id: "text_1" },
             {
               type: "tool",
               id: "call_1",
               name: "bash",
-              status: "completed",
-              contentCount: 1,
-              resultLength: 17,
-              partialOutputLength: 17,
+              state: {
+                status: "completed",
+                input: { cwd: "/workspace" },
+                content: [{ type: "text", mime: "text/plain" }],
+                metadata: { preserved: "state metadata to preserve" },
+                error: { name: "ToolError", code: "E_TOOL" },
+              },
               metadata: {
-                truncation: { contentLength: 17, truncated: true },
+                truncation: { content: "large tool output", truncated: true },
               },
             },
           ],
@@ -466,7 +484,32 @@ describe("verbose interaction payload design", () => {
       ],
       cursor: { next: "opaque" },
     })
-    expect(JSON.stringify(response)).not.toContain("large tool output")
+    expect(JSON.stringify(payload)).toContain("metadata output to omit")
+    expect(JSON.stringify(payload)).toContain("a complete v2 user prompt")
+    expect(JSON.stringify(payload)).toContain("a complete v2 answer")
+    const loggedResponse = JSON.stringify(response)
+    for (const removed of [
+      "metadata output to omit",
+      "metadata partial output to omit",
+      "a complete v2 user prompt",
+      "a complete v2 answer",
+      "state input command to omit",
+      "state input content to omit",
+      "state input path to omit",
+      "state input filePath to omit",
+      "state content text to omit",
+      "state result to omit",
+      "state metadata output to omit",
+      "state metadata partial output to omit",
+      "state error message to omit",
+      "message summary to omit",
+      "summary body to omit",
+    ]) {
+      expect(loggedResponse).not.toContain(removed)
+    }
+    expect(loggedResponse).toContain("large tool output")
+    expect(loggedResponse).toContain("state metadata to preserve")
+    expect(loggedResponse).toContain("E_TOOL")
 
     const event = optimizeInteractionPayload(
       "opencode",
@@ -494,6 +537,45 @@ describe("verbose interaction payload design", () => {
         textLength: 25,
       },
     })
+  })
+
+  test("OpenCode command catalog logs omit only each command template", () => {
+    const payload = {
+      location: { directory: "/workspace" },
+      data: [
+        {
+          name: "review",
+          description: "Review a target",
+          template: "complete Skill instructions that should not be logged",
+          subtask: false,
+        },
+        {
+          name: "test",
+          template: "run the complete test workflow",
+          agent: "plan",
+        },
+      ],
+    }
+
+    const response = optimizeInteractionPayload(
+      "opencode",
+      {
+        kind: "HTTP response",
+        method: "GET",
+        url: "/api/command?location%5Bdirectory%5D=%2Fworkspace",
+        status: 200,
+      },
+      payload,
+    )
+
+    expect(response).toEqual({
+      location: { directory: "/workspace" },
+      data: [
+        { name: "review", description: "Review a target", subtask: false },
+        { name: "test", agent: "plan" },
+      ],
+    })
+    expect(payload.data[0]!.template).toBe("complete Skill instructions that should not be logged")
   })
 
   test("unrelated HTTP payloads, failed message responses, and unknown future events remain complete", () => {

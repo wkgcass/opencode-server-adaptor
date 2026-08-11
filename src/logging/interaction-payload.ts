@@ -10,6 +10,12 @@ function defined(input: UnknownRecord): UnknownRecord {
   return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined))
 }
 
+function withoutFields(value: unknown, fields: readonly string[]): UnknownRecord | undefined {
+  const input = record(value)
+  if (!input) return undefined
+  return Object.fromEntries(Object.entries(input).filter(([key]) => !fields.includes(key)))
+}
+
 function compactMetadata(metadata: UnknownRecord): UnknownRecord {
   const truncation = record(metadata.truncation)
   return defined({
@@ -97,6 +103,7 @@ function compactPart(part: UnknownRecord): UnknownRecord {
 
 function isSessionMessagesResponse(metadata: Record<string, unknown>): boolean {
   if (metadata.kind !== "HTTP response") return false
+  if (metadata.method !== undefined && metadata.method !== "GET") return false
   const status = metadata.status
   if (typeof status === "number" && (status < 200 || status >= 300)) return false
   if (typeof metadata.url !== "string") return false
@@ -104,80 +111,77 @@ function isSessionMessagesResponse(metadata: Record<string, unknown>): boolean {
   return /^\/api\/session\/[^/]+\/message\/?$/.test(path)
 }
 
-function compactSessionMessagesResponse(payload: unknown): unknown {
-  const envelope = record(payload)
-  if (envelope && Array.isArray(envelope.data)) {
-    return {
-      ...envelope,
-      data: envelope.data.map(compactV2Message),
-    }
-  }
-  return payload
+function isCommandListResponse(metadata: Record<string, unknown>): boolean {
+  if (metadata.kind !== "HTTP response") return false
+  if (metadata.method !== undefined && metadata.method !== "GET") return false
+  const status = metadata.status
+  if (typeof status === "number" && (status < 200 || status >= 300)) return false
+  if (typeof metadata.url !== "string") return false
+  const path = metadata.url.split("?", 1)[0] ?? metadata.url
+  return /^\/api\/command\/?$/.test(path)
 }
 
-function compactV2Message(value: unknown): unknown {
-  const message = record(value)
-  if (!message || (message.type !== "user" && message.type !== "assistant")) return value
-  if (message.type === "user") {
-    return defined({
-      id: message.id,
-      type: message.type,
-      time: message.time,
-      textLength: typeof message.text === "string" ? message.text.length : undefined,
-      fileCount: Array.isArray(message.files) ? message.files.length : undefined,
-      agentCount: Array.isArray(message.agents) ? message.agents.length : undefined,
-      subtaskCount: Array.isArray(message.subtasks) ? message.subtasks.length : undefined,
-      systemLength: typeof message.system === "string" ? message.system.length : undefined,
-    })
+function sanitizeSessionMessages(payload: unknown): unknown {
+  const envelope = record(payload)
+  if (!envelope || !Array.isArray(envelope.data)) return payload
+  return {
+    ...envelope,
+    data: envelope.data.map((value) => {
+      const message = record(value)
+      if (!message) return value
+      const messageWithoutLargeFields = withoutFields(message, ["text", "summary"])!
+      return {
+        ...messageWithoutLargeFields,
+        ...(Array.isArray(message.content)
+          ? {
+              content: message.content.map((item) => {
+                const content = record(item)
+                if (!content) return item
+                const sanitized = withoutFields(content, ["text"])!
+                const metadata = withoutFields(content.metadata, ["output", "partialOutput"])
+                if (metadata) sanitized.metadata = metadata
+
+                const state = withoutFields(content.state, ["result"])
+                if (state) {
+                  const input = withoutFields(state.input, ["command", "content", "path", "filePath"])
+                  if (input) state.input = input
+
+                  if (Array.isArray(state.content)) {
+                    state.content = state.content.map((stateItem) => withoutFields(stateItem, ["text"]) ?? stateItem)
+                  } else {
+                    const stateContent = withoutFields(state.content, ["text"])
+                    if (stateContent) state.content = stateContent
+                  }
+
+                  const stateMetadata = withoutFields(state.metadata, ["output", "partialOutput"])
+                  if (stateMetadata) state.metadata = stateMetadata
+
+                  const error = withoutFields(state.error, ["message"])
+                  if (error) state.error = error
+
+                  sanitized.state = state
+                }
+                return sanitized
+              }),
+            }
+          : {}),
+      }
+    }),
   }
-  return defined({
-    id: message.id,
-    type: message.type,
-    time: message.time,
-    agent: message.agent,
-    model: message.model,
-    finish: message.finish,
-    cost: message.cost,
-    tokens: message.tokens,
-    error: message.error,
-    content: Array.isArray(message.content)
-      ? message.content.map((item) => {
-          const content = record(item)
-          if (!content) return item
-          if (content.type === "text" || content.type === "reasoning") {
-            return defined({
-              type: content.type,
-              id: content.id,
-              textLength: typeof content.text === "string" ? content.text.length : undefined,
-              time: content.time,
-            })
-          }
-          if (content.type === "tool") {
-            const state = record(content.state)
-            const metadata = record(content.metadata)
-            const partialOutput = metadata?.partialOutput
-            const compactedMetadata = metadata ? compactMetadata(metadata) : undefined
-            return defined({
-              type: content.type,
-              id: content.id,
-              partID: content.partID,
-              callID: content.callID,
-              name: content.name,
-              status: state?.status,
-              input: state?.status === "pending" ? state.input : undefined,
-              title: content.title,
-              time: content.time,
-              error: state?.error,
-              contentCount: Array.isArray(state?.content) ? state.content.length : undefined,
-              resultLength: typeof state?.result === "string" ? state.result.length : undefined,
-              partialOutputLength: typeof partialOutput === "string" ? partialOutput.length : undefined,
-              metadata: compactedMetadata && Object.keys(compactedMetadata).length > 0 ? compactedMetadata : undefined,
-            })
-          }
-          return content
-        })
-      : undefined,
-  })
+}
+
+function stripCommandTemplates(payload: unknown): unknown {
+  const envelope = record(payload)
+  if (!envelope || !Array.isArray(envelope.data)) return payload
+  return {
+    ...envelope,
+    data: envelope.data.map((value) => {
+      const command = record(value)
+      if (!command || !Object.prototype.hasOwnProperty.call(command, "template")) return value
+      const { template: _template, ...commandWithoutTemplate } = command
+      return commandWithoutTemplate
+    }),
+  }
 }
 
 function compactOpenCodeEvent(event: UnknownRecord): UnknownRecord {
@@ -283,11 +287,16 @@ export function optimizeInteractionPayload(
   if (channel === "opencode" && metadata.kind === "SSE message") {
     return compactOpenCodePayload(payload)
   }
-  // Session history can contain the complete accumulated conversation and
-  // terminal tool output. Keep the real HTTP response untouched while making
-  // its verbose log use the same identity-and-length summaries as SSE.
+  // Keep session history structure useful for diagnostics without repeating
+  // message text or potentially large command/tool payload fields. The
+  // returned copy affects only verbose logging, never the HTTP response.
   if (channel === "opencode" && isSessionMessagesResponse(metadata)) {
-    return compactSessionMessagesResponse(payload)
+    return sanitizeSessionMessages(payload)
+  }
+  // Command templates can contain complete Skill instructions and dominate
+  // the catalog response. Keep command identity and execution metadata only.
+  if (channel === "opencode" && isCommandListResponse(metadata)) {
+    return stripCommandTemplates(payload)
   }
   return payloadOptimizers.get(channel)?.(metadata, payload) ?? payload
 }
