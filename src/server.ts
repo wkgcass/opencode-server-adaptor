@@ -14,8 +14,8 @@ import { createPiAgentIntegration } from "./agents/pi/pi-integration.ts"
 import { createV2SessionRoutes } from "./api/routes/v2-session.ts"
 import { createV2Routes } from "./api/routes/v2.ts"
 import { createV2PermissionRoutes } from "./api/routes/v2-permission.ts"
-import { createV1Routes } from "./api/routes/v1.ts"
-import { createV1CompatibleRoutes } from "./api/routes/v1-compatible.ts"
+import { createV1LegacyRoutes } from "./api/routes/v1-legacy.ts"
+import { createV1CompatibleLegacyRoutes } from "./api/routes/v1-compatible-legacy.ts"
 import { registerInteractionPayloadOptimizer } from "./logging/interaction-payload.ts"
 import { ProviderConfigStore } from "./config/provider-config.ts"
 import { SessionEventStore } from "./event/session-event-store.ts"
@@ -380,13 +380,13 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
   // The v1-compatible routes (DELETE /session/:id, GET /config) have no v2
   // counterpart and are mounted in both api versions unless explicitly disabled.
   if (!options?.disableV1Compatible) {
-    app.route("/", createV1CompatibleRoutes({ config, providerConfig, sessionService: sessionService }))
+    app.route("/", createV1CompatibleLegacyRoutes({ config, providerConfig, sessionService: sessionService }))
   }
 
   if (apiVersion === "v1") {
     app.route(
       "/",
-      createV1Routes({
+      createV1LegacyRoutes({
         sessionService,
         registry,
         config,

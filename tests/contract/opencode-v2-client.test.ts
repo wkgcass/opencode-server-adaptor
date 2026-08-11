@@ -6,6 +6,18 @@ import { reserveFreePort } from "../helpers/free-port.ts"
 
 const CLI_PATH = resolve(import.meta.dir, "..", "..", "src", "cli.ts")
 const OPENCODE_APP_PACKAGE = resolve(import.meta.dir, "..", "..", "..", "opencode", "packages", "app", "package.json")
+const DESKTOP_REDUCER_ENTRY = resolve(
+  import.meta.dir,
+  "..",
+  "..",
+  "..",
+  "opencode",
+  "packages",
+  "app",
+  "src",
+  "context",
+  "server-session-v2-reducer.ts",
+)
 const CLIENT_ENTRY = resolve(
   import.meta.dir,
   "..",
@@ -21,7 +33,8 @@ const CLIENT_ENTRY = resolve(
   "promise",
   "index.js",
 )
-const HAS_OPENCODE_V2_CLIENT = existsSync(OPENCODE_APP_PACKAGE) && existsSync(CLIENT_ENTRY)
+const HAS_OPENCODE_V2_CLIENT =
+  existsSync(OPENCODE_APP_PACKAGE) && existsSync(CLIENT_ENTRY) && existsSync(DESKTOP_REDUCER_ENTRY)
 
 /**
  * Version of the packaged OpenCode Desktop client under test. Read dynamically so
@@ -167,11 +180,7 @@ describe.skipIf(!HAS_OPENCODE_V2_CLIENT)(`OpenCode ${OPENCODE_APP_VERSION} Deskt
       for await (const event of api.event.subscribe({ signal: controller.signal })) {
         if (event.data?.sessionID !== session.id) continue
         events.push(event as { type: string; data: Record<string, any> })
-        if (
-          event.type === "message.updated" &&
-          event.data.info?.role === "assistant" &&
-          event.data.info?.time?.completed !== undefined
-        ) {
+        if (event.type === "session.execution.succeeded") {
           return
         }
       }
@@ -193,23 +202,29 @@ describe.skipIf(!HAS_OPENCODE_V2_CLIENT)(`OpenCode ${OPENCODE_APP_VERSION} Deskt
           throw new Error("Timed out waiting for terminal assistant event")
         }),
       ])
-      const user = events.findIndex((event) => event.type === "message.updated" && event.data.info?.role === "user")
-      const assistant = events.findIndex(
-        (event) =>
-          event.type === "message.updated" &&
-          event.data.info?.role === "assistant" &&
-          event.data.info?.time?.completed === undefined,
-      )
-      const text = events.findIndex(
-        (event) => event.type === "message.part.updated" && event.data.part?.type === "text",
-      )
+      const user = events.findIndex((event) => event.type === "session.input.promoted")
+      const assistant = events.findIndex((event) => event.type === "session.step.started")
+      const text = events.findIndex((event) => event.type === "session.text.started")
       expect(user).toBeGreaterThanOrEqual(0)
       expect(assistant).toBeGreaterThan(user)
       expect(text).toBeGreaterThan(assistant)
-      const textPartIDs = new Set(
-        events.filter((event) => event.data.part?.type === "text").map((event) => event.data.part.id),
+      expect(events.filter((event) => event.type === "session.text.started")).toHaveLength(1)
+      expect(events.some((event) => event.type === "message.updated" || event.type.startsWith("message.part."))).toBe(
+        false,
       )
-      expect(textPartIDs.size).toBe(1)
+
+      const { createV2SessionReducer } = await import(DESKTOP_REDUCER_ENTRY)
+      const reducer = createV2SessionReducer()
+      let messages: any[] = []
+      for (const event of events) {
+        const reduced = reducer.reduce(messages, event)
+        if (reduced) messages = reduced.messages
+      }
+      expect(messages.find((message) => message.type === "user")?.text).toBe("ordered v2 event stream")
+      expect(messages.find((message) => message.type === "assistant")).toMatchObject({
+        finish: "stop",
+        content: [{ type: "text", text: expect.stringContaining("ordered v2 event stream") }],
+      })
     } finally {
       controller.abort()
       await read.catch(() => {})

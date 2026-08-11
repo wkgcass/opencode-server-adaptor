@@ -2,11 +2,12 @@ import type { AgentService } from "../agents/agent-service.ts"
 import { AgentConversationError } from "../agents/agent-service.ts"
 import type { AppConfig } from "../config/index.ts"
 import type { ProviderConfigStore } from "../config/provider-config.ts"
-import type { EventBus, OpenCodeEvent } from "../event/index.ts"
+import type { EventBus } from "../event/index.ts"
 import { createEvent } from "../event/index.ts"
 import type { SessionEventStore } from "../event/session-event-store.ts"
-import { orderedIdFormat } from "../id/index.ts"
-import type { MessageRepository, MessageWithParts, Part } from "../message/index.ts"
+import { publishSessionIdleLegacy } from "../event/session-events-legacy.ts"
+import { eventIdForMessageId, orderedIdFormat } from "../id/index.ts"
+import type { MessageRepository, MessageWithParts } from "../message/index.ts"
 import type { Session, SessionRepository } from "./index.ts"
 import { buildDefaultProviderMap, buildProviders, type BuiltinProviderDefinition } from "../provider/index.ts"
 import { runShellCommand } from "./shell-runner.ts"
@@ -86,9 +87,6 @@ function forkedSessionTitle(title: string): string {
 }
 
 export class SessionService {
-  private readonly unsubscribe: () => void
-  private readonly projectedTerminalEvents = new Set<string>()
-
   constructor(
     readonly sessions: SessionRepository,
     readonly messages: MessageRepository,
@@ -101,13 +99,9 @@ export class SessionService {
     private readonly builtinProviders: readonly BuiltinProviderDefinition[],
     private readonly startupSessionIds: ReadonlySet<string>,
     private readonly commands: CommandService,
-  ) {
-    this.unsubscribe = events.subscribeInternal((event) => this.projectRuntimeEvent(event))
-  }
+  ) {}
 
-  close(): void {
-    this.unsubscribe()
-  }
+  close(): void {}
 
   resolveModel(requested?: {
     providerID: string
@@ -172,23 +166,31 @@ export class SessionService {
     if (!updated) throw new SessionServiceError("not_found", `Session not found: ${sessionID}`, { sessionID })
     this.events.publish(createEvent("session.updated", { sessionID, info: updated }))
     if (input.agent && input.agent !== previous.agent) {
-      this.appendSessionEvent(sessionID, "session.next.agent.switched", {
-        timestamp: Date.now(),
+      const messageID = this.messages.nextMessageId(sessionID)
+      this.publishCurrentSessionEvent(
         sessionID,
-        messageID: this.messages.nextMessageId(sessionID),
-        agent: input.agent,
-      })
+        "session.agent.selected",
+        {
+          sessionID,
+          agent: input.agent,
+        },
+        { id: eventIdForMessageId(messageID) },
+      )
     }
     if (
       input.model &&
       (input.model.id !== previous.model?.id || input.model.providerID !== previous.model?.providerID)
     ) {
-      this.appendSessionEvent(sessionID, "session.next.model.switched", {
-        timestamp: Date.now(),
+      const messageID = this.messages.nextMessageId(sessionID)
+      this.publishCurrentSessionEvent(
         sessionID,
-        messageID: this.messages.nextMessageId(sessionID),
-        model: input.model,
-      })
+        "session.model.selected",
+        {
+          sessionID,
+          model: input.model,
+        },
+        { id: eventIdForMessageId(messageID) },
+      )
     }
     return updated
   }
@@ -282,8 +284,7 @@ export class SessionService {
     this.requireSession(sessionID)
     try {
       const session = await this.agentService.revert(sessionID, messageID, partID)
-      this.appendSessionEvent(sessionID, "session.next.revert.staged", {
-        timestamp: Date.now(),
+      this.publishCurrentSessionEvent(sessionID, "session.revert.staged", {
         sessionID,
         revert: { messageID, ...(partID ? { partID } : {}) },
       })
@@ -297,8 +298,7 @@ export class SessionService {
     this.requireSession(sessionID)
     try {
       const session = await this.agentService.unrevert(sessionID)
-      this.appendSessionEvent(sessionID, "session.next.revert.cleared", {
-        timestamp: Date.now(),
+      this.publishCurrentSessionEvent(sessionID, "session.revert.cleared", {
         sessionID,
       })
       return session
@@ -311,10 +311,8 @@ export class SessionService {
     this.requireSession(sessionID)
     try {
       await this.agentService.commitRevert(sessionID)
-      this.appendSessionEvent(sessionID, "session.next.revert.committed", {
-        timestamp: Date.now(),
+      this.publishCurrentSessionEvent(sessionID, "session.revert.committed", {
         sessionID,
-        messageID: this.messages.nextMessageId(sessionID),
       })
     } catch (error) {
       throw this.conversationError(error)
@@ -466,20 +464,22 @@ export class SessionService {
       }
     }
 
-    this.publishMessage(user)
     const prompt = {
       text: promptSegments.join("\n\n"),
       ...(files.length ? { files } : {}),
       ...(agents.length ? { agents } : {}),
     }
     const delivery = input.delivery ?? "steer"
-    const admitted = this.appendSessionEvent(sessionID, "session.next.prompt.admitted", {
-      timestamp: user.time.created,
+    const admitted = this.publishCurrentSessionEvent(
       sessionID,
-      messageID: user.id,
-      prompt,
-      delivery,
-    })
+      "session.input.admitted",
+      {
+        sessionID,
+        inputID: user.id,
+        input: { type: "user", delivery, data: prompt },
+      },
+      { created: user.time.created },
+    )
     const admission: SessionPromptAdmission = {
       admittedSeq: admitted.durable.seq,
       id: user.id,
@@ -491,20 +491,17 @@ export class SessionService {
     if (input.resume === false) return admission
 
     const assistant = this.messages.createAssistantMessage(sessionID, user.id, agent, model)
-    this.publishMessage(assistant)
     admission.assistantMessageID = assistant.id
-    const promoted = this.appendSessionEvent(sessionID, "session.next.prompted", {
-      timestamp: Date.now(),
+    const promoted = this.publishCurrentSessionEvent(sessionID, "session.input.promoted", {
       sessionID,
-      messageID: user.id,
-      prompt,
-      delivery,
+      inputID: user.id,
     })
     admission.promotedSeq = promoted.durable.seq
 
     if (input.noReply) {
       this.messages.completeMessage(assistant.id, "stop")
-      this.publishMessage(this.messages.getMessage(assistant.id)!)
+      this.agentService.startAssistantStep(assistant.id)
+      this.agentService.settleAssistantMessage(assistant.id)
       return admission
     }
 
@@ -513,7 +510,8 @@ export class SessionService {
       this.agentService.generateTitle(sessionID, promptSegments.join("\n\n") || text, model)
     }
     this.sessions.setStatus(sessionID, "busy")
-    this.publishStatus(sessionID, "busy")
+    this.agentService.startExecution(sessionID)
+    this.agentService.startAssistantStep(assistant.id)
     const mode = input.subtaskMode === "parallel" ? "parallel" : input.subtaskMode === "chain" ? "chain" : "sequential"
     if (subtasks.length) {
       this.agentService.schedulePromptWithSubtasks(sessionID, text, user.id, assistant.id, subtasks, mode, model)
@@ -615,19 +613,27 @@ export class SessionService {
       throw new SessionServiceError("invalid_request", `Agent not found: ${agent}`)
     }
 
+    const created = Date.now()
+    const shellPrompt = "The following tool was executed by the user"
     const user = this.messages.createUserMessage(sessionID, agent, model, input.messageID)
-    const userTextPart = this.messages.createPart(sessionID, user.id, "text", {
-      text: "The following tool was executed by the user",
-      time: { start: Date.now() },
+    this.messages.createPart(sessionID, user.id, "text", {
+      text: shellPrompt,
+      time: { start: created, end: created },
       synthetic: true,
     })
-    this.publishMessage(user)
-    // Shell mode is fire-and-forget on the client (no optimistic message), so
-    // the user-side text part must be streamed explicitly to render.
-    this.publishPart(userTextPart.id)
+    this.publishCurrentSessionEvent(
+      sessionID,
+      "session.input.admitted",
+      {
+        sessionID,
+        inputID: user.id,
+        input: { type: "user", delivery: "steer", data: { text: shellPrompt } },
+      },
+      { created: user.time.created },
+    )
+    this.publishCurrentSessionEvent(sessionID, "session.input.promoted", { sessionID, inputID: user.id })
 
     const assistant = this.messages.createAssistantMessage(sessionID, user.id, agent, model)
-    this.publishMessage(assistant)
 
     const callID = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`
     const started = Date.now()
@@ -640,7 +646,10 @@ export class SessionService {
         time: { start: started },
       },
     })
-    this.publishPart(toolPart.id)
+    this.sessions.setStatus(sessionID, "busy")
+    this.agentService.startExecution(sessionID)
+    this.agentService.startAssistantStep(assistant.id)
+    this.agentService.projectToolRunning(toolPart.id)
 
     void this.executeShell(assistant.id, toolPart.id, input.command, session.directory, started)
   }
@@ -664,7 +673,7 @@ export class SessionService {
         this.messages.updatePart(toolPartId, {
           state: { ...current.state, output: accumulated, metadata: { output: accumulated } },
         })
-        this.publishPart(toolPartId)
+        this.agentService.projectToolProgress(toolPartId, { output: accumulated })
       },
     })
 
@@ -684,9 +693,17 @@ export class SessionService {
         time: { start: started, end: completed },
       },
     })
-    this.publishPart(toolPartId)
+    this.agentService.projectToolTerminal(toolPartId)
     this.messages.completeMessage(assistantMessageId, failed ? "error" : "stop")
-    this.publishMessage(this.messages.getMessage(assistantMessageId)!)
+    this.agentService.settleAssistantMessage(assistantMessageId)
+    const assistant = this.messages.getMessage(assistantMessageId)
+    const sessionID = current?.sessionID ?? assistant?.sessionID
+    if (sessionID) {
+      if (failed) this.agentService.failExecution(sessionID, result.error ?? "Shell command failed")
+      else this.agentService.succeedExecution(sessionID)
+      this.sessions.setStatus(sessionID, "idle")
+      publishSessionIdleLegacy(this.events, sessionID)
+    }
   }
 
   private enableWideIdsFromMessage(sessionID: string, messageID: string | undefined): void {
@@ -711,77 +728,32 @@ export class SessionService {
     return { info, parts: this.messages.listParts(messageID) }
   }
 
-  private publishMessage(info: MessageWithParts["info"]): void {
-    this.events.publish(createEvent("message.updated", { sessionID: info.sessionID, info }))
-  }
-
-  private publishPart(partId: string): void {
-    const part = this.messages.getPart(partId)
-    if (!part) return
-    this.events.publish(createEvent("message.part.updated", { sessionID: part.sessionID, part, time: Date.now() }))
-  }
-
-  private publishStatus(sessionID: string, status: "busy" | "idle"): void {
-    this.events.publish(createEvent("session.status", { sessionID, status: { type: status } }))
-    if (status === "idle") this.events.publish(createEvent("session.idle", { sessionID }))
-  }
-
-  private appendSessionEvent(sessionID: string, type: string, data: Record<string, unknown>) {
+  private publishCurrentSessionEvent(
+    sessionID: string,
+    type: string,
+    data: Record<string, unknown>,
+    options?: { id?: string; created?: number; metadata?: Record<string, unknown>; version?: number },
+  ) {
     const session = this.sessions.get(sessionID)
-    return this.sessionEvents.append(sessionID, type, data, session ? { directory: session.directory } : undefined)
-  }
-
-  private projectRuntimeEvent(event: OpenCodeEvent): void {
-    const properties = event.properties as {
-      sessionID?: string
-      info?: MessageWithParts["info"]
-      part?: Part
-    }
-    const sessionID = properties.sessionID ?? properties.info?.sessionID ?? properties.part?.sessionID
-    if (!sessionID) return
-    if (event.type === "message.updated" && properties.info?.role === "assistant") {
-      const info = properties.info
-      if (info.time.completed === undefined && !info.error) return
-      const key = `${info.id}:terminal`
-      if (this.projectedTerminalEvents.has(key)) return
-      this.projectedTerminalEvents.add(key)
-      if (info.error) {
-        this.appendSessionEvent(sessionID, "session.next.step.failed", {
-          timestamp: info.time.completed ?? Date.now(),
-          sessionID,
-          assistantMessageID: info.id,
-          error: { type: "unknown", message: info.error.data.message },
-        })
-        return
-      }
-      this.appendSessionEvent(sessionID, "session.next.step.ended", {
-        timestamp: info.time.completed ?? Date.now(),
-        sessionID,
-        assistantMessageID: info.id,
-        finish: info.finish ?? "stop",
-        cost: info.cost,
-        tokens: info.tokens,
-      })
-      return
-    }
-    if (event.type !== "message.part.updated" || !properties.part) return
-    const part = properties.part
-    if (part.type !== "text" && part.type !== "reasoning") return
-    if (part.time?.end === undefined) return
-    const key = `${part.id}:terminal`
-    if (this.projectedTerminalEvents.has(key)) return
-    this.projectedTerminalEvents.add(key)
-    this.appendSessionEvent(
+    const event = this.sessionEvents.append(
       sessionID,
-      part.type === "text" ? "session.next.text.ended" : "session.next.reasoning.ended",
-      {
-        timestamp: part.time.end,
-        sessionID,
-        assistantMessageID: part.messageID,
-        ...(part.type === "text" ? { textID: part.id } : { reasoningID: part.id }),
-        text: part.text,
-      },
+      type,
+      data,
+      session ? { directory: session.directory } : undefined,
+      options,
     )
+    this.events.publish(
+      {
+        id: event.id,
+        created: event.created,
+        type: event.type,
+        metadata: event.metadata,
+        durable: event.durable,
+        properties: event.data,
+      },
+      session?.directory,
+    )
+    return event
   }
 
   private conversationError(error: unknown): SessionServiceError {

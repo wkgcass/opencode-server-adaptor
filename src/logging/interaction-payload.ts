@@ -192,38 +192,6 @@ function compactOpenCodeEvent(event: UnknownRecord): UnknownRecord {
     return { type: event.type }
   }
 
-  if (event.type === "message.part.updated") {
-    const part = record(properties.part)
-    return defined({
-      type: event.type,
-      sessionID: properties.sessionID,
-      part: part ? compactPart(part) : properties.part,
-      time: properties.time,
-    })
-  }
-
-  if (event.type === "message.updated") {
-    const info = record(properties.info)
-    return defined({
-      type: event.type,
-      sessionID: properties.sessionID ?? info?.sessionID,
-      message: info
-        ? defined({
-            id: info.id,
-            role: info.role,
-            parentID: info.parentID,
-            finish: info.finish,
-            error: info.error,
-            time: info.time,
-            modelID: info.modelID,
-            providerID: info.providerID,
-            cost: info.cost,
-            tokens: info.tokens,
-          })
-        : properties.info,
-    })
-  }
-
   return defined({ type: event.type, ...properties })
 }
 
@@ -232,7 +200,14 @@ function compactOpenCodePayload(payload: unknown): unknown {
   if (!event) return payload
   const data = record(event.data)
   if (typeof event.type === "string" && data) {
-    if (event.type === "session.next.text.ended" || event.type === "session.next.reasoning.ended") {
+    if (
+      event.type === "session.text.delta" ||
+      event.type === "session.reasoning.delta" ||
+      event.type === "session.text.ended" ||
+      event.type === "session.reasoning.ended"
+    ) {
+      const field = event.type.endsWith(".delta") ? "delta" : "text"
+      const value = data[field]
       return defined({
         id: event.id,
         type: event.type,
@@ -240,13 +215,14 @@ function compactOpenCodePayload(payload: unknown): unknown {
         location: event.location,
         data: defined({
           ...data,
-          text: undefined,
-          textLength: typeof data.text === "string" ? data.text.length : undefined,
+          [field]: undefined,
+          [`${field}Length`]: typeof value === "string" ? value.length : undefined,
         }),
       })
     }
-    if (event.type === "session.next.prompt.admitted" || event.type === "session.next.prompted") {
-      const prompt = record(data.prompt)
+    if (event.type === "session.input.admitted") {
+      const input = record(data.input)
+      const inputData = record(input?.data)
       return defined({
         id: event.id,
         type: event.type,
@@ -254,14 +230,60 @@ function compactOpenCodePayload(payload: unknown): unknown {
         location: event.location,
         data: defined({
           ...data,
-          prompt: prompt
-            ? defined({
-                textLength: typeof prompt.text === "string" ? prompt.text.length : undefined,
-                fileCount: Array.isArray(prompt.files) ? prompt.files.length : undefined,
-                agentCount: Array.isArray(prompt.agents) ? prompt.agents.length : undefined,
-              })
-            : data.prompt,
+          input:
+            input && inputData
+              ? defined({
+                  ...input,
+                  data: defined({
+                    ...inputData,
+                    text: undefined,
+                    textLength: typeof inputData.text === "string" ? inputData.text.length : undefined,
+                    files: undefined,
+                    fileCount: Array.isArray(inputData.files) ? inputData.files.length : undefined,
+                    agents: undefined,
+                    agentCount: Array.isArray(inputData.agents) ? inputData.agents.length : undefined,
+                  }),
+                })
+              : data.input,
         }),
+      })
+    }
+    if (event.type === "session.tool.progress") {
+      const metadata = record(data.metadata)
+      return defined({
+        id: event.id,
+        type: event.type,
+        durable: event.durable,
+        location: event.location,
+        data: defined({
+          ...data,
+          metadata: metadata
+            ? defined({
+                ...metadata,
+                output: undefined,
+                outputLength: typeof metadata.output === "string" ? metadata.output.length : undefined,
+                partialOutput: undefined,
+                partialOutputLength:
+                  typeof metadata.partialOutput === "string" ? metadata.partialOutput.length : undefined,
+              })
+            : data.metadata,
+        }),
+      })
+    }
+    if (event.type === "session.tool.success" && Array.isArray(data.content)) {
+      return defined({
+        id: event.id,
+        type: event.type,
+        durable: event.durable,
+        location: event.location,
+        data: {
+          ...data,
+          content: data.content.map((item) => {
+            const content = record(item)
+            if (!content || typeof content.text !== "string") return item
+            return defined({ ...content, text: undefined, textLength: content.text.length })
+          }),
+        },
       })
     }
     const compacted = compactOpenCodeEvent({

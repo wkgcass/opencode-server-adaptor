@@ -13,7 +13,7 @@ describe("assistant part projector", () => {
     const sessions = new SessionRepository(db)
     const messages = new MessageRepository(db, sessions)
     const events = new EventBus(logger)
-    const projector = new AssistantPartProjector(messages, events)
+    const projector = new AssistantPartProjector(messages)
 
     try {
       const session = sessions.create({ directory: process.cwd(), agent: "test" })

@@ -84,7 +84,7 @@ describe("OpenCode v2 shell endpoint", () => {
     expect(eventStream.ok).toBe(true)
     const reader = eventStream.body!.getReader()
     const decoder = new TextDecoder()
-    const received: Array<{ type: string; data: Record<string, unknown> }> = []
+    const received: Array<{ type: string; data: Record<string, unknown>; durable?: { version: number } }> = []
     const collect = (async () => {
       let buffer = ""
       while (true) {
@@ -100,7 +100,11 @@ describe("OpenCode v2 shell endpoint", () => {
             ?.slice(6)
           if (!dataLine) continue
           try {
-            const event = JSON.parse(dataLine) as { type: string; data: Record<string, unknown> }
+            const event = JSON.parse(dataLine) as {
+              type: string
+              data: Record<string, unknown>
+              durable?: { version: number }
+            }
             if (event.type !== "server.heartbeat" && event.type !== "server.connected") received.push(event)
           } catch {}
         }
@@ -120,7 +124,12 @@ describe("OpenCode v2 shell endpoint", () => {
       await Bun.sleep(100)
       const messagesResponse = await request(`/api/session/${sessionID}/message?limit=20&order=asc`)
       const messages = (await messagesResponse.json()) as {
-        data: Array<{ id: string; type: string; text?: string; content?: Array<{ type: string; state?: { status: string; output?: string } }> }>
+        data: Array<{
+          id: string
+          type: string
+          text?: string
+          content?: Array<{ type: string; state?: { status: string; output?: string } }>
+        }>
       }
       assistant = messages.data.find((message) => message.type === "assistant")
       const bashPart = assistant?.content?.find((part) => part.type === "tool")
@@ -142,26 +151,29 @@ describe("OpenCode v2 shell endpoint", () => {
     await collect.catch(() => {})
 
     const types = received.map((event) => event.type)
-    expect(types).toContain("message.updated")
-    expect(types).toContain("message.part.updated")
-    // The tool part update must carry the bash tool and completed status.
-    const partUpdate = received.find(
-      (event) =>
-        event.type === "message.part.updated" &&
-        (event.data as { part?: { tool?: string; state?: { status?: string } } }).part?.tool === "bash" &&
-        (event.data as { part?: { state?: { status?: string } } }).part?.state?.status === "completed",
+    expect(types).toEqual(
+      expect.arrayContaining([
+        "session.input.admitted",
+        "session.input.promoted",
+        "session.execution.started",
+        "session.step.started",
+        "session.tool.input.started",
+        "session.tool.called",
+        "session.tool.success",
+        "session.step.ended",
+        "session.execution.succeeded",
+      ]),
     )
-    expect(partUpdate).toBeDefined()
-    // Shell mode sends no optimistic message, so the user-side synthetic text
-    // part must be streamed explicitly to render in the Desktop timeline.
-    const userTextUpdate = received.find(
-      (event) =>
-        event.type === "message.part.updated" &&
-        (event.data as { part?: { type?: string; text?: string; synthetic?: boolean } }).part?.type === "text" &&
-        (event.data as { part?: { text?: string } }).part?.text ===
-          "The following tool was executed by the user",
-    )
-    expect(userTextUpdate).toBeDefined()
+    const success = received.find((event) => event.type === "session.tool.success")
+    expect(success?.durable?.version).toBe(2)
+    expect(success?.data).toMatchObject({
+      content: [{ type: "text", text: expect.stringContaining("shell-test-output") }],
+    })
+    const admitted = received.find((event) => event.type === "session.input.admitted")
+    expect(admitted?.data).toMatchObject({
+      input: { type: "user", data: { text: "The following tool was executed by the user" } },
+    })
+    expect(types.some((type) => type === "message.updated" || type.startsWith("message.part."))).toBe(false)
   })
 
   test("shell rejects empty commands with 400", async () => {

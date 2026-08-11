@@ -47,7 +47,7 @@ describe("OpenCode Desktop event stream compatibility", () => {
 
   test("replays events produced before Desktop reconnects without replaying them twice", () => {
     const events = new EventBus(new Logger())
-    const missed = createEvent("message.updated", { sessionID: "ses_restart" })
+    const missed = createEvent("session.execution.started", { sessionID: "ses_restart" })
     events.publish(missed)
 
     const first: string[] = []
@@ -64,9 +64,10 @@ describe("OpenCode Desktop event stream compatibility", () => {
   test("sends server.connected before events buffered during adaptor restart", async () => {
     const logger = new Logger()
     const events = new EventBus(logger)
-    const missed = createEvent("message.part.updated", {
+    const missed = createEvent("session.text.started", {
       sessionID: "ses_restart",
-      part: { id: "prt_restart" },
+      assistantMessageID: "msg_restart",
+      ordinal: 0,
     })
     events.publish(missed)
 
@@ -108,9 +109,11 @@ describe("OpenCode Desktop event stream compatibility", () => {
     expect(connected).toMatchObject({ type: "server.connected", data: {} })
     expect(connected).not.toHaveProperty("payload")
 
-    const event = createEvent("message.updated", {
+    const event = createEvent("session.step.started", {
       sessionID: "ses_current",
-      info: { id: "msg_current" },
+      assistantMessageID: "msg_current",
+      agent: "build",
+      model: { id: "model", providerID: "provider" },
     })
     events.publish(event)
     const current = JSON.parse(
@@ -122,7 +125,7 @@ describe("OpenCode Desktop event stream compatibility", () => {
     )
     expect(current).toEqual({
       id: event.id,
-      type: "message.updated",
+      type: "session.step.started",
       data: event.properties,
       location: { directory: "/workspace" },
     })
@@ -131,7 +134,7 @@ describe("OpenCode Desktop event stream compatibility", () => {
     events.close()
   })
 
-  test("broadcasts session and message lifecycle events identically to multiple clients", async () => {
+  test("broadcasts session and current message lifecycle events identically to multiple clients", async () => {
     const logger = new Logger({ minLevel: "ERROR" })
     const events = new EventBus(logger, () => "/workspace")
     const app = createEventRoutes({ events, logger })
@@ -145,19 +148,21 @@ describe("OpenCode Desktop event stream compatibility", () => {
 
       const sessionID = "ses_multiple_clients"
       const messageID = "msg_multiple_clients"
-      const partID = "prt_multiple_clients"
       const published = [
         createEvent("session.created", {
           sessionID,
           info: { id: sessionID, directory: "/workspace" },
         }),
-        createEvent("message.updated", {
+        createEvent("session.step.started", {
           sessionID,
-          info: { id: messageID, sessionID, role: "assistant" },
+          assistantMessageID: messageID,
+          agent: "build",
+          model: { id: "model", providerID: "provider" },
         }),
-        createEvent("message.part.updated", {
+        createEvent("session.text.started", {
           sessionID,
-          part: { id: partID, messageID, sessionID, type: "text", text: "shared" },
+          assistantMessageID: messageID,
+          ordinal: 0,
         }),
         createEvent("session.deleted", {
           sessionID,

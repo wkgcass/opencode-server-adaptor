@@ -48,7 +48,26 @@ describe("agent backend abstractions", () => {
       maxConcurrentSubtasksPerParent: 2,
       subtaskTimeoutMs: 5_000,
     }
-    const manager = new SubtaskManager(registry, sessions, messages, events, logger, config)
+    const projectedParts = new Map<string, string>()
+    const manager = new SubtaskManager(registry, sessions, messages, events, logger, config, undefined, {
+      childStarted: () => {},
+      runtimeEvent: (event, childSessionId, assistantMessageId) => {
+        if (event.type === "text_started") {
+          const part = messages.createPart(childSessionId, assistantMessageId, "text", {
+            text: "",
+            time: { start: Date.now() },
+          })
+          projectedParts.set(event.partId, part.id)
+        }
+        if (event.type === "text_ended") {
+          const partId = projectedParts.get(event.partId)
+          if (partId) messages.updatePart(partId, { text: event.text, time: { start: Date.now(), end: Date.now() } })
+        }
+      },
+      parentToolProgress: () => {},
+      parentToolOutput: () => {},
+      childSettled: () => {},
+    })
 
     const parent = sessions.create({ directory, agent: "native-test" })
     sessions.enableWideIds(parent.id)
@@ -85,8 +104,7 @@ describe("agent backend abstractions", () => {
       messages
         .listMessages(handle.childSessionId)
         .every(
-          (message) =>
-            message.info.id.startsWith("msg-") && message.parts.every((part) => part.id.startsWith("prt-")),
+          (message) => message.info.id.startsWith("msg-") && message.parts.every((part) => part.id.startsWith("prt-")),
         ),
     ).toBe(true)
     expect(childAssistant?.parts).toEqual(

@@ -107,25 +107,22 @@ describe("OpenCode v2 subagent event ordering", () => {
         childID = event.data.info.id
       }
       if (childID && event.data.sessionID === childID) {
-        if (event.type === "message.updated" && event.data.info?.role === "assistant") {
-          childAssistantID = event.data.info.id
-        }
-        const part = event.data.part
-        if (
-          event.type === "message.part.updated" &&
-          part?.messageID === childAssistantID &&
-          !seenPartIDs.has(part.id)
-        ) {
-          seenPartIDs.add(part.id)
-          firstPartTypes.push(part.type)
+        if (event.type === "session.step.started") childAssistantID = event.data.assistantMessageID
+        const partType =
+          event.type === "session.reasoning.started"
+            ? "reasoning"
+            : event.type === "session.tool.input.started"
+              ? "tool"
+              : event.type === "session.text.started"
+                ? "text"
+                : undefined
+        const partID = partType === "tool" ? event.data.callID : `${partType}:${event.data.ordinal}`
+        if (partType && event.data.assistantMessageID === childAssistantID && !seenPartIDs.has(partID)) {
+          seenPartIDs.add(partID)
+          firstPartTypes.push(partType)
         }
       }
-      if (
-        event.type === "message.updated" &&
-        event.data.info?.sessionID === parentID &&
-        event.data.info?.role === "assistant" &&
-        event.data.info?.time?.completed !== undefined
-      ) {
+      if (event.type === "session.execution.succeeded" && event.data.sessionID === parentID) {
         break
       }
     }

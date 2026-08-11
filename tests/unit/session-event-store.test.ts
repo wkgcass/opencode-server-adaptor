@@ -30,20 +30,23 @@ describe("SessionEventStore", () => {
 
     const first = store.append(
       session.id,
-      "session.next.prompt.admitted",
-      { timestamp: 1, sessionID: session.id, messageID: "msg_1", prompt: { text: "one" }, delivery: "steer" },
+      "session.input.admitted",
+      { sessionID: session.id, inputID: "msg_1", input: { type: "user", data: { text: "one" } } },
       { directory },
     )
     const second = store.append(
       session.id,
-      "session.next.prompted",
-      { timestamp: 2, sessionID: session.id, messageID: "msg_1", prompt: { text: "one" }, delivery: "steer" },
+      "session.tool.success",
+      { sessionID: session.id, assistantMessageID: "msg_2", callID: "call_1", content: [] },
       { directory },
+      { version: 2 },
     )
     unsubscribe()
 
     expect(first.durable.seq).toBe(1)
     expect(second.durable.seq).toBe(2)
+    expect(first.durable.version).toBe(1)
+    expect(second.durable.version).toBe(2)
     expect(live).toEqual([first.id, second.id])
     expect(store.list(session.id, 0, 1)).toEqual({ events: [first], hasMore: true })
     db.close()

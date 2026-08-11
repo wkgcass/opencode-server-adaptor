@@ -203,7 +203,11 @@ describe("verbose interaction payload design", () => {
                 partial: {
                   role: "assistant",
                   content: [
-                    { type: "thinking", thinking: "The user wants me to write two files.", thinkingSignature: "reasoning_content" },
+                    {
+                      type: "thinking",
+                      thinking: "The user wants me to write two files.",
+                      thinkingSignature: "reasoning_content",
+                    },
                     { type: "text", text: "已成功执行两条命令。" },
                   ],
                   provider: "pi-cmss",
@@ -254,132 +258,94 @@ describe("verbose interaction payload design", () => {
     expect(result).toEqual({ type: "agent_end", willRetry: false, messageCount: 2 })
   })
 
-  test("OpenCode text part snapshots keep identity and length, not accumulated text", () => {
+  test("OpenCode current text events keep identity and length, not accumulated text", () => {
     const result = optimizeInteractionPayload(
       "opencode",
       { kind: "SSE message", path: "/api/event" },
       {
         id: "evt_1",
-        type: "message.part.updated",
+        type: "session.text.ended",
         data: {
           sessionID: "ses_1",
-          part: {
-            id: "prt_1",
-            messageID: "msg_1",
-            sessionID: "ses_1",
-            type: "text",
-            text: "the entire accumulated answer",
-            time: { start: 1 },
-          },
-          time: 2,
+          assistantMessageID: "msg_1",
+          ordinal: 0,
+          text: "the entire accumulated answer",
         },
       },
     )
     expect(result).toEqual({
       id: "evt_1",
-      type: "message.part.updated",
+      type: "session.text.ended",
       data: {
         sessionID: "ses_1",
-        part: {
-          id: "prt_1",
-          messageID: "msg_1",
-          sessionID: "ses_1",
-          type: "text",
-          textLength: 29,
-          time: { start: 1 },
-        },
-        time: 2,
+        assistantMessageID: "msg_1",
+        ordinal: 0,
+        textLength: 29,
       },
     })
     expect(JSON.stringify(result)).not.toContain("accumulated answer")
   })
 
-  test("OpenCode tool snapshots log input once and summarize growing output", () => {
+  test("OpenCode current tool events log input once and summarize growing output", () => {
     const pending = optimizeInteractionPayload(
       "opencode",
       { kind: "SSE message", path: "/api/event" },
       {
         id: "evt_pending",
-        type: "message.part.updated",
+        type: "session.tool.called",
         data: {
           sessionID: "ses_1",
-          part: {
-            id: "prt_tool",
-            messageID: "msg_1",
-            sessionID: "ses_1",
-            type: "tool",
-            callID: "call_1",
-            tool: "bash",
-            state: { status: "pending", input: { command: "ls ~" } },
-          },
+          assistantMessageID: "msg_1",
+          callID: "call_1",
+          input: { command: "ls ~" },
+          executed: true,
         },
       },
-    ) as { data: { part: { input?: unknown } } }
-    expect(pending.data.part.input).toEqual({ command: "ls ~" })
+    ) as { data: { input?: unknown } }
+    expect(pending.data.input).toEqual({ command: "ls ~" })
 
     const running = optimizeInteractionPayload(
       "opencode",
       { kind: "SSE message", path: "/api/event" },
       {
         id: "evt_running",
-        type: "message.part.updated",
+        type: "session.tool.progress",
         data: {
           sessionID: "ses_1",
-          part: {
-            id: "prt_tool",
-            messageID: "msg_1",
-            sessionID: "ses_1",
-            type: "tool",
-            callID: "call_1",
-            tool: "bash",
-            state: {
-              status: "running",
-              input: { command: "ls ~" },
-              metadata: { partialOutput: "growing output", lineCount: 2 },
-            },
-          },
+          assistantMessageID: "msg_1",
+          callID: "call_1",
+          metadata: { partialOutput: "growing output", lineCount: 2 },
         },
       },
-    ) as { data: { part: { input?: unknown; partialOutputLength?: number; metadata?: unknown } } }
-    expect(running.data.part.input).toBeUndefined()
-    expect(running.data.part.partialOutputLength).toBe(14)
-    expect(running.data.part.metadata).toEqual({ lineCount: 2 })
+    ) as { data: { metadata?: { partialOutputLength?: number; lineCount?: number } } }
+    expect(running.data.metadata).toEqual({ partialOutputLength: 14, lineCount: 2 })
   })
 
-  test("OpenCode message.updated keeps lifecycle and usage fields only", () => {
+  test("OpenCode current step terminal keeps lifecycle and usage fields", () => {
     const result = optimizeInteractionPayload(
       "opencode",
       { kind: "SSE message", path: "/api/event" },
       {
         id: "evt_message",
-        type: "message.updated",
+        type: "session.step.ended",
         data: {
           sessionID: "ses_1",
-          info: {
-            id: "msg_1",
-            sessionID: "ses_1",
-            role: "assistant",
-            finish: "stop",
-            time: { created: 1, completed: 2 },
-            tokens: { input: 4, output: 2 },
-            summary: { title: "large repeated summary" },
-            path: { cwd: "/tmp/repeated" },
-          },
+          assistantMessageID: "msg_1",
+          finish: "stop",
+          cost: 0,
+          tokens: { input: 4, output: 2 },
         },
       },
     )
     expect(result).toEqual({
       id: "evt_message",
-      type: "message.updated",
+      type: "session.step.ended",
       data: {
         sessionID: "ses_1",
-        message: {
-          id: "msg_1",
-          role: "assistant",
-          finish: "stop",
-          time: { created: 1, completed: 2 },
-          tokens: { input: 4, output: 2 },
-        },
+        assistantMessageID: "msg_1",
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 4, output: 2 },
       },
     })
   })
@@ -516,24 +482,24 @@ describe("verbose interaction payload design", () => {
       { kind: "SSE message", path: "/api/session/ses_1/event" },
       {
         id: "evt_1",
-        type: "session.next.text.ended",
+        type: "session.text.ended",
         durable: { aggregateID: "ses_1", seq: 3, version: 1 },
         data: {
           sessionID: "ses_1",
           assistantMessageID: "msg_assistant",
-          textID: "text_1",
+          ordinal: 0,
           text: "complete durable response",
         },
       },
     )
     expect(event).toEqual({
       id: "evt_1",
-      type: "session.next.text.ended",
+      type: "session.text.ended",
       durable: { aggregateID: "ses_1", seq: 3, version: 1 },
       data: {
         sessionID: "ses_1",
         assistantMessageID: "msg_assistant",
-        textID: "text_1",
+        ordinal: 0,
         textLength: 25,
       },
     })

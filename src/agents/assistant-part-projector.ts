@@ -1,5 +1,3 @@
-import type { EventBus } from "../event/index.ts"
-import { createEvent } from "../event/index.ts"
 import type { AssistantMessage, MessageRepository, Part } from "../message/index.ts"
 
 interface MessageGroup {
@@ -30,7 +28,6 @@ export class AssistantPartProjector {
 
   constructor(
     private readonly messages: MessageRepository,
-    private readonly events: EventBus,
     options?: AssistantPartProjectorOptions,
   ) {
     this.encapsulateParts = options?.encapsulateParts ?? false
@@ -63,7 +60,6 @@ export class AssistantPartProjector {
       )
       group.messageIds.push(sibling.id)
       this.rootByMessage.set(sibling.id, group.rootMessageId)
-      this.publishMessage(sibling)
       targetMessageId = sibling.id
     }
 
@@ -156,14 +152,5 @@ export class AssistantPartProjector {
       throw new Error(`Assistant message not found: ${messageId}`)
     }
     return message
-  }
-
-  private publishMessage(message: AssistantMessage): void {
-    this.events.publish(
-      createEvent("message.updated", {
-        sessionID: message.sessionID,
-        info: message,
-      }),
-    )
   }
 }

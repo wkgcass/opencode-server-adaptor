@@ -363,7 +363,20 @@ describe("OpenCode v2 protocol", () => {
       data: Array<{ type: string; durable: { seq: number } }>
       hasMore: boolean
     }
-    expect(historyBody.data.some((event) => event.type === "session.next.prompt.admitted")).toBe(true)
+    expect(historyBody.data.some((event) => event.type === "session.input.admitted")).toBe(true)
+    expect(historyBody.data.some((event) => event.type === "session.text.started")).toBe(true)
+    expect(historyBody.data.some((event) => event.type === "session.text.ended")).toBe(true)
+    expect(historyBody.data.some((event) => event.type === "session.step.ended")).toBe(true)
+    expect(historyBody.data.some((event) => event.type === "session.execution.succeeded")).toBe(true)
+    expect(historyBody.data.some((event) => event.type === "session.text.delta")).toBe(false)
+    expect(
+      historyBody.data.some(
+        (event) =>
+          event.type === "message.updated" ||
+          event.type === "message.part.updated" ||
+          event.type === "message.part.delta",
+      ),
+    ).toBe(false)
     expect(
       historyBody.data.every(
         (event, index, events) => index === 0 || event.durable.seq > events[index - 1]!.durable.seq,
@@ -379,7 +392,7 @@ describe("OpenCode v2 protocol", () => {
     const reader = stream.body!.getReader()
     const first = await reader.read()
     await reader.cancel()
-    expect(new TextDecoder().decode(first.value)).toContain("session.next.prompt.admitted")
+    expect(new TextDecoder().decode(first.value)).toContain("session.input.admitted")
 
     expect((await request(`/api/session/${sessionID}/compact`, { method: "POST" })).status).toBe(400)
     expect(

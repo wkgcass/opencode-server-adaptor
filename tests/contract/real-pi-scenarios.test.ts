@@ -982,10 +982,7 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     })
     const partDeltas = wireEvents.filter(
       (event) =>
-        event.type === "message.part.delta" &&
-        event.data?.sessionID === sid &&
-        event.data?.field === "text" &&
-        typeof event.data?.delta === "string",
+        event.type === "session.text.delta" && event.data?.sessionID === sid && typeof event.data?.delta === "string",
     )
     console.log("  Live part deltas:", partDeltas.length)
 

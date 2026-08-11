@@ -57,10 +57,7 @@ async function runProcess(
         /* ignore */
       }
     }, timeoutMs)
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ])
+    const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
     const code = await proc.exited
     clearTimeout(timeout)
     return { stdout, stderr, code }
@@ -83,7 +80,7 @@ async function checkIgnored(directory: string, names: string[]): Promise<Set<str
   return ignored
 }
 
-export function createV1CompatibleRoutes(options: {
+export function createV1CompatibleLegacyRoutes(options: {
   config: AppConfig
   providerConfig: ProviderConfigStore
   sessionService: SessionService
@@ -231,12 +228,7 @@ export function createV1CompatibleRoutes(options: {
     if (!query) return c.json({ error: "Query parameter 'query' is required" }, 400)
     const typeParam = c.req.query("type")
     const dirs = c.req.query("dirs")
-    const type =
-      typeParam === "file" || typeParam === "directory"
-        ? typeParam
-        : dirs === "false"
-          ? "file"
-          : undefined
+    const type = typeParam === "file" || typeParam === "directory" ? typeParam : dirs === "false" ? "file" : undefined
     const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "10", 10) || 10, 1), 200)
     const results: string[] = []
     const walk = (directory: string, depth: number) => {

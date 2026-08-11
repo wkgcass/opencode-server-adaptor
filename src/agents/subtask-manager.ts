@@ -6,7 +6,7 @@ import { createEvent } from "../event/index.ts"
 import type { AppConfig } from "../config/index.ts"
 import type { AgentAdapterRegistry } from "./registry.ts"
 import type { SubagentRunner, SubagentUsage } from "./subagent-adapter.ts"
-import { SubagentEventBridge } from "./subagents/subagent-event-bridge.ts"
+import type { AgentRuntimeEvent } from "./agent-adapter.ts"
 import { subagentSessionTitle } from "./subagents/subagent-session.ts"
 import { AssistantPartProjector } from "./assistant-part-projector.ts"
 
@@ -45,6 +45,20 @@ interface RunningSubtask {
   runner: SubagentRunner
 }
 
+export interface SubtaskProjection {
+  childStarted(sessionId: string, userMessageId: string, prompt: string, assistantMessageId: string): void
+  runtimeEvent(event: AgentRuntimeEvent, sessionId: string, assistantMessageId: string): void
+  parentToolProgress(partId: string, metadata: Record<string, unknown>): void
+  parentToolOutput(partId: string, delta: string): void
+  childSettled(
+    sessionId: string,
+    messageIds: string[],
+    terminalMessageId: string,
+    status: "completed" | "failed" | "aborted",
+    error?: string,
+  ): void
+}
+
 export class SubtaskManager {
   private readonly registry: AgentAdapterRegistry
   private readonly sessions: SessionRepository
@@ -53,6 +67,7 @@ export class SubtaskManager {
   private readonly logger: Logger
   private readonly config: AppConfig
   private readonly assistantParts: AssistantPartProjector
+  private readonly projection: SubtaskProjection
   private readonly running = new Map<string, RunningSubtask>()
 
   constructor(
@@ -62,7 +77,8 @@ export class SubtaskManager {
     events: EventBus,
     logger: Logger,
     config: AppConfig,
-    assistantParts?: AssistantPartProjector,
+    assistantParts: AssistantPartProjector | undefined,
+    projection: SubtaskProjection,
   ) {
     this.registry = registry
     this.sessions = sessions
@@ -70,7 +86,8 @@ export class SubtaskManager {
     this.events = events
     this.logger = logger
     this.config = config
-    this.assistantParts = assistantParts ?? new AssistantPartProjector(messages, events)
+    this.assistantParts = assistantParts ?? new AssistantPartProjector(messages)
+    this.projection = projection
   }
 
   getGlobalRunningCount(): number {
@@ -83,41 +100,6 @@ export class SubtaskManager {
       if (sub.parentSessionId === parentSessionId) count++
     }
     return count
-  }
-
-  private publishMessage(messageId: string): void {
-    const info = this.messages.getMessage(messageId)
-    if (!info) return
-    this.events.publish(
-      createEvent("message.updated", {
-        sessionID: info.sessionID,
-        info,
-      }),
-    )
-  }
-
-  private publishMessageParts(messageId: string): void {
-    for (const part of this.messages.listParts(messageId)) {
-      this.events.publish(
-        createEvent("message.part.updated", {
-          sessionID: part.sessionID,
-          part,
-          time: Date.now(),
-        }),
-      )
-    }
-  }
-
-  private publishChildStatus(sessionId: string, status: "busy" | "idle"): void {
-    this.events.publish(
-      createEvent("session.status", {
-        sessionID: sessionId,
-        status: { type: status },
-      }),
-    )
-    if (status === "idle") {
-      this.events.publish(createEvent("session.idle", { sessionID: sessionId }))
-    }
   }
 
   start(input: StartSubtaskInput): SubtaskHandle {
@@ -178,14 +160,8 @@ export class SubtaskManager {
           },
         },
       })
-      if (linkedPart) {
-        this.events.publish(
-          createEvent("message.part.updated", {
-            sessionID: parentSessionId,
-            part: linkedPart,
-            time: Date.now(),
-          }),
-        )
+      if (linkedPart?.type === "tool") {
+        this.projection.parentToolProgress(linkedPart.id, linkedPart.state.metadata ?? {})
       }
     }
 
@@ -230,7 +206,7 @@ export class SubtaskManager {
     runner: SubagentRunner,
     signal: AbortSignal,
   ): Promise<SubtaskResult> {
-    const { parentSessionId, parentToolPartId, parentAssistantMessageId } = input
+    const { parentSessionId, parentToolPartId } = input
 
     this.logger.info("Subtask started", {
       parentSessionId,
@@ -245,34 +221,18 @@ export class SubtaskManager {
         info: this.sessions.get(childSessionId),
       }),
     )
-    this.publishChildStatus(childSessionId, "busy")
-
     const childUserMsg = this.messages.createUserMessage(childSessionId, input.agent, input.model)
     this.messages.createPart(childSessionId, childUserMsg.id, "text", {
       text: input.prompt,
       time: { start: Date.now() },
     })
-    this.events.publish(
-      createEvent("message.updated", {
-        sessionID: childSessionId,
-        info: childUserMsg,
-      }),
-    )
-
     const childAssistantMsg = this.messages.createAssistantMessage(
       childSessionId,
       childUserMsg.id,
       input.agent,
       input.model,
     )
-    this.events.publish(
-      createEvent("message.updated", {
-        sessionID: childSessionId,
-        info: childAssistantMsg,
-      }),
-    )
-
-    const bridge = new SubagentEventBridge()
+    this.projection.childStarted(childSessionId, childUserMsg.id, input.prompt, childAssistantMsg.id)
 
     try {
       const result = await runner.run(
@@ -289,23 +249,9 @@ export class SubtaskManager {
         {
           onUpdate: (update) => {
             if (update.type === "event") {
-              bridge.handle(update.event, {
-                sessionId: childSessionId,
-                assistantMessageId: childAssistantMsg.id,
-                messages: this.messages,
-                events: this.events,
-                assistantParts: this.assistantParts,
-              })
+              this.projection.runtimeEvent(update.event, childSessionId, childAssistantMsg.id)
             } else if (update.type === "output_delta") {
-              this.events.publish(
-                createEvent("message.part.delta", {
-                  sessionID: parentSessionId,
-                  messageID: parentAssistantMessageId,
-                  partID: parentToolPartId,
-                  field: "state.output",
-                  delta: update.delta,
-                }),
-              )
+              this.projection.parentToolOutput(parentToolPartId, update.delta)
             }
           },
         },
@@ -314,8 +260,7 @@ export class SubtaskManager {
       if (result.status === "aborted") {
         this.sessions.setStatus(childSessionId, "aborted")
         const completed = this.assistantParts.complete(childAssistantMsg.id, "aborted", this.usage(result.usage))
-        this.publishProjectedMessages(completed.messageIds)
-        this.publishChildStatus(childSessionId, "idle")
+        this.projection.childSettled(childSessionId, completed.messageIds, completed.terminalMessageId, "aborted")
         this.assistantParts.releaseSession(childSessionId)
 
         const output = result.output
@@ -337,8 +282,7 @@ export class SubtaskManager {
           type: "subagent_error",
           message: errorMsg,
         })
-        this.publishProjectedMessages(failed.messageIds)
-        this.publishChildStatus(childSessionId, "idle")
+        this.projection.childSettled(childSessionId, failed.messageIds, failed.terminalMessageId, "failed", errorMsg)
         this.assistantParts.releaseSession(childSessionId)
 
         const output = result.output || errorMsg
@@ -355,8 +299,7 @@ export class SubtaskManager {
 
       this.sessions.setStatus(childSessionId, "idle")
       const completed = this.assistantParts.complete(childAssistantMsg.id, "stop", this.usage(result.usage))
-      this.publishProjectedMessages(completed.messageIds)
-      this.publishChildStatus(childSessionId, "idle")
+      this.projection.childSettled(childSessionId, completed.messageIds, completed.terminalMessageId, "completed")
       this.assistantParts.releaseSession(childSessionId)
 
       const output = result.output || "(Subtask completed with no text output)"
@@ -392,8 +335,13 @@ export class SubtaskManager {
         type: err instanceof Error ? err.name : "Error",
         message: err instanceof Error ? err.message : String(err),
       })
-      this.publishProjectedMessages(failed.messageIds)
-      this.publishChildStatus(childSessionId, "idle")
+      this.projection.childSettled(
+        childSessionId,
+        failed.messageIds,
+        failed.terminalMessageId,
+        isAborted ? "aborted" : "failed",
+        err instanceof Error ? err.message : String(err),
+      )
       this.assistantParts.releaseSession(childSessionId)
 
       this.running.delete(childSessionId)
@@ -435,13 +383,6 @@ export class SubtaskManager {
       cacheRead: usage.cacheRead,
       cacheWrite: usage.cacheWrite,
       total: usage.contextTokens,
-    }
-  }
-
-  private publishProjectedMessages(messageIds: string[]): void {
-    for (const messageId of messageIds) {
-      this.publishMessageParts(messageId)
-      this.publishMessage(messageId)
     }
   }
 

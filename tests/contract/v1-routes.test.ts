@@ -10,7 +10,7 @@ const CLI_PATH = join(import.meta.dir, "..", "..", "src", "cli.ts")
 
 /**
  * Behavioural coverage for the slimmed-down v1 API surface
- * (src/api/routes/v1.ts). The server is started with --api-version=v1 so only
+ * (src/api/routes/v1-legacy.ts). The server is started with --api-version=v1 so only
  * v1 routes are mounted. v1 is a configuration + read-only inspection layer:
  * health, auth, provider/model CRUD, project list, session list/content, agent
  * list, provider+model list.

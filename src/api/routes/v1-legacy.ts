@@ -26,7 +26,7 @@ import { projectIDForDirectory } from "../../project/index.ts"
  *   - Provider API key        — PUT/DELETE /auth/:id
  *   - Project list            — GET /project
  *
- * Shared routes (v1-compatible.ts, mounted in both v1 and v2 mode):
+ * Shared routes (v1-compatible-legacy.ts, mounted in both v1 and v2 mode):
  *   - DELETE /session/:id  — session deletion (v2 uses DELETE /api/session/:id)
  *   - GET /config          — legacy config object (v2 has no equivalent)
  *   - GET /file, /file/content, /find/file — legacy filesystem routes driven by
@@ -36,7 +36,7 @@ import { projectIDForDirectory } from "../../project/index.ts"
  *     File/Find methods (file.status, find.text, find.symbols) are unused by
  *     the desktop and intentionally not mounted.
  */
-export function createV1Routes(options: {
+export function createV1LegacyRoutes(options: {
   sessionService: SessionService
   registry: AgentAdapterRegistry
   config: AppConfig

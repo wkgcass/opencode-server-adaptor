@@ -35,7 +35,7 @@ export class SessionEventStore {
     type: string,
     data: Record<string, unknown>,
     location?: { directory: string },
-    options?: { id?: string; created?: number; metadata?: Record<string, unknown> },
+    options?: { id?: string; created?: number; metadata?: Record<string, unknown>; version?: number },
   ): SessionDurableEvent {
     const event = this.db.transaction(() => {
       const row = this.db
@@ -43,7 +43,7 @@ export class SessionEventStore {
         .get(sessionID) as { seq: number }
       const id = options?.id ?? createEventId(undefined, this.idFormats?.getIdFormat(sessionID) ?? "legacy")
       const created = options?.created ?? Date.now()
-      const durable = { aggregateID: sessionID, seq: row.seq, version: 1 }
+      const durable = { aggregateID: sessionID, seq: row.seq, version: options?.version ?? 1 }
       const stored = { durable, location, data, metadata: options?.metadata }
       this.db
         .prepare("INSERT INTO session_events (session_id, seq, id, type, data, created_at) VALUES (?, ?, ?, ?, ?, ?)")

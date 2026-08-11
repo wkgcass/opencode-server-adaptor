@@ -723,15 +723,14 @@ describe("Fake Pi Integration", () => {
           sawTerminalError = true
         }
         return (
-          event.payload?.type === "session.status" &&
+          event.payload?.type === "session.retry.scheduled" &&
           event.payload?.properties?.sessionID === session.id &&
-          event.payload?.properties?.status?.type === "retry"
+          event.payload?.properties?.attempt === 1
         )
       })
-      expect(retryEvent.payload.properties.status).toMatchObject({
-        type: "retry",
+      expect(retryEvent.payload.properties).toMatchObject({
         attempt: 1,
-        message: "HTTP 500: temporary provider failure",
+        error: { message: "HTTP 500: temporary provider failure" },
       })
 
       const liveTextEvent = await waitForSseEvent(reader, (event) => {
@@ -739,16 +738,15 @@ describe("Fake Pi Integration", () => {
           sawTerminalError = true
         }
         return (
-          event.payload?.type === "message.part.updated" &&
+          event.payload?.type === "session.text.ended" &&
           event.payload?.properties?.sessionID === session.id &&
-          event.payload?.properties?.part?.type === "text" &&
-          event.payload?.properties?.part?.text?.includes("Pi agent simulation is working correctly")
+          event.payload?.properties?.text?.includes("Pi agent simulation is working correctly")
         )
       })
 
       expect(sawTerminalError).toBe(false)
       expect(liveTextEvent.directory).toBe(directory)
-      expect(liveTextEvent.payload.properties.part.text).toContain("recover visibly __retry_once__")
+      expect(liveTextEvent.payload.properties.text).toContain("recover visibly __retry_once__")
 
       const messageRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },
@@ -807,18 +805,14 @@ describe("Fake Pi Integration", () => {
         (event) => {
           const payload = event.payload
           if (
-            payload?.type === "message.part.delta" &&
+            payload?.type === "session.text.delta" &&
             payload.properties?.sessionID === session.id &&
-            payload.properties?.field === "text"
+            typeof payload.properties?.delta === "string"
           ) {
             streamed += payload.properties.delta
             deltaCount++
           }
-          return (
-            payload?.type === "session.status" &&
-            payload.properties?.sessionID === session.id &&
-            payload.properties?.status?.type === "idle"
-          )
+          return payload?.type === "session.execution.succeeded" && payload.properties?.sessionID === session.id
         },
         10_000,
       )
@@ -867,40 +861,32 @@ describe("Fake Pi Integration", () => {
       })
 
       const expected = "Let me analyze this request carefully."
-      let reasoningPartId: string | undefined
       let streamed = ""
       let deltaCount = 0
+      const lifecycle: string[] = []
       await waitForSseEvent(
         reader,
         (event) => {
           const payload = event.payload
           if (
-            payload?.type === "message.part.updated" &&
-            payload.properties?.sessionID === session.id &&
-            payload.properties?.part?.type === "reasoning"
+            payload?.properties?.sessionID === session.id &&
+            (payload.type === "session.reasoning.ended" || payload.type === "session.text.started")
           ) {
-            reasoningPartId = payload.properties.part.id
+            lifecycle.push(payload.type)
           }
-          if (
-            payload?.type === "message.part.delta" &&
-            payload.properties?.sessionID === session.id &&
-            payload.properties?.partID === reasoningPartId
-          ) {
+          if (payload?.type === "session.reasoning.delta" && payload.properties?.sessionID === session.id) {
             streamed += payload.properties.delta
             deltaCount++
           }
-          return (
-            payload?.type === "session.status" &&
-            payload.properties?.sessionID === session.id &&
-            payload.properties?.status?.type === "idle"
-          )
+          return payload?.type === "session.execution.succeeded" && payload.properties?.sessionID === session.id
         },
         10_000,
       )
 
-      expect(reasoningPartId).toBeString()
       expect(deltaCount).toBe(expected.split(" ").length)
       expect(streamed).toBe(`${expected} `)
+      expect(lifecycle.indexOf("session.reasoning.ended")).toBeGreaterThanOrEqual(0)
+      expect(lifecycle.indexOf("session.text.started")).toBeGreaterThan(lifecycle.indexOf("session.reasoning.ended"))
 
       const messageRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },
@@ -1072,41 +1058,41 @@ describe("Fake Pi Integration", () => {
         body: JSON.stringify({ parts: [{ type: "text", text: "run a bash tool" }] }),
       })
 
-      const toolParts: Array<{ status?: string; output?: string; metadataOutput?: string }> = []
+      const toolProgress: Array<{ output?: string; partialOutput?: string }> = []
+      let terminalOutput = ""
+      const lifecycle: string[] = []
       await waitForSseEvent(
         reader,
         (event) => {
           const payload = event.payload
           if (
-            payload?.type === "message.part.updated" &&
-            payload.properties?.sessionID === session.id &&
-            payload.properties?.part?.type === "tool"
+            payload?.properties?.sessionID === session.id &&
+            (payload.type === "session.tool.success" ||
+              payload.type === "session.step.ended" ||
+              payload.type === "session.execution.succeeded")
           ) {
-            const state = payload.properties.part.state ?? {}
-            toolParts.push({
-              status: state.status,
-              output: state.output,
-              metadataOutput: state.metadata?.output,
-            })
+            lifecycle.push(payload.type)
           }
-          return (
-            payload?.type === "session.status" &&
+          if (
+            payload?.type === "session.tool.progress" &&
             payload.properties?.sessionID === session.id &&
-            payload.properties?.status?.type === "idle"
-          )
+            payload.properties?.metadata
+          ) {
+            toolProgress.push(payload.properties.metadata)
+          }
+          if (payload?.type === "session.tool.success" && payload.properties?.sessionID === session.id) {
+            terminalOutput =
+              payload.properties.content?.find?.((content: { type?: string }) => content.type === "text")?.text ?? ""
+          }
+          return payload?.type === "session.execution.succeeded" && payload.properties?.sessionID === session.id
         },
         10_000,
       )
 
-      // The running tool part must carry the partial output on BOTH state.output
-      // (read by the Desktop shell renderer via props.output on the live event
-      // path) AND state.metadata.output (read via props.metadata.output after a
-      // v2 REST reload, and by the ACP shellOutputSnapshot). This matches how
-      // the canonical opencode ShellTool streams via ctx.metadata({ output }).
-      expect(toolParts.some((part) => part.status === "running" && part.output === "hel")).toBe(true)
-      expect(toolParts.some((part) => part.status === "running" && part.metadataOutput === "hel")).toBe(true)
-      // The final completed part carries the full output ("hello").
-      expect(toolParts.some((part) => part.status === "completed" && part.output === "hello")).toBe(true)
+      expect(toolProgress.some((progress) => progress.output === "hel")).toBe(true)
+      expect(toolProgress.some((progress) => progress.partialOutput === "hel")).toBe(true)
+      expect(terminalOutput).toBe("hello")
+      expect(lifecycle).toEqual(["session.tool.success", "session.step.ended", "session.execution.succeeded"])
 
       // The v2 REST message projection must also carry tool metadata inside
       // `state.metadata` (not only at the top level) so the Desktop's v2
@@ -1170,21 +1156,27 @@ describe("Fake Pi Integration", () => {
       input?: Record<string, unknown>
       sessionId?: unknown
     }> = []
+    const toolInputs = new Map<string, Record<string, unknown>>()
     await waitForSseEvent(
       eventReader,
       (event) => {
         const payload = event.payload
         if (
-          payload?.type === "message.part.updated" &&
+          payload?.type === "session.tool.called" &&
           payload.properties?.sessionID === parent.id &&
-          payload.properties?.part?.type === "tool" &&
-          payload.properties?.part?.tool === "task" &&
-          typeof payload.properties?.part?.state?.metadata?.sessionId === "string"
+          typeof payload.properties?.callID === "string"
+        ) {
+          toolInputs.set(payload.properties.callID, payload.properties.input ?? {})
+        }
+        if (
+          payload?.type === "session.tool.progress" &&
+          payload.properties?.sessionID === parent.id &&
+          typeof payload.properties?.metadata?.sessionId === "string"
         ) {
           taskLinkOrder.push({
             kind: "linked-task",
-            input: payload.properties.part.state.input,
-            sessionId: payload.properties.part.state.metadata.sessionId,
+            input: toolInputs.get(payload.properties.callID),
+            sessionId: payload.properties.metadata.sessionId,
           })
         }
         if (payload?.type === "session.created" && payload.properties?.info?.parentID === parent.id) {
@@ -1338,15 +1330,13 @@ describe("Fake Pi Integration", () => {
       const event = await waitForSseEvent(
         reader,
         (item) =>
-          item.payload?.type === "message.part.updated" &&
+          item.payload?.type === "session.tool.success" &&
           item.payload?.properties?.sessionID === session.id &&
-          item.payload?.properties?.part?.type === "tool" &&
-          item.payload?.properties?.part?.state?.status === "completed",
+          item.payload?.properties?.content?.some?.((part: { text?: string }) => part.text === "hello"),
       )
       expect(event.directory).toBe(directory)
-      expect(event.payload.properties.part).toMatchObject({
-        tool: "bash",
-        state: { status: "completed", output: "hello", title: "bash" },
+      expect(event.payload.properties).toMatchObject({
+        content: [{ type: "text", text: "hello" }],
       })
     } finally {
       await reader.cancel()

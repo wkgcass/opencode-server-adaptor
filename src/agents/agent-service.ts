@@ -1,7 +1,7 @@
 import type { AgentAdapterRegistry } from "../agents/registry.ts"
 import { RuntimePool } from "../runtime/runtime-pool.ts"
 import type { SessionRepository } from "../session/index.ts"
-import type { MessageRepository, ToolPart } from "../message/index.ts"
+import type { AssistantMessage, MessageRepository, Part, ToolPart } from "../message/index.ts"
 import type { EventBus } from "../event/index.ts"
 import type { Logger } from "../logging/index.ts"
 import type {
@@ -20,6 +20,12 @@ import { subagentSessionTitle } from "./subagents/subagent-session.ts"
 import type { PermissionRepository } from "../permission/index.ts"
 import { AssistantPartProjector } from "./assistant-part-projector.ts"
 import type { SessionEventStore } from "../event/session-event-store.ts"
+import {
+  publishMessageRemovedLegacy,
+  publishSessionCompactedLegacy,
+  publishSessionErrorLegacy,
+  publishSessionIdleLegacy,
+} from "../event/session-events-legacy.ts"
 import { eventIdForMessageId } from "../id/index.ts"
 
 interface RuntimeSubtask {
@@ -111,6 +117,14 @@ export class AgentService {
   private readonly runtimeSubtasks = new Map<string, RuntimeSubtask>()
   private readonly pendingStarts = new Map<string, Set<ReturnType<typeof setTimeout>>>()
   private readonly pendingCompactions = new Map<string, PendingCompactionProjection>()
+  private readonly startedAssistantSteps = new Set<string>()
+  private readonly settledAssistantSteps = new Set<string>()
+  private readonly startedContentParts = new Set<string>()
+  private readonly endedContentParts = new Set<string>()
+  private readonly startedToolInputs = new Set<string>()
+  private readonly calledTools = new Set<string>()
+  private readonly settledTools = new Set<string>()
+  private readonly activeExecutions = new Set<string>()
 
   constructor(
     registry: AgentAdapterRegistry,
@@ -134,10 +148,68 @@ export class AgentService {
     this.skills = skills
     this.sessionEvents = sessionEvents
 
-    this.assistantParts = new AssistantPartProjector(messages, events, {
+    this.assistantParts = new AssistantPartProjector(messages, {
       encapsulateParts: options?.encapsulateMessageParts,
     })
-    this.subtaskManager = new SubtaskManager(registry, sessions, messages, events, logger, config, this.assistantParts)
+    this.subtaskManager = new SubtaskManager(
+      registry,
+      sessions,
+      messages,
+      events,
+      logger,
+      config,
+      this.assistantParts,
+      {
+        childStarted: (sessionId, userMessageId, prompt, assistantMessageId) => {
+          const user = this.messages.getMessage(userMessageId)
+          this.publishCurrentSessionEvent(
+            sessionId,
+            "session.input.admitted",
+            {
+              sessionID: sessionId,
+              inputID: userMessageId,
+              input: { type: "user", delivery: "steer", data: { text: prompt } },
+            },
+            { created: user?.time.created ?? Date.now() },
+          )
+          this.publishCurrentSessionEvent(sessionId, "session.input.promoted", {
+            sessionID: sessionId,
+            inputID: userMessageId,
+          })
+          this.startExecution(sessionId)
+          this.startAssistantStep(assistantMessageId)
+        },
+        runtimeEvent: (event, sessionId, assistantMessageId) => {
+          const retargeted = retargetRuntimeEvent(event, sessionId, assistantMessageId)
+          if (
+            retargeted.type === "session_busy" ||
+            retargeted.type === "session_idle" ||
+            retargeted.type === "session_started" ||
+            retargeted.type === "session_stopped"
+          ) {
+            return
+          }
+          this.handleAgentEvent(retargeted, sessionId)
+        },
+        parentToolProgress: (partId, metadata) => this.projectToolProgress(partId, metadata),
+        parentToolOutput: (partId, delta) => this.appendToolOutput(partId, delta),
+        childSettled: (sessionId, messageIds, terminalMessageId, status, error) => {
+          for (const messageId of messageIds) this.publishUnterminatedContent(messageId)
+          this.settleAssistantStep(terminalMessageId)
+          this.settleExecution(
+            sessionId,
+            status === "completed"
+              ? "session.execution.succeeded"
+              : status === "aborted"
+                ? "session.execution.interrupted"
+                : "session.execution.failed",
+            error ? { error: { type: "unknown", message: error } } : {},
+          )
+          publishSessionIdleLegacy(this.events, sessionId)
+          this.clearProjectionTracking(sessionId)
+        },
+      },
+    )
   }
 
   generateTitle(
@@ -351,14 +423,20 @@ export class AgentService {
         throw new Error(`Agent '${current.agent}' does not support session compaction`)
       }
       this.sessions.setStatus(sessionId, "busy")
-      this.publishStatus(sessionId, "busy")
+      this.startExecution(sessionId)
       try {
-        return await runtime.compact({ customInstructions })
+        const result = await runtime.compact({ customInstructions })
+        this.settleExecution(sessionId, "session.execution.succeeded")
+        return result
+      } catch (error) {
+        this.settleExecution(sessionId, "session.execution.failed", {
+          error: { type: "unknown", message: error instanceof Error ? error.message : String(error) },
+        })
+        throw error
       } finally {
         this.sessions.setStatus(sessionId, "idle")
         pool.scheduleIdleCheck(sessionId)
-        this.publishStatus(sessionId, "idle")
-        this.events.publish(createEvent("session.idle", { sessionID: sessionId }))
+        publishSessionIdleLegacy(this.events, sessionId)
       }
     })
   }
@@ -498,12 +576,7 @@ export class AgentService {
       const removed = this.messages.deleteMessagesFrom(sessionId, session.revert.messageID)
       const updated = this.sessions.clearRevert(sessionId)
       for (const removedMessageId of removed) {
-        this.events.publish(
-          createEvent("message.removed", {
-            sessionID: sessionId,
-            messageID: removedMessageId,
-          }),
-        )
+        publishMessageRemovedLegacy(this.events, sessionId, removedMessageId)
       }
       if (updated) {
         this.events.publish(createEvent("session.updated", { sessionID: sessionId, info: updated }))
@@ -562,19 +635,20 @@ export class AgentService {
         type: "agent_error",
         message: err instanceof Error ? err.message : String(err),
       })
-      this.publishProjectedMessages(failed.messageIds)
-      this.events.publish(
-        createEvent("session.error", {
-          sessionID: sessionId,
-          messageID: failed.terminalMessageId,
-          error: {
-            name: "UnknownError",
-            data: { message: err instanceof Error ? err.message : String(err) },
-          },
-        }),
-      )
-      this.publishStatus(sessionId, "idle")
-      this.assistantParts.releaseSession(sessionId)
+      for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
+      this.settleAssistantStep(failed.terminalMessageId)
+      this.settleExecution(sessionId, "session.execution.failed", {
+        error: { type: "unknown", message: err instanceof Error ? err.message : String(err) },
+      })
+      publishSessionErrorLegacy(this.events, {
+        sessionID: sessionId,
+        messageID: failed.terminalMessageId,
+        error: {
+          name: "UnknownError",
+          data: { message: err instanceof Error ? err.message : String(err) },
+        },
+      })
+      this.releaseSessionProjection(sessionId)
     }
   }
 
@@ -610,9 +684,12 @@ export class AgentService {
         type: "agent_error",
         message: err instanceof Error ? err.message : String(err),
       })
-      this.publishProjectedMessages(failed.messageIds)
-      this.publishStatus(sessionId, "idle")
-      this.assistantParts.releaseSession(sessionId)
+      for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
+      this.settleAssistantStep(failed.terminalMessageId)
+      this.settleExecution(sessionId, "session.execution.failed", {
+        error: { type: "unknown", message: err instanceof Error ? err.message : String(err) },
+      })
+      this.releaseSessionProjection(sessionId)
     }
   }
 
@@ -637,8 +714,8 @@ export class AgentService {
       },
     }) as ToolPart
 
-    this.publishMessage(subAssistantMsg.id)
-    this.publishPart(toolPart.id)
+    this.publishToolInputStarted(toolPart)
+    this.publishToolCalled(toolPart, toolInput)
 
     return { toolPart, subAssistantMsg }
   }
@@ -750,11 +827,13 @@ export class AgentService {
       time: { start: startTime, end: now },
     }
     this.messages.updatePart(toolPart.id, { state: updatedState })
-
-    this.publishPart(toolPart.id)
+    const updated = this.messages.getPart(toolPart.id)
+    if (!updated || updated.type !== "tool") throw new Error(`Tool part not found: ${toolPart.id}`)
+    if (subStatus === "completed") this.publishToolSuccess(updated, subText, updatedState.metadata)
+    else this.publishToolFailed(updated, subText, updatedState.metadata)
 
     this.messages.completeMessage(subAssistantMsgId, subStatus === "completed" ? "stop" : "error")
-    this.publishMessage(subAssistantMsgId)
+    this.settleAssistantStep(subAssistantMsgId)
   }
 
   private async runSequentialSubtasks(
@@ -835,9 +914,9 @@ export class AgentService {
   ): Promise<void> {
     if (this.abortedSessions.has(sessionId)) {
       this.sessions.setStatus(sessionId, "idle")
-      this.publishStatus(sessionId, "idle")
       this.messages.completeMessage(assistantMessageId, "aborted")
-      this.publishMessage(assistantMessageId)
+      this.settleAssistantStep(assistantMessageId)
+      this.settleExecution(sessionId, "session.execution.interrupted")
       return
     }
 
@@ -857,10 +936,10 @@ export class AgentService {
       await this.executePrompt(sessionId, effectiveText, userMessageId, assistantMessageId, model)
     } else {
       this.sessions.setStatus(sessionId, "idle")
-      this.publishStatus(sessionId, "idle")
-      this.events.publish(createEvent("session.idle", { sessionID: sessionId }))
+      publishSessionIdleLegacy(this.events, sessionId)
       this.messages.completeMessage(assistantMessageId, "stop")
-      this.publishMessage(assistantMessageId)
+      this.settleAssistantStep(assistantMessageId)
+      this.settleExecution(sessionId, "session.execution.succeeded")
     }
   }
 
@@ -897,8 +976,8 @@ export class AgentService {
 
     this.finishRuntimeSubtasksByParent(sessionId, "aborted", "Delegated task was aborted with its parent session.")
     this.sessions.setStatus(sessionId, "idle")
-    this.publishStatus(sessionId, "idle")
-    this.events.publish(createEvent("session.idle", { sessionID: sessionId }))
+    this.settleExecution(sessionId, "session.execution.interrupted")
+    publishSessionIdleLegacy(this.events, sessionId)
   }
 
   async stopSession(sessionId: string): Promise<void> {
@@ -925,6 +1004,7 @@ export class AgentService {
     this.sessionRuntimeAdapters.delete(sessionId)
     this.sessionRuntimeRevisions.delete(sessionId)
     this.abortedSessions.delete(sessionId)
+    this.releaseSessionProjection(sessionId)
   }
 
   async respondToPermission(
@@ -1006,30 +1086,6 @@ export class AgentService {
     }
   }
 
-  private publishPart(partId: string): void {
-    const part = this.messages.getPart(partId)
-    if (!part) return
-    this.events.publish(
-      createEvent("message.part.updated", {
-        sessionID: part.sessionID,
-        part,
-        time: Date.now(),
-      }),
-    )
-  }
-
-  private publishPartDelta(sessionId: string, messageId: string, partId: string, field: string, delta: string): void {
-    this.events.publish(
-      createEvent("message.part.delta", {
-        sessionID: sessionId,
-        messageID: messageId,
-        partID: partId,
-        field,
-        delta,
-      }),
-    )
-  }
-
   private flushStreamedMessageParts(messageId: string): void {
     for (const part of this.messages.listParts(messageId)) {
       const text = this.streamedPartText.get(part.id)
@@ -1048,35 +1104,32 @@ export class AgentService {
     }
   }
 
-  private publishMessage(messageId: string): void {
-    const info = this.messages.getMessage(messageId)
-    if (!info) return
-    this.events.publish(
-      createEvent("message.updated", {
-        sessionID: info.sessionID,
-        info,
-      }),
-    )
+  private clearProjectionTracking(sessionId: string): void {
+    for (const message of this.messages.listMessages(sessionId)) {
+      this.startedAssistantSteps.delete(message.info.id)
+      this.settledAssistantSteps.delete(message.info.id)
+      for (const part of message.parts) {
+        this.startedContentParts.delete(part.id)
+        this.endedContentParts.delete(part.id)
+        this.startedToolInputs.delete(part.id)
+        this.calledTools.delete(part.id)
+        this.settledTools.delete(part.id)
+      }
+    }
+    this.activeExecutions.delete(sessionId)
   }
 
-  private publishMessageParts(messageId: string): void {
-    for (const part of this.messages.listParts(messageId)) {
-      this.events.publish(
-        createEvent("message.part.updated", {
-          sessionID: part.sessionID,
-          part,
-          time: Date.now(),
-        }),
-      )
-    }
+  private releaseSessionProjection(sessionId: string): void {
+    this.assistantParts.releaseSession(sessionId)
+    this.clearProjectionTracking(sessionId)
   }
 
   private publishCurrentSessionEvent(
     sessionId: string,
     type: string,
     data: Record<string, unknown>,
-    options?: { id?: string; created?: number; metadata?: Record<string, unknown> },
-  ): void {
+    options?: { id?: string; created?: number; metadata?: Record<string, unknown>; version?: number },
+  ): ReturnType<SessionEventStore["append"]> {
     const session = this.sessions.get(sessionId)
     const event = this.sessionEvents.append(
       sessionId,
@@ -1095,6 +1148,310 @@ export class AgentService {
         properties: event.data,
       },
       session?.directory,
+    )
+    return event
+  }
+
+  private publishLiveCurrentSessionEvent(
+    sessionId: string,
+    type: string,
+    data: Record<string, unknown>,
+    created = Date.now(),
+  ): void {
+    const session = this.sessions.get(sessionId)
+    const event = createEvent(type, data)
+    event.created = created
+    this.events.publish(event, session?.directory)
+  }
+
+  private requireAssistantMessage(messageId: string): AssistantMessage {
+    const message = this.messages.getMessage(messageId)
+    if (!message || message.role !== "assistant") throw new Error(`Assistant message not found: ${messageId}`)
+    return message
+  }
+
+  private activeAssistantMessageId(sessionId: string): string | undefined {
+    return this.messages
+      .listMessages(sessionId)
+      .map((item) => item.info)
+      .findLast((message): message is AssistantMessage => message.role === "assistant" && !message.time.completed)?.id
+  }
+
+  private contentOrdinal(part: Extract<Part, { type: "text" | "reasoning" }>): number {
+    const ordinal = this.messages
+      .listParts(part.messageID)
+      .filter((item) => item.type === part.type)
+      .findIndex((item) => item.id === part.id)
+    if (ordinal < 0) throw new Error(`Cannot determine ${part.type} ordinal for part '${part.id}'`)
+    return ordinal
+  }
+
+  startAssistantStep(messageId: string): void {
+    if (this.startedAssistantSteps.has(messageId)) return
+    const message = this.requireAssistantMessage(messageId)
+    this.startedAssistantSteps.add(messageId)
+    this.publishCurrentSessionEvent(
+      message.sessionID,
+      "session.step.started",
+      {
+        sessionID: message.sessionID,
+        assistantMessageID: message.id,
+        agent: message.agent,
+        model: { id: message.modelID, providerID: message.providerID },
+      },
+      { id: eventIdForMessageId(message.id), created: message.time.created },
+    )
+  }
+
+  startExecution(sessionId: string): void {
+    if (this.activeExecutions.has(sessionId)) return
+    this.activeExecutions.add(sessionId)
+    this.publishCurrentSessionEvent(sessionId, "session.execution.started", { sessionID: sessionId })
+  }
+
+  private settleExecution(
+    sessionId: string,
+    type: "session.execution.succeeded" | "session.execution.failed" | "session.execution.interrupted",
+    data: Record<string, unknown> = {},
+  ): void {
+    if (!this.activeExecutions.delete(sessionId)) return
+    this.publishCurrentSessionEvent(sessionId, type, { sessionID: sessionId, ...data })
+  }
+
+  settleAssistantMessage(messageId: string): void {
+    this.settleAssistantStep(messageId)
+  }
+
+  projectToolRunning(partId: string): void {
+    const part = this.messages.getPart(partId)
+    if (!part || part.type !== "tool") throw new Error(`Tool part not found: ${partId}`)
+    const input = "input" in part.state && part.state.input ? part.state.input : {}
+    this.publishToolInputStarted(part)
+    this.publishToolCalled(part, input)
+  }
+
+  projectToolProgress(partId: string, metadata: Record<string, unknown>): void {
+    const part = this.messages.getPart(partId)
+    if (!part || part.type !== "tool") throw new Error(`Tool part not found: ${partId}`)
+    this.publishToolProgress(part, metadata)
+  }
+
+  appendToolOutput(partId: string, delta: string): void {
+    const part = this.messages.getPart(partId)
+    if (!part || part.type !== "tool") throw new Error(`Tool part not found: ${partId}`)
+    const output = `${part.state.output ?? ""}${delta}`
+    const metadata = { ...(part.state.metadata ?? {}), output, partialOutput: output }
+    this.messages.updatePart(partId, { state: { ...part.state, output, metadata } })
+    const current = this.messages.getPart(partId)
+    if (current?.type === "tool") this.publishToolProgress(current, metadata)
+  }
+
+  projectToolTerminal(partId: string): void {
+    const part = this.messages.getPart(partId)
+    if (!part || part.type !== "tool") throw new Error(`Tool part not found: ${partId}`)
+    if (part.state.status === "completed") {
+      this.publishToolSuccess(part, part.state.output ?? "", part.state.metadata)
+      return
+    }
+    if (part.state.status === "error" || part.state.status === "aborted") {
+      this.publishToolFailed(part, part.state.error ?? "Tool execution failed", part.state.metadata)
+    }
+  }
+
+  succeedExecution(sessionId: string): void {
+    this.settleExecution(sessionId, "session.execution.succeeded")
+  }
+
+  failExecution(sessionId: string, message: string): void {
+    this.settleExecution(sessionId, "session.execution.failed", {
+      error: { type: "unknown", message },
+    })
+  }
+
+  private publishContentStarted(part: Extract<Part, { type: "text" | "reasoning" }>): void {
+    if (this.startedContentParts.has(part.id)) return
+    this.startedContentParts.add(part.id)
+    this.startAssistantStep(part.messageID)
+    const ordinal = this.contentOrdinal(part)
+    this.publishCurrentSessionEvent(
+      part.sessionID,
+      part.type === "text" ? "session.text.started" : "session.reasoning.started",
+      {
+        sessionID: part.sessionID,
+        assistantMessageID: part.messageID,
+        ordinal,
+      },
+      { created: part.time?.start ?? Date.now() },
+    )
+  }
+
+  private publishContentDelta(part: Extract<Part, { type: "text" | "reasoning" }>, delta: string): void {
+    this.publishLiveCurrentSessionEvent(
+      part.sessionID,
+      part.type === "text" ? "session.text.delta" : "session.reasoning.delta",
+      {
+        sessionID: part.sessionID,
+        assistantMessageID: part.messageID,
+        ordinal: this.contentOrdinal(part),
+        delta,
+      },
+    )
+  }
+
+  private publishContentEnded(part: Extract<Part, { type: "text" | "reasoning" }>, text: string): void {
+    if (this.endedContentParts.has(part.id)) return
+    this.endedContentParts.add(part.id)
+    this.publishCurrentSessionEvent(
+      part.sessionID,
+      part.type === "text" ? "session.text.ended" : "session.reasoning.ended",
+      {
+        sessionID: part.sessionID,
+        assistantMessageID: part.messageID,
+        ordinal: this.contentOrdinal(part),
+        text,
+      },
+      { created: part.time?.end ?? Date.now() },
+    )
+  }
+
+  private publishToolInputStarted(part: ToolPart): void {
+    if (this.startedToolInputs.has(part.id)) return
+    this.startedToolInputs.add(part.id)
+    this.startAssistantStep(part.messageID)
+    this.publishCurrentSessionEvent(
+      part.sessionID,
+      "session.tool.input.started",
+      {
+        sessionID: part.sessionID,
+        assistantMessageID: part.messageID,
+        callID: part.callID,
+        name: part.tool,
+      },
+      { created: part.state.time?.start ?? Date.now() },
+    )
+  }
+
+  private publishToolCalled(part: ToolPart, input: Record<string, unknown>): void {
+    this.publishToolInputStarted(part)
+    if (this.calledTools.has(part.id)) return
+    this.calledTools.add(part.id)
+    this.publishCurrentSessionEvent(part.sessionID, "session.tool.input.ended", {
+      sessionID: part.sessionID,
+      assistantMessageID: part.messageID,
+      callID: part.callID,
+      text: JSON.stringify(input),
+    })
+    this.publishCurrentSessionEvent(part.sessionID, "session.tool.called", {
+      sessionID: part.sessionID,
+      assistantMessageID: part.messageID,
+      callID: part.callID,
+      input,
+      executed: true,
+    })
+  }
+
+  private publishToolInputDelta(part: ToolPart, delta: string): void {
+    this.publishToolInputStarted(part)
+    this.publishLiveCurrentSessionEvent(part.sessionID, "session.tool.input.delta", {
+      sessionID: part.sessionID,
+      assistantMessageID: part.messageID,
+      callID: part.callID,
+      delta,
+    })
+  }
+
+  private publishToolProgress(part: ToolPart, metadata: Record<string, unknown>): void {
+    const input = "input" in part.state && part.state.input ? part.state.input : {}
+    this.publishToolCalled(part, input)
+    this.publishLiveCurrentSessionEvent(part.sessionID, "session.tool.progress", {
+      sessionID: part.sessionID,
+      assistantMessageID: part.messageID,
+      callID: part.callID,
+      metadata,
+    })
+  }
+
+  private publishToolSuccess(part: ToolPart, output: string, metadata?: Record<string, unknown>): void {
+    if (this.settledTools.has(part.id)) return
+    const input = "input" in part.state && part.state.input ? part.state.input : {}
+    this.publishToolCalled(part, input)
+    this.settledTools.add(part.id)
+    this.publishCurrentSessionEvent(
+      part.sessionID,
+      "session.tool.success",
+      {
+        sessionID: part.sessionID,
+        assistantMessageID: part.messageID,
+        callID: part.callID,
+        content: [{ type: "text", text: output }],
+        metadata: metadata ?? {},
+        executed: true,
+      },
+      { created: part.state.time?.end ?? Date.now(), version: 2 },
+    )
+  }
+
+  private publishToolFailed(part: ToolPart, error: string, metadata?: Record<string, unknown>): void {
+    if (this.settledTools.has(part.id)) return
+    const input = "input" in part.state && part.state.input ? part.state.input : {}
+    this.publishToolCalled(part, input)
+    this.settledTools.add(part.id)
+    this.publishCurrentSessionEvent(
+      part.sessionID,
+      "session.tool.failed",
+      {
+        sessionID: part.sessionID,
+        assistantMessageID: part.messageID,
+        callID: part.callID,
+        error: { type: "unknown", message: error },
+        metadata: metadata ?? {},
+        executed: true,
+      },
+      { created: part.state.time?.end ?? Date.now(), version: 2 },
+    )
+  }
+
+  private publishUnterminatedContent(messageId: string): void {
+    for (const part of this.messages.listParts(messageId)) {
+      if (part.type !== "text" && part.type !== "reasoning") continue
+      if (this.endedContentParts.has(part.id)) continue
+      this.publishContentStarted(part)
+      this.publishContentEnded(part, part.text)
+    }
+  }
+
+  private settleAssistantStep(messageId: string): void {
+    if (this.settledAssistantSteps.has(messageId)) return
+    const message = this.requireAssistantMessage(messageId)
+    this.startAssistantStep(messageId)
+    this.publishUnterminatedContent(messageId)
+    this.settledAssistantSteps.add(messageId)
+    if (message.error) {
+      this.publishCurrentSessionEvent(
+        message.sessionID,
+        "session.step.failed",
+        {
+          sessionID: message.sessionID,
+          assistantMessageID: message.id,
+          error: { type: "unknown", message: message.error.data.message },
+          cost: message.cost,
+          tokens: message.tokens,
+        },
+        { created: message.time.completed ?? Date.now() },
+      )
+      return
+    }
+    this.publishCurrentSessionEvent(
+      message.sessionID,
+      "session.step.ended",
+      {
+        sessionID: message.sessionID,
+        assistantMessageID: message.id,
+        finish: message.finish ?? "unknown",
+        cost: message.cost,
+        tokens: message.tokens,
+      },
+      { created: message.time.completed ?? Date.now() },
     )
   }
 
@@ -1153,33 +1510,6 @@ export class AgentService {
       },
     )
     return pending
-  }
-
-  private publishProjectedMessages(messageIds: string[]): void {
-    for (const messageId of messageIds) {
-      this.publishMessageParts(messageId)
-      this.publishMessage(messageId)
-    }
-  }
-
-  private publishStatus(
-    sessionId: string,
-    status:
-      | "busy"
-      | "idle"
-      | {
-          type: "retry"
-          attempt: number
-          message: string
-          next: number
-        },
-  ): void {
-    this.events.publish(
-      createEvent("session.status", {
-        sessionID: sessionId,
-        status: typeof status === "string" ? { type: status } : status,
-      }),
-    )
   }
 
   private async invalidateRuntime(
@@ -1279,9 +1609,7 @@ export class AgentService {
     run.published = true
 
     const childSession = this.sessions.get(run.childSessionId)
-    const childUserMessage = this.messages.getMessage(run.childUserMessageId)
     const childPromptPart = this.messages.getPart(run.childPromptPartId)
-    const childAssistantMessage = this.messages.getMessage(run.childAssistantMessageId)
     if (childSession) {
       this.events.publish(
         createEvent("session.created", {
@@ -1290,32 +1618,24 @@ export class AgentService {
         }),
       )
     }
-    if (childUserMessage) {
-      this.events.publish(
-        createEvent("message.updated", {
+    if (childPromptPart?.type === "text") {
+      this.publishCurrentSessionEvent(
+        run.childSessionId,
+        "session.input.admitted",
+        {
           sessionID: run.childSessionId,
-          info: childUserMessage,
-        }),
+          inputID: run.childUserMessageId,
+          input: { type: "user", delivery: "steer", data: { text: childPromptPart.text } },
+        },
+        { created: childPromptPart.time?.start ?? Date.now() },
       )
+      this.publishCurrentSessionEvent(run.childSessionId, "session.input.promoted", {
+        sessionID: run.childSessionId,
+        inputID: run.childUserMessageId,
+      })
     }
-    if (childPromptPart) {
-      this.events.publish(
-        createEvent("message.part.updated", {
-          sessionID: run.childSessionId,
-          part: childPromptPart,
-          time: Date.now(),
-        }),
-      )
-    }
-    if (childAssistantMessage) {
-      this.events.publish(
-        createEvent("message.updated", {
-          sessionID: run.childSessionId,
-          info: childAssistantMessage,
-        }),
-      )
-    }
-    this.publishStatus(run.childSessionId, "busy")
+    this.startAssistantStep(run.childAssistantMessageId)
+    this.startExecution(run.childSessionId)
   }
 
   private runtimeSubtaskMetadata(run: RuntimeSubtask | undefined): Record<string, unknown> {
@@ -1355,7 +1675,8 @@ export class AgentService {
         callId: event.callId,
         agentPartId: event.partId,
       })
-      this.publishPart(recovered.id)
+      this.publishToolInputStarted(recovered)
+      this.publishToolCalled(recovered, event.input)
     }
     const run = this.ensureRuntimeSubtask(event.sessionId, parentToolPartId, event.callId, event.messageId, event.input)
     if (!run) {
@@ -1383,17 +1704,19 @@ export class AgentService {
       // tool_call_error will settle the mirrored child and release the group.
       this.flushProjectedMessageParts(run.childAssistantMessageId)
       const failed = this.assistantParts.fail(run.childAssistantMessageId, childEvent.error)
-      this.publishProjectedMessages(failed.messageIds)
-      this.events.publish(
-        createEvent("session.error", {
-          sessionID: run.childSessionId,
-          messageID: failed.terminalMessageId,
-          error: {
-            name: "UnknownError",
-            data: { message: childEvent.error.message },
-          },
-        }),
-      )
+      for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
+      this.settleAssistantStep(failed.terminalMessageId)
+      this.settleExecution(run.childSessionId, "session.execution.failed", {
+        error: { type: "unknown", message: childEvent.error.message },
+      })
+      publishSessionErrorLegacy(this.events, {
+        sessionID: run.childSessionId,
+        messageID: failed.terminalMessageId,
+        error: {
+          name: "UnknownError",
+          data: { message: childEvent.error.message },
+        },
+      })
       return
     }
     this.handleAgentEvent(childEvent, run.childSessionId)
@@ -1443,10 +1766,14 @@ export class AgentService {
       )
       .flatMap((message) => message.parts)
     if (output && !childParts.some((part) => part.type === "text" && part.text.trim())) {
-      this.assistantParts.createPart(run.childSessionId, run.childAssistantMessageId, "text", {
+      const synthetic = this.assistantParts.createPart(run.childSessionId, run.childAssistantMessageId, "text", {
         text: output,
         time: { start: Date.now(), end: Date.now() },
       })
+      if (synthetic.type === "text") {
+        this.publishContentStarted(synthetic)
+        this.publishContentEnded(synthetic, output)
+      }
     }
 
     let projected: { messageIds: string[]; terminalMessageId: string }
@@ -1467,10 +1794,19 @@ export class AgentService {
       this.sessions.setStatus(run.childSessionId, status)
     }
 
-    this.publishProjectedMessages(projected.messageIds)
-    this.publishStatus(run.childSessionId, "idle")
-    this.events.publish(createEvent("session.idle", { sessionID: run.childSessionId }))
-    this.assistantParts.releaseSession(run.childSessionId)
+    for (const messageId of projected.messageIds) this.publishUnterminatedContent(messageId)
+    this.settleAssistantStep(projected.terminalMessageId)
+    this.settleExecution(
+      run.childSessionId,
+      status === "completed"
+        ? "session.execution.succeeded"
+        : status === "aborted"
+          ? "session.execution.interrupted"
+          : "session.execution.failed",
+      status === "failed" ? { error: { type: "unknown", message: error || output || "Delegated task failed" } } : {},
+    )
+    publishSessionIdleLegacy(this.events, run.childSessionId)
+    this.releaseSessionProjection(run.childSessionId)
     this.runtimeSubtasks.delete(key)
   }
 
@@ -1498,7 +1834,7 @@ export class AgentService {
           })
           partIdMap.set(event.partId, part.id)
           this.streamedPartText.set(part.id, "")
-          this.publishPart(part.id)
+          if (part.type === "text") this.publishContentStarted(part)
           break
         }
 
@@ -1517,10 +1853,10 @@ export class AgentService {
               messageId: event.messageId,
               agentPartId: event.partId,
             })
-            this.publishPart(part.id)
-          } else {
-            this.publishPartDelta(sessionId, existing.messageID, dbPartId, "text", event.delta)
+            if (part.type === "text") this.publishContentStarted(part)
           }
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "text") this.publishContentDelta(current, event.delta)
           this.streamedPartText.set(dbPartId, event.text)
           break
         }
@@ -1540,11 +1876,18 @@ export class AgentService {
               messageId: event.messageId,
               agentPartId: event.partId,
             })
-          } else if (part.text !== event.text) {
+          }
+          if (part.type !== "text") throw new Error(`Text part not found: ${dbPartId}`)
+          const previous = this.streamedPartText.get(dbPartId) ?? part.text
+          if (part.text !== event.text) {
             this.messages.updatePart(dbPartId, { text: event.text })
           }
           this.streamedPartText.set(dbPartId, event.text)
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "text") {
+            this.publishContentStarted(current)
+            if (event.text.startsWith(previous)) this.publishContentDelta(current, event.text.slice(previous.length))
+          }
           break
         }
 
@@ -1570,7 +1913,11 @@ export class AgentService {
             })
           }
           this.streamedPartText.delete(dbPartId)
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "text") {
+            this.publishContentStarted(current)
+            this.publishContentEnded(current, event.text)
+          }
           break
         }
 
@@ -1581,7 +1928,7 @@ export class AgentService {
           })
           partIdMap.set(event.partId, part.id)
           this.streamedPartText.set(part.id, "")
-          this.publishPart(part.id)
+          if (part.type === "reasoning") this.publishContentStarted(part)
           break
         }
 
@@ -1600,10 +1947,10 @@ export class AgentService {
               messageId: event.messageId,
               agentPartId: event.partId,
             })
-            this.publishPart(part.id)
-          } else {
-            this.publishPartDelta(sessionId, existing.messageID, dbPartId, "text", event.delta)
+            if (part.type === "reasoning") this.publishContentStarted(part)
           }
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "reasoning") this.publishContentDelta(current, event.delta)
           this.streamedPartText.set(dbPartId, event.text)
           break
         }
@@ -1623,11 +1970,18 @@ export class AgentService {
               messageId: event.messageId,
               agentPartId: event.partId,
             })
-          } else if (part.text !== event.text) {
+          }
+          if (part.type !== "reasoning") throw new Error(`Reasoning part not found: ${dbPartId}`)
+          const previous = this.streamedPartText.get(dbPartId) ?? part.text
+          if (part.text !== event.text) {
             this.messages.updatePart(dbPartId, { text: event.text })
           }
           this.streamedPartText.set(dbPartId, event.text)
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "reasoning") {
+            this.publishContentStarted(current)
+            if (event.text.startsWith(previous)) this.publishContentDelta(current, event.text.slice(previous.length))
+          }
           break
         }
 
@@ -1653,7 +2007,11 @@ export class AgentService {
             })
           }
           this.streamedPartText.delete(dbPartId)
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "reasoning") {
+            this.publishContentStarted(current)
+            this.publishContentEnded(current, event.text)
+          }
           break
         }
 
@@ -1675,7 +2033,7 @@ export class AgentService {
           // subtitle until toolcall_end supplies the description. Create and
           // link the child from tool_call_running, where the backend has finalized the
           // arguments.
-          this.publishPart(part.id)
+          this.publishToolInputStarted(part)
           break
         }
 
@@ -1711,7 +2069,8 @@ export class AgentService {
               },
             })
           }
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "tool") this.publishToolInputDelta(current, event.delta)
           break
         }
 
@@ -1755,7 +2114,11 @@ export class AgentService {
               time: { start: part.state.time?.start ?? Date.now() },
             },
           })
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "tool") {
+            this.publishToolCalled(current, event.input)
+            if (run) this.publishToolProgress(current, current.state.metadata ?? {})
+          }
           if (run) this.publishRuntimeSubtaskStarted(run)
           break
         }
@@ -1800,7 +2163,14 @@ export class AgentService {
               },
             })
           }
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "tool") {
+            this.publishToolProgress(current, {
+              ...(event.metadata ?? {}),
+              output: event.output,
+              partialOutput: event.output,
+            })
+          }
           break
         }
 
@@ -1854,7 +2224,8 @@ export class AgentService {
             tool: event.tool || part.tool,
             state: updatedState,
           })
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "tool") this.publishToolSuccess(current, event.output, updatedState.metadata)
           if (run) this.publishRuntimeSubtaskStarted(run)
           if (event.tool === "task") {
             this.finishRuntimeSubtask(sessionId, event.callId, "completed", event.output, undefined, event.metadata)
@@ -1906,7 +2277,8 @@ export class AgentService {
             tool: event.tool || part.tool,
             state: updatedState,
           })
-          this.publishPart(dbPartId)
+          const current = this.messages.getPart(dbPartId)
+          if (current?.type === "tool") this.publishToolFailed(current, event.error, updatedState.metadata)
           if (run) this.publishRuntimeSubtaskStarted(run)
           if (event.tool === "task") {
             const status = event.metadata?.status === "aborted" ? "aborted" : "failed"
@@ -1978,9 +2350,7 @@ export class AgentService {
               },
             },
           )
-          this.publishMessage(completed.assistant.id)
-          this.publishMessageParts(completed.assistant.id)
-          this.events.publish(createEvent("session.compacted", { sessionID: sessionId }))
+          publishSessionCompactedLegacy(this.events, sessionId)
           this.pendingCompactions.delete(sessionId)
           break
         }
@@ -2009,36 +2379,36 @@ export class AgentService {
           // while the legacy session.error event is what Desktop surfaces in
           // its notification/error UI. Publish both projections from the same
           // application-layer failure boundary.
-          this.events.publish(
-            createEvent("session.error", {
-              sessionID: sessionId,
-              error: {
-                name: "UnknownError",
-                data: { message: event.error },
-              },
-            }),
-          )
+          publishSessionErrorLegacy(this.events, {
+            sessionID: sessionId,
+            error: {
+              name: "UnknownError",
+              data: { message: event.error },
+            },
+          })
           this.pendingCompactions.delete(sessionId)
           break
         }
 
         case "session_busy": {
           this.sessions.setStatus(sessionId, "busy")
-          this.publishStatus(sessionId, "busy")
+          this.startExecution(sessionId)
           break
         }
 
         case "session_retry": {
-          // Keep the persisted status busy so reconnecting clients do not see a
-          // false idle boundary, while live Desktop clients receive OpenCode's
-          // richer retry state and countdown.
           this.sessions.setStatus(sessionId, "busy")
-          this.publishStatus(sessionId, {
-            type: "retry",
-            attempt: event.attempt,
-            message: event.message,
-            next: event.next,
-          })
+          this.startExecution(sessionId)
+          const assistantMessageID = this.activeAssistantMessageId(sessionId)
+          if (assistantMessageID) {
+            this.publishCurrentSessionEvent(sessionId, "session.retry.scheduled", {
+              sessionID: sessionId,
+              assistantMessageID,
+              attempt: event.attempt,
+              at: event.next,
+              error: { type: "unknown", message: event.message },
+            })
+          }
           break
         }
 
@@ -2054,13 +2424,13 @@ export class AgentService {
         case "session_idle": {
           if (this.globalQueue.pendingCount(sessionId) > 1) {
             this.sessions.setStatus(sessionId, "busy")
-            this.publishStatus(sessionId, "busy")
+            this.startExecution(sessionId)
             break
           }
           this.sessions.setStatus(sessionId, "idle")
-          this.publishStatus(sessionId, "idle")
-          this.events.publish(createEvent("session.idle", { sessionID: sessionId }))
-          this.assistantParts.releaseSession(sessionId)
+          this.settleExecution(sessionId, "session.execution.succeeded")
+          publishSessionIdleLegacy(this.events, sessionId)
+          this.releaseSessionProjection(sessionId)
           break
         }
 
@@ -2069,49 +2439,48 @@ export class AgentService {
             const diagnosticMessageId = event.messageId
               ? this.assistantParts.terminalMessageId(event.messageId)
               : undefined
-            this.events.publish(
-              createEvent("session.error", {
-                sessionID: sessionId,
-                messageID: diagnosticMessageId,
-                error: {
-                  name: "UnknownError",
-                  data: { message: event.error.message },
-                },
-              }),
-            )
+            publishSessionErrorLegacy(this.events, {
+              sessionID: sessionId,
+              messageID: diagnosticMessageId,
+              error: {
+                name: "UnknownError",
+                data: { message: event.error.message },
+              },
+            })
             break
           }
           if (!event.messageId) {
             this.sessions.setStatus(sessionId, "idle")
-            this.events.publish(
-              createEvent("session.error", {
-                sessionID: sessionId,
-                error: {
-                  name: "UnknownError",
-                  data: { message: event.error.message },
-                },
-              }),
-            )
-            this.publishStatus(sessionId, "idle")
+            publishSessionErrorLegacy(this.events, {
+              sessionID: sessionId,
+              error: {
+                name: "UnknownError",
+                data: { message: event.error.message },
+              },
+            })
+            this.settleExecution(sessionId, "session.execution.failed", {
+              error: { type: "unknown", message: event.error.message },
+            })
             void this.invalidateRuntime(sessionId, runtime, agentId, "session_error")
             break
           }
           this.flushProjectedMessageParts(event.messageId)
           const failed = this.assistantParts.fail(event.messageId, event.error)
           this.sessions.setStatus(sessionId, "idle")
-          this.publishProjectedMessages(failed.messageIds)
-          this.events.publish(
-            createEvent("session.error", {
-              sessionID: sessionId,
-              messageID: failed.terminalMessageId,
-              error: {
-                name: "UnknownError",
-                data: { message: event.error.message },
-              },
-            }),
-          )
-          this.publishStatus(sessionId, "idle")
-          this.assistantParts.releaseSession(sessionId)
+          for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
+          this.settleAssistantStep(failed.terminalMessageId)
+          publishSessionErrorLegacy(this.events, {
+            sessionID: sessionId,
+            messageID: failed.terminalMessageId,
+            error: {
+              name: "UnknownError",
+              data: { message: event.error.message },
+            },
+          })
+          this.settleExecution(sessionId, "session.execution.failed", {
+            error: { type: "unknown", message: event.error.message },
+          })
+          this.releaseSessionProjection(sessionId)
           void this.invalidateRuntime(sessionId, runtime, agentId, "session_error")
           break
         }
@@ -2122,16 +2491,16 @@ export class AgentService {
           // Runtime has no prompt owner, so publish that fault here.
           if (!event.messageId) {
             this.sessions.setStatus(sessionId, "idle")
-            this.events.publish(
-              createEvent("session.error", {
-                sessionID: sessionId,
-                error: {
-                  name: "UnknownError",
-                  data: { message: event.error.message },
-                },
-              }),
-            )
-            this.publishStatus(sessionId, "idle")
+            publishSessionErrorLegacy(this.events, {
+              sessionID: sessionId,
+              error: {
+                name: "UnknownError",
+                data: { message: event.error.message },
+              },
+            })
+            this.settleExecution(sessionId, "session.execution.failed", {
+              error: { type: "unknown", message: event.error.message },
+            })
           }
           void this.invalidateRuntime(sessionId, runtime, agentId, "runtime_fault")
           break
@@ -2143,10 +2512,8 @@ export class AgentService {
           // reconnect see exactly the same content as the live delta stream.
           this.flushProjectedMessageParts(event.messageId)
           const completed = this.assistantParts.complete(event.messageId, event.finish ?? "stop", event.usage)
-          // completeMessage closes any unterminated text/reasoning parts in the
-          // database. Publish those snapshots before the terminal message/status
-          // events so Desktop cannot retain a local part with no time.end.
-          this.publishProjectedMessages(completed.messageIds)
+          for (const messageId of completed.messageIds) this.publishUnterminatedContent(messageId)
+          this.settleAssistantStep(completed.terminalMessageId)
           break
         }
 
@@ -2186,23 +2553,27 @@ export class AgentService {
           type: "event_projection_error",
           message: error instanceof Error ? error.message : String(error),
         })
-        this.publishProjectedMessages(failed.messageIds)
+        for (const failedMessageId of failed.messageIds) this.publishUnterminatedContent(failedMessageId)
+        this.settleAssistantStep(failed.terminalMessageId)
       }
       this.sessions.setStatus(sessionId, "idle")
-      this.events.publish(
-        createEvent("session.error", {
-          sessionID: sessionId,
-          ...(messageId ? { messageID: this.assistantParts.terminalMessageId(messageId) } : {}),
-          error: {
-            name: "UnknownError",
-            data: {
-              message: `Failed to persist an agent event: ${error instanceof Error ? error.message : String(error)}`,
-            },
+      publishSessionErrorLegacy(this.events, {
+        sessionID: sessionId,
+        ...(messageId ? { messageID: this.assistantParts.terminalMessageId(messageId) } : {}),
+        error: {
+          name: "UnknownError",
+          data: {
+            message: `Failed to persist an agent event: ${error instanceof Error ? error.message : String(error)}`,
           },
-        }),
-      )
-      this.publishStatus(sessionId, "idle")
-      this.assistantParts.releaseSession(sessionId)
+        },
+      })
+      this.settleExecution(sessionId, "session.execution.failed", {
+        error: {
+          type: "unknown",
+          message: `Failed to persist an agent event: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      })
+      this.releaseSessionProjection(sessionId)
     } catch (recoveryError) {
       this.logger.error("Could not persist agent event projection failure", {
         sessionId,

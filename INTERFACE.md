@@ -46,8 +46,9 @@ flowchart LR
 - [`src/api/routes/v2-session.ts`](src/api/routes/v2-session.ts)：v2 会话协议映射。
 - [`src/api/routes/v2.ts`](src/api/routes/v2.ts)：Agent、provider、项目、文件系统和 PTY 等 v2 HTTP 接口。
 - [`src/api/routes/v2-permission.ts`](src/api/routes/v2-permission.ts)：v2 权限请求、查询和回复生命周期。
-- [`src/api/routes/v1.ts`](src/api/routes/v1.ts)：v1 专属路由（配置与检查层）。
-- [`src/api/routes/v1-compatible.ts`](src/api/routes/v1-compatible.ts)：两种模式都挂载的兼容路由（`GET /config`、`DELETE /session/:id`）。
+- [`src/api/routes/v1-legacy.ts`](src/api/routes/v1-legacy.ts)：v1 专属路由（配置与检查层）。
+- [`src/api/routes/v1-compatible-legacy.ts`](src/api/routes/v1-compatible-legacy.ts)：两种模式都挂载的兼容路由（配置、会话删除和 Desktop 文件树）。
+- [`src/event/session-events-legacy.ts`](src/event/session-events-legacy.ts)：尚无 current 等价物的 Desktop 通知事件。
 - [`src/api/version.ts`](src/api/version.ts)：`--api-version` 选项与默认版本。
 - [`src/session/session-service.ts`](src/session/session-service.ts)：协议无关的会话应用服务。
 - [`src/event/session-event-store.ts`](src/event/session-event-store.ts)：v2 持久事件序列。
@@ -58,8 +59,8 @@ flowchart LR
 
 服务默认启用 v2，可通过 `--api-version=v1` 切换为 v1。`/api/health` 返回数值型 `pid`，
 `/global/health` 不注册并返回 404，以匹配 OpenCode 的协议探测顺序。v1 模式下挂载
-`v1.ts` 和 `v1-compatible.ts`；v2 模式下挂载 `v2.ts`、`v2-session.ts`、`v2-permission.ts`、`event.ts` 和
-`v1-compatible.ts`。`v1-compatible.ts`（`GET /config`、`DELETE /session/:id`）在两种模式下都挂载。
+`v1-legacy.ts` 和 `v1-compatible-legacy.ts`；v2 模式下挂载 `v2.ts`、`v2-session.ts`、`v2-permission.ts`、`event.ts` 和
+`v1-compatible-legacy.ts`。`v1-compatible-legacy.ts`（`GET /config`、`DELETE /session/:id`）在两种模式下都挂载。
 
 ### 应用层与持久化边界
 
@@ -71,10 +72,18 @@ pending/reply 语义，项目目录查询也不会在 v1/v2 路由中各复制�
 provider/model 的通用目录模型与构建逻辑位于 [`src/provider/index.ts`](src/provider/index.ts)。后端 integration 可以贡献
 内置 provider，但不需要依赖 HTTP 路由模块；`src/api/provider.ts` 仅作为旧导入路径的兼容导出。
 
-通用 `EventBus` 继续发布 OpenCode 兼容实时事件；`SessionEventStore` 将需要断点续传的 v2 会话事件保存为每个
-session 单调递增的 durable sequence。订阅流程先注册实时监听，再回放数据库历史并按 sequence 去重，避免回放与
-实时切换窗口内丢失事件。日志优化器处理 v2 的消息快照与 SSE envelope，保留事件身份、生命周期和统计，
-但不重复输出累积文本或工具结果。
+通用 `EventBus` 发布 OpenCode current 会话事件；主消息流不再发送已被替代的 `message.updated`、
+`message.part.updated`、`message.part.delta` 和 `session.status`。输入、execution、step、text、reasoning、tool、
+重试和压缩的生命周期边界由 `SessionEventStore` 保存为每个 session 单调递增的 durable sequence，并同时发送到
+`/api/event`；text/reasoning/tool-input delta 与 tool progress 只实时发送，不写数据库。tool success/failed 使用
+durable version 2，其余当前边界使用 version 1。尚无 current 等价物的 `session.idle`、`session.error`、
+`message.removed` 和 `session.compacted` 集中在 `session-events-legacy.ts`，并继续由 `EventBus` 发送。其中
+`session.idle` 和 `session.error` 承担 Desktop 的完成唤醒与错误通知。标准的 `session.created`、
+`session.updated`、`session.deleted`、`session.forked`、权限和 PTY 事件仍属于 current 全局事件，不归入 legacy 文件。
+
+持久事件订阅先注册实时监听，再回放数据库历史并按 sequence 去重，避免回放与实时切换窗口内丢失事件。客户端重连也可
+直接重新读取 `/api/session/:sessionID/message` 获取消息快照；持久事件主要用于有游标的增量恢复。日志优化器处理 current
+SSE envelope，保留事件身份、生命周期和统计，但不重复输出累积文本或工具结果。
 
 ### 会话级有序 ID 格式
 

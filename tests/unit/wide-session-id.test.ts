@@ -47,7 +47,7 @@ describe("session-scoped wide ordered IDs", () => {
     expect(userPart.id).toMatch(/^prt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
     expect(assistantPart.id).toMatch(/^prt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
 
-    const durable = new SessionEventStore(db, logger, sessions).append(parent.id, "session.next.prompted", {})
+    const durable = new SessionEventStore(db, logger, sessions).append(parent.id, "session.input.promoted", {})
     expect(durable.id).toMatch(/^evt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
 
     let liveEventId = ""
@@ -56,7 +56,14 @@ describe("session-scoped wide ordered IDs", () => {
       return sessionID ? sessions.getIdFormat(sessionID) : "legacy"
     })
     events.subscribeInternal((event) => (liveEventId = event.id))
-    events.publish(createEvent("message.updated", { sessionID: parent.id, info: assistant }))
+    events.publish(
+      createEvent("session.step.started", {
+        sessionID: parent.id,
+        assistantMessageID: assistant.id,
+        agent: "pi",
+        model: { id: "model", providerID: "provider" },
+      }),
+    )
     expect(liveEventId).toMatch(/^evt-[0-9a-f]{14}[0-9A-Za-z]{14}$/)
 
     const child = sessions.create({
