@@ -25,6 +25,7 @@ import {
   publishSessionCompactedLegacy,
   publishSessionErrorLegacy,
   publishSessionIdleLegacy,
+  publishSessionStatusLegacy,
 } from "../event/session-events-legacy.ts"
 import { eventIdForMessageId } from "../id/index.ts"
 
@@ -118,6 +119,7 @@ export class AgentService {
   private readonly pendingStarts = new Map<string, Set<ReturnType<typeof setTimeout>>>()
   private readonly pendingCompactions = new Map<string, PendingCompactionProjection>()
   private readonly startedAssistantSteps = new Set<string>()
+  private readonly recoveredAssistantSteps = new Set<string>()
   private readonly settledAssistantSteps = new Set<string>()
   private readonly startedContentParts = new Set<string>()
   private readonly endedContentParts = new Set<string>()
@@ -125,6 +127,7 @@ export class AgentService {
   private readonly calledTools = new Set<string>()
   private readonly settledTools = new Set<string>()
   private readonly activeExecutions = new Set<string>()
+  private suppressCurrentEventBroadcast = false
 
   constructor(
     registry: AgentAdapterRegistry,
@@ -189,13 +192,17 @@ export class AgentService {
           ) {
             return
           }
+          if (retargeted.type === "session_error" && retargeted.fatal !== false) {
+            this.projectManagedSubtaskError(retargeted)
+            return
+          }
           this.handleAgentEvent(retargeted, sessionId)
         },
         parentToolProgress: (partId, metadata) => this.projectToolProgress(partId, metadata),
         parentToolOutput: (partId, delta) => this.appendToolOutput(partId, delta),
         childSettled: (sessionId, messageIds, terminalMessageId, status, error) => {
           for (const messageId of messageIds) this.publishUnterminatedContent(messageId)
-          this.settleAssistantStep(terminalMessageId)
+          this.settleAssistantSteps(messageIds)
           this.settleExecution(
             sessionId,
             status === "completed"
@@ -636,7 +643,7 @@ export class AgentService {
         message: err instanceof Error ? err.message : String(err),
       })
       for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
-      this.settleAssistantStep(failed.terminalMessageId)
+      this.settleAssistantSteps(failed.messageIds)
       this.settleExecution(sessionId, "session.execution.failed", {
         error: { type: "unknown", message: err instanceof Error ? err.message : String(err) },
       })
@@ -685,7 +692,7 @@ export class AgentService {
         message: err instanceof Error ? err.message : String(err),
       })
       for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
-      this.settleAssistantStep(failed.terminalMessageId)
+      this.settleAssistantSteps(failed.messageIds)
       this.settleExecution(sessionId, "session.execution.failed", {
         error: { type: "unknown", message: err instanceof Error ? err.message : String(err) },
       })
@@ -1075,6 +1082,12 @@ export class AgentService {
     for (const session of orphanedSessions) {
       this.sessions.setStatus(session.id, "idle")
     }
+    this.suppressCurrentEventBroadcast = true
+    try {
+      for (const session of this.sessions.list()) this.recoverDurableLifecycle(session.id)
+    } finally {
+      this.suppressCurrentEventBroadcast = false
+    }
     const deniedPermissions = this.permissions.denyAllPending("Server restarted")
     if (openMessages > 0 || orphanedTools > 0 || orphanedSessions.length > 0 || deniedPermissions > 0) {
       this.logger.warn("Recovered orphaned runtime state on startup", {
@@ -1082,6 +1095,112 @@ export class AgentService {
         openTools: orphanedTools,
         busySessions: orphanedSessions.length,
         pendingPermissions: deniedPermissions,
+      })
+    }
+  }
+
+  private recoverDurableLifecycle(sessionId: string): void {
+    const events = this.sessionEvents.listByTypes(sessionId, [
+      "session.execution.started",
+      "session.execution.succeeded",
+      "session.execution.failed",
+      "session.execution.interrupted",
+      "session.step.started",
+      "session.step.ended",
+      "session.step.failed",
+      "session.text.started",
+      "session.text.ended",
+      "session.reasoning.started",
+      "session.reasoning.ended",
+      "session.tool.input.started",
+      "session.tool.called",
+      "session.tool.success",
+      "session.tool.failed",
+    ])
+    if (events.length === 0) return
+
+    const key = (data: Record<string, unknown>) => `${data.assistantMessageID ?? ""}:${data.callID ?? ""}`
+    const contentKey = (data: Record<string, unknown>, type: string) =>
+      `${type}:${data.assistantMessageID ?? ""}:${data.ordinal ?? ""}`
+    const terminalSteps = new Set(
+      events
+        .filter((event) => event.type === "session.step.ended" || event.type === "session.step.failed")
+        .map((event) => String(event.data.assistantMessageID ?? "")),
+    )
+    const startedSteps = new Set(
+      events
+        .filter((event) => event.type === "session.step.started")
+        .map((event) => String(event.data.assistantMessageID ?? "")),
+    )
+    const terminalTools = new Set(
+      events
+        .filter((event) => event.type === "session.tool.success" || event.type === "session.tool.failed")
+        .map((event) => key(event.data)),
+    )
+    const inputStartedTools = new Set(
+      events.filter((event) => event.type === "session.tool.input.started").map((event) => key(event.data)),
+    )
+    const calledTools = new Set(
+      events.filter((event) => event.type === "session.tool.called").map((event) => key(event.data)),
+    )
+    const startedContent = new Set(
+      events
+        .filter((event) => event.type === "session.text.started" || event.type === "session.reasoning.started")
+        .map((event) => contentKey(event.data, event.type.includes("text") ? "text" : "reasoning")),
+    )
+    const endedContent = new Set(
+      events
+        .filter((event) => event.type === "session.text.ended" || event.type === "session.reasoning.ended")
+        .map((event) => contentKey(event.data, event.type.includes("text") ? "text" : "reasoning")),
+    )
+
+    for (const item of this.messages.listMessages(sessionId)) {
+      if (item.info.role !== "assistant") continue
+      const ordinals = { text: 0, reasoning: 0 }
+      for (const part of item.parts) {
+        if (part.type === "text" || part.type === "reasoning") {
+          const ordinal = ordinals[part.type]++
+          const persistedKey = `${part.type}:${part.messageID}:${ordinal}`
+          if (startedContent.has(persistedKey)) this.startedContentParts.add(part.id)
+          if (endedContent.has(persistedKey)) this.endedContentParts.add(part.id)
+          if (startedContent.has(persistedKey) && !endedContent.has(persistedKey)) {
+            this.publishContentEnded(part, part.text)
+          }
+          continue
+        }
+        if (part.type !== "tool") continue
+        const persistedKey = `${part.messageID}:${part.callID}`
+        if (inputStartedTools.has(persistedKey)) this.startedToolInputs.add(part.id)
+        if (calledTools.has(persistedKey)) this.calledTools.add(part.id)
+        if (terminalTools.has(persistedKey)) this.settledTools.add(part.id)
+        if (
+          (inputStartedTools.has(persistedKey) || calledTools.has(persistedKey)) &&
+          !terminalTools.has(persistedKey)
+        ) {
+          this.projectToolTerminal(part.id)
+        }
+      }
+
+      if (startedSteps.has(item.info.id) && !terminalSteps.has(item.info.id)) {
+        this.startAssistantStep(item.info.id)
+        this.settleAssistantStep(item.info.id)
+      }
+    }
+
+    const lastExecutionStart = events.findLast((event) => event.type === "session.execution.started")
+    const lastExecutionTerminal = events.findLast(
+      (event) =>
+        event.type === "session.execution.succeeded" ||
+        event.type === "session.execution.failed" ||
+        event.type === "session.execution.interrupted",
+    )
+    if (
+      lastExecutionStart &&
+      (!lastExecutionTerminal || lastExecutionTerminal.durable.seq < lastExecutionStart.durable.seq)
+    ) {
+      this.publishCurrentSessionEvent(sessionId, "session.execution.interrupted", {
+        sessionID: sessionId,
+        reason: "shutdown",
       })
     }
   }
@@ -1107,8 +1226,10 @@ export class AgentService {
   private clearProjectionTracking(sessionId: string): void {
     for (const message of this.messages.listMessages(sessionId)) {
       this.startedAssistantSteps.delete(message.info.id)
+      this.recoveredAssistantSteps.delete(message.info.id)
       this.settledAssistantSteps.delete(message.info.id)
       for (const part of message.parts) {
+        this.streamedPartText.delete(part.id)
         this.startedContentParts.delete(part.id)
         this.endedContentParts.delete(part.id)
         this.startedToolInputs.delete(part.id)
@@ -1116,6 +1237,7 @@ export class AgentService {
         this.settledTools.delete(part.id)
       }
     }
+    this.partIdMap.delete(sessionId)
     this.activeExecutions.delete(sessionId)
   }
 
@@ -1138,17 +1260,19 @@ export class AgentService {
       session ? { directory: session.directory } : undefined,
       options,
     )
-    this.events.publish(
-      {
-        id: event.id,
-        created: event.created,
-        type: event.type,
-        metadata: event.metadata,
-        durable: event.durable,
-        properties: event.data,
-      },
-      session?.directory,
-    )
+    if (!this.suppressCurrentEventBroadcast) {
+      this.events.publish(
+        {
+          id: event.id,
+          created: event.created,
+          type: event.type,
+          metadata: event.metadata,
+          durable: event.durable,
+          properties: event.data,
+        },
+        session?.directory,
+      )
+    }
     return event
   }
 
@@ -1189,18 +1313,39 @@ export class AgentService {
   startAssistantStep(messageId: string): void {
     if (this.startedAssistantSteps.has(messageId)) return
     const message = this.requireAssistantMessage(messageId)
+    const eventId = eventIdForMessageId(message.id)
+    const existing = this.sessionEvents.getById(eventId)
+    if (existing) {
+      if (
+        existing.durable.aggregateID !== message.sessionID ||
+        existing.type !== "session.step.started" ||
+        existing.data.assistantMessageID !== message.id
+      ) {
+        throw new Error(
+          `Session event ID '${eventId}' is already used by '${existing.type}' in session '${existing.durable.aggregateID}'`,
+        )
+      }
+      this.startedAssistantSteps.add(messageId)
+      this.recoveredAssistantSteps.add(messageId)
+      return
+    }
     this.startedAssistantSteps.add(messageId)
-    this.publishCurrentSessionEvent(
-      message.sessionID,
-      "session.step.started",
-      {
-        sessionID: message.sessionID,
-        assistantMessageID: message.id,
-        agent: message.agent,
-        model: { id: message.modelID, providerID: message.providerID },
-      },
-      { id: eventIdForMessageId(message.id), created: message.time.created },
-    )
+    try {
+      this.publishCurrentSessionEvent(
+        message.sessionID,
+        "session.step.started",
+        {
+          sessionID: message.sessionID,
+          assistantMessageID: message.id,
+          agent: message.agent,
+          model: { id: message.modelID, providerID: message.providerID },
+        },
+        { id: eventId, created: message.time.created },
+      )
+    } catch (error) {
+      this.startedAssistantSteps.delete(messageId)
+      throw error
+    }
   }
 
   startExecution(sessionId: string): void {
@@ -1215,7 +1360,11 @@ export class AgentService {
     data: Record<string, unknown> = {},
   ): void {
     if (!this.activeExecutions.delete(sessionId)) return
-    this.publishCurrentSessionEvent(sessionId, type, { sessionID: sessionId, ...data })
+    this.publishCurrentSessionEvent(sessionId, type, {
+      sessionID: sessionId,
+      ...(type === "session.execution.interrupted" && !("reason" in data) ? { reason: "user" } : {}),
+      ...data,
+    })
   }
 
   settleAssistantMessage(messageId: string): void {
@@ -1424,6 +1573,15 @@ export class AgentService {
     if (this.settledAssistantSteps.has(messageId)) return
     const message = this.requireAssistantMessage(messageId)
     this.startAssistantStep(messageId)
+    if (this.recoveredAssistantSteps.has(messageId)) {
+      const existing = this.sessionEvents
+        .listByTypes(message.sessionID, ["session.step.ended", "session.step.failed"])
+        .find((event) => event.data.assistantMessageID === message.id)
+      if (existing) {
+        this.settledAssistantSteps.add(messageId)
+        return
+      }
+    }
     this.publishUnterminatedContent(messageId)
     this.settledAssistantSteps.add(messageId)
     if (message.error) {
@@ -1447,12 +1605,32 @@ export class AgentService {
       {
         sessionID: message.sessionID,
         assistantMessageID: message.id,
-        finish: message.finish ?? "unknown",
+        finish: normalizeStepFinish(message.finish),
         cost: message.cost,
         tokens: message.tokens,
       },
       { created: message.time.completed ?? Date.now() },
     )
+  }
+
+  private settleAssistantSteps(messageIds: readonly string[]): void {
+    for (const messageId of messageIds) this.settleAssistantStep(messageId)
+  }
+
+  private projectManagedSubtaskError(event: Extract<AgentRuntimeEvent, { type: "session_error" }>): void {
+    if (!event.messageId) return
+    this.flushProjectedMessageParts(event.messageId)
+    const failed = this.assistantParts.fail(event.messageId, event.error, event.usage)
+    for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
+    this.settleAssistantSteps(failed.messageIds)
+    this.settleExecution(event.sessionId, "session.execution.failed", {
+      error: { type: "unknown", message: event.error.message },
+    })
+    publishSessionErrorLegacy(this.events, {
+      sessionID: event.sessionId,
+      messageID: failed.terminalMessageId,
+      error: { name: "UnknownError", data: { message: event.error.message } },
+    })
   }
 
   private startCompactionProjection(
@@ -1703,9 +1881,9 @@ export class AgentService {
       // lifecycle owned by the enclosing task. The matching parent
       // tool_call_error will settle the mirrored child and release the group.
       this.flushProjectedMessageParts(run.childAssistantMessageId)
-      const failed = this.assistantParts.fail(run.childAssistantMessageId, childEvent.error)
+      const failed = this.assistantParts.fail(run.childAssistantMessageId, childEvent.error, childEvent.usage)
       for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
-      this.settleAssistantStep(failed.terminalMessageId)
+      this.settleAssistantSteps(failed.messageIds)
       this.settleExecution(run.childSessionId, "session.execution.failed", {
         error: { type: "unknown", message: childEvent.error.message },
       })
@@ -1795,7 +1973,7 @@ export class AgentService {
     }
 
     for (const messageId of projected.messageIds) this.publishUnterminatedContent(messageId)
-    this.settleAssistantStep(projected.terminalMessageId)
+    this.settleAssistantSteps(projected.messageIds)
     this.settleExecution(
       run.childSessionId,
       status === "completed"
@@ -2392,6 +2570,10 @@ export class AgentService {
 
         case "session_busy": {
           this.sessions.setStatus(sessionId, "busy")
+          // A retry resumes inside the same execution, so startExecution() is
+          // intentionally idempotent and cannot clear Desktop's retry status.
+          // Publish the compatible status transition explicitly.
+          publishSessionStatusLegacy(this.events, sessionId, { type: "busy" })
           this.startExecution(sessionId)
           break
         }
@@ -2399,6 +2581,12 @@ export class AgentService {
         case "session_retry": {
           this.sessions.setStatus(sessionId, "busy")
           this.startExecution(sessionId)
+          publishSessionStatusLegacy(this.events, sessionId, {
+            type: "retry",
+            attempt: event.attempt,
+            message: event.message,
+            next: event.next,
+          })
           const assistantMessageID = this.activeAssistantMessageId(sessionId)
           if (assistantMessageID) {
             this.publishCurrentSessionEvent(sessionId, "session.retry.scheduled", {
@@ -2428,7 +2616,10 @@ export class AgentService {
             break
           }
           this.sessions.setStatus(sessionId, "idle")
-          this.settleExecution(sessionId, "session.execution.succeeded")
+          this.settleExecution(
+            sessionId,
+            this.abortedSessions.has(sessionId) ? "session.execution.interrupted" : "session.execution.succeeded",
+          )
           publishSessionIdleLegacy(this.events, sessionId)
           this.releaseSessionProjection(sessionId)
           break
@@ -2449,8 +2640,14 @@ export class AgentService {
             })
             break
           }
+          // A session error terminates the model turn, not the Runtime. Pi still
+          // owns the following agent_settled boundary; stopping it here rejects
+          // the otherwise completed prompt and replaces the provider error with
+          // "Runtime stopped before the current prompt settled". Only a
+          // runtime_fault invalidates the pooled process.
           if (!event.messageId) {
             this.sessions.setStatus(sessionId, "idle")
+            publishSessionStatusLegacy(this.events, sessionId, { type: "idle" })
             publishSessionErrorLegacy(this.events, {
               sessionID: sessionId,
               error: {
@@ -2461,14 +2658,14 @@ export class AgentService {
             this.settleExecution(sessionId, "session.execution.failed", {
               error: { type: "unknown", message: event.error.message },
             })
-            void this.invalidateRuntime(sessionId, runtime, agentId, "session_error")
             break
           }
           this.flushProjectedMessageParts(event.messageId)
-          const failed = this.assistantParts.fail(event.messageId, event.error)
+          const failed = this.assistantParts.fail(event.messageId, event.error, event.usage)
           this.sessions.setStatus(sessionId, "idle")
+          publishSessionStatusLegacy(this.events, sessionId, { type: "idle" })
           for (const messageId of failed.messageIds) this.publishUnterminatedContent(messageId)
-          this.settleAssistantStep(failed.terminalMessageId)
+          this.settleAssistantSteps(failed.messageIds)
           publishSessionErrorLegacy(this.events, {
             sessionID: sessionId,
             messageID: failed.terminalMessageId,
@@ -2481,7 +2678,6 @@ export class AgentService {
             error: { type: "unknown", message: event.error.message },
           })
           this.releaseSessionProjection(sessionId)
-          void this.invalidateRuntime(sessionId, runtime, agentId, "session_error")
           break
         }
 
@@ -2513,7 +2709,7 @@ export class AgentService {
           this.flushProjectedMessageParts(event.messageId)
           const completed = this.assistantParts.complete(event.messageId, event.finish ?? "stop", event.usage)
           for (const messageId of completed.messageIds) this.publishUnterminatedContent(messageId)
-          this.settleAssistantStep(completed.terminalMessageId)
+          this.settleAssistantSteps(completed.messageIds)
           break
         }
 
@@ -2554,7 +2750,7 @@ export class AgentService {
           message: error instanceof Error ? error.message : String(error),
         })
         for (const failedMessageId of failed.messageIds) this.publishUnterminatedContent(failedMessageId)
-        this.settleAssistantStep(failed.terminalMessageId)
+        this.settleAssistantSteps(failed.messageIds)
       }
       this.sessions.setStatus(sessionId, "idle")
       publishSessionErrorLegacy(this.events, {
@@ -2581,5 +2777,26 @@ export class AgentService {
         error: recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
       })
     }
+  }
+}
+
+function normalizeStepFinish(
+  finish: string | undefined,
+): "stop" | "length" | "tool-calls" | "content-filter" | "error" | "unknown" {
+  switch (finish) {
+    case "stop":
+    case "length":
+    case "tool-calls":
+    case "content-filter":
+    case "error":
+      return finish
+    case "end_turn":
+      return "stop"
+    case "tool_use":
+      return "tool-calls"
+    case "content_filter":
+      return "content-filter"
+    default:
+      return "unknown"
   }
 }

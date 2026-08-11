@@ -308,11 +308,13 @@ export class SessionService {
   }
 
   async commitRevert(sessionID: string): Promise<void> {
-    this.requireSession(sessionID)
+    const target = this.requireSession(sessionID).revert?.messageID
     try {
       await this.agentService.commitRevert(sessionID)
+      if (!target) return
       this.publishCurrentSessionEvent(sessionID, "session.revert.committed", {
         sessionID,
+        to: target,
       })
     } catch (error) {
       throw this.conversationError(error)
@@ -352,11 +354,7 @@ export class SessionService {
     if (!this.agentService.hasAgent(agent)) {
       throw new SessionServiceError("invalid_request", `Agent not found: ${agent}`)
     }
-    try {
-      await this.agentService.commitRevert(sessionID)
-    } catch (error) {
-      throw this.conversationError(error)
-    }
+    await this.commitRevert(sessionID)
     if (agent !== session.agent) session = this.update(sessionID, { agent })
 
     const isFirstUserMessage = !this.messages.listMessages(sessionID).some((message) => message.info.role === "user")

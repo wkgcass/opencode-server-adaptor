@@ -132,6 +132,15 @@ export type AgentRuntimeEvent =
       sessionId: string
       messageId?: string
       error: { type: string; message: string }
+      usage?: {
+        cost?: number
+        input?: number
+        output?: number
+        reasoning?: number
+        cacheRead?: number
+        cacheWrite?: number
+        total?: number
+      }
       /** Non-fatal backend diagnostics are published without terminating the current message or Runtime. */
       fatal?: boolean
     }

@@ -353,6 +353,16 @@ async function handleCommand(cmd: RpcCommand): Promise<void> {
         details: { customInstructions: cmd.customInstructions },
       }
       sendEvent({ type: "compaction_start", reason: "manual" })
+      if (cmd.customInstructions === "__compact_retry__" || persistedPrompts.at(-1)?.includes("__compact_retry__")) {
+        sendEvent({
+          type: "summarization_retry_scheduled",
+          attempt: 2,
+          maxAttempts: 3,
+          delayMs: 5,
+          errorMessage: "temporary compact provider failure",
+        })
+        sendEvent({ type: "summarization_retry_attempt_start", attempt: 2, maxAttempts: 3 })
+      }
       if (cmd.customInstructions === "__slow_compact__") {
         await Bun.sleep(350)
         sendEvent({ type: "compaction_end", reason: "manual", result, aborted: false, willRetry: false })
@@ -406,6 +416,7 @@ async function simulatePrompt(text: string): Promise<void> {
   const delayedIdleWithoutSettled = text.includes("__delayed_idle_without_settled__")
   const toolSnapshotsOnly = text.includes("__tool_snapshots_only__")
   const retryOnce = text.includes("__retry_once__")
+  const providerError = text.includes("__provider_error__")
   const wantsModelSubtask = text.includes("__model_subtask__")
   const wantsAutoCompact = text.includes("__auto_compact__")
 
@@ -493,6 +504,39 @@ async function simulatePrompt(text: string): Promise<void> {
     await Bun.sleep(10)
     sendEvent({ type: "agent_start" })
     sendEvent({ type: "turn_start" })
+  }
+
+  if (providerError) {
+    sendEvent({
+      type: "auto_retry_start",
+      attempt: 3,
+      maxAttempts: 3,
+      delayMs: 10,
+      errorMessage: "Connection error.",
+    })
+    await Bun.sleep(10)
+    sendEvent({ type: "agent_start" })
+    sendEvent({ type: "turn_start" })
+    const failed = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: "Connection error.",
+      timestamp: Date.now(),
+    }
+    sendEvent({ type: "message_start", message: { role: "assistant", content: [], timestamp: Date.now() } })
+    sendEvent({
+      type: "message_update",
+      message: failed,
+      assistantMessageEvent: { type: "error", reason: "error", error: failed },
+    })
+    sendEvent({ type: "message_end", message: failed })
+    sendEvent({ type: "turn_end", message: failed, toolResults: [] })
+    sendEvent({ type: "agent_end", messages: [failed], willRetry: false })
+    await Bun.sleep(75)
+    sendEvent({ type: "auto_retry_end", success: false, attempt: 3, finalError: failed.errorMessage })
+    sendEvent({ type: "agent_settled" })
+    return
   }
 
   // Assistant message

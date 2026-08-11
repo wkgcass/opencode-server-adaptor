@@ -472,6 +472,28 @@ export class PiRpcRuntime implements AgentRuntime {
   }
 
   private handlePiEvent(event: PiEvent): void {
+    if (event.type === "summarization_retry_scheduled") {
+      const attempt = typeof event.attempt === "number" ? Math.max(0, Math.floor(event.attempt)) : 0
+      const delayMs = typeof event.delayMs === "number" ? Math.max(0, event.delayMs) : 0
+      const delivered = this.emit({
+        type: "session_retry",
+        sessionId: this.context.sessionId,
+        attempt,
+        message: typeof event.errorMessage === "string" ? event.errorMessage : "Pi compaction request failed",
+        next: Date.now() + delayMs,
+      })
+      if (!delivered) {
+        this.warnUnprojectedPiEvent(event, "runtime_delivery", "Pi Runtime has no accepting event subscriber")
+      }
+      return
+    }
+    if (event.type === "summarization_retry_attempt_start") {
+      const delivered = this.emit({ type: "session_busy", sessionId: this.context.sessionId })
+      if (!delivered) {
+        this.warnUnprojectedPiEvent(event, "runtime_delivery", "Pi Runtime has no accepting event subscriber")
+      }
+      return
+    }
     if (event.type === "compaction_start") {
       this.compactionEventsSeen++
       const backendReason = typeof event.reason === "string" ? event.reason : "manual"
@@ -593,7 +615,13 @@ export class PiRpcRuntime implements AgentRuntime {
       this.failRuntime(new Error(`Failed to map Pi event '${event.type}': ${cause.message}`), "event_mapping_failed")
       return
     }
-    if (events.some((mapped) => mapped.type === "message_completed")) {
+    if (
+      events.some(
+        (mapped) =>
+          mapped.type === "message_completed" ||
+          (mapped.type === "session_error" && mapped.fatal !== false && Boolean(mapped.messageId)),
+      )
+    ) {
       this.currentPromptCompleted = true
     }
 

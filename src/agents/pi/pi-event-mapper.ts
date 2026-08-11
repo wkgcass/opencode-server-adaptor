@@ -284,7 +284,11 @@ export class PiToOpenCodeEventMapper {
     toolCall.terminal = true
     const output = toolResultText(result)
     toolCall.output = output
-    toolCall.metadata = buildFileDiffMetadata(toolCall.tool, toolCall.input, result?.details as Record<string, unknown> | undefined)
+    toolCall.metadata = buildFileDiffMetadata(
+      toolCall.tool,
+      toolCall.input,
+      result?.details as Record<string, unknown> | undefined,
+    )
 
     if (isError || result?.isError) {
       ensured.events.push({
@@ -816,34 +820,33 @@ export class PiToOpenCodeEventMapper {
               }
             : undefined
         this.pendingAssistantError = undefined
+        const mappedUsage = usage
+          ? {
+              cost: usage.cost?.total,
+              input: usage.input,
+              output: usage.output,
+              cacheRead: usage.cacheRead,
+              cacheWrite: usage.cacheWrite,
+              total: usage.totalTokens,
+            }
+          : undefined
         return [
           ...this.finalizeOpenToolCalls(),
-          {
-            type: "message_completed",
-            sessionId: ctx.sessionId,
-            messageId: ctx.assistantMessageId,
-            finish,
-            usage: usage
-              ? {
-                  cost: usage.cost?.total,
-                  input: usage.input,
-                  output: usage.output,
-                  cacheRead: usage.cacheRead,
-                  cacheWrite: usage.cacheWrite,
-                  total: usage.totalTokens,
-                }
-              : undefined,
-          },
-          ...(finalError
-            ? [
-                {
-                  type: "session_error" as const,
-                  sessionId: ctx.sessionId,
-                  messageId: ctx.assistantMessageId,
-                  error: finalError,
-                },
-              ]
-            : []),
+          finalError
+            ? {
+                type: "session_error" as const,
+                sessionId: ctx.sessionId,
+                messageId: ctx.assistantMessageId,
+                error: finalError,
+                usage: mappedUsage,
+              }
+            : {
+                type: "message_completed" as const,
+                sessionId: ctx.sessionId,
+                messageId: ctx.assistantMessageId,
+                finish,
+                usage: mappedUsage,
+              },
         ]
       }
 

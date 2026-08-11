@@ -347,6 +347,85 @@ describe("Fake Pi Integration", () => {
     )
   }, 15000)
 
+  test("preserves a terminal provider error while waiting for Pi agent_settled", async () => {
+    const headers = { Authorization: authHeader, "Content-Type": "application/json" }
+    const controller = new AbortController()
+    const eventRes = await fetch(`${baseUrl}/global/event`, {
+      headers: { Authorization: authHeader },
+      signal: controller.signal,
+    })
+    const reader = eventRes.body!.getReader()
+    await waitForSseEvent(reader, (event) => event.payload?.type === "server.connected")
+    const createRes = await fetch(`${baseUrl}/session`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ title: "Provider failure settlement", agent: "pi" }),
+    })
+    const session = (await createRes.json()) as { id: string }
+
+    try {
+      const response = await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ parts: [{ type: "text", text: "__provider_error__" }] }),
+      })
+      expect(response.status).toBe(204)
+
+      await waitForSseEvent(
+        reader,
+        (event) =>
+          event.payload?.type === "session.retry.scheduled" &&
+          event.payload?.properties?.sessionID === session.id &&
+          event.payload?.properties?.attempt === 3,
+      )
+      const resumed = await waitForSseEvent(
+        reader,
+        (event) =>
+          event.payload?.type === "session.status" &&
+          event.payload?.properties?.sessionID === session.id &&
+          event.payload?.properties?.status?.type === "busy",
+      )
+      expect(resumed.payload.properties.status).toEqual({ type: "busy" })
+
+      const settled = await waitForSseEvent(
+        reader,
+        (event) =>
+          event.payload?.type === "session.status" &&
+          event.payload?.properties?.sessionID === session.id &&
+          event.payload?.properties?.status?.type === "idle",
+      )
+      expect(settled.payload.properties.status).toEqual({ type: "idle" })
+
+      await waitForSessionIdle(baseUrl, authHeader, session.id)
+      await Bun.sleep(200)
+
+      const historyRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
+        headers: { Authorization: authHeader },
+      })
+      const history = (await historyRes.json()) as Array<{
+        info: { role: string; error?: { data?: { message?: string } } }
+      }>
+      const assistant = history.find((message) => message.info.role === "assistant")
+
+      expect(assistant?.info.error?.data?.message).toBe("Connection error.")
+      expect(assistant?.info.error?.data?.message).not.toContain("Runtime stopped before the current prompt settled")
+
+      const durableRes = await fetch(`${baseUrl}/api/session/${session.id}/history?after=0&limit=100`, {
+        headers: { Authorization: authHeader },
+      })
+      const durable = (await durableRes.json()) as {
+        data: Array<{ type: string; data: { assistantMessageID?: string } }>
+      }
+      const stepTerminals = durable.data.filter(
+        (event) => event.type === "session.step.ended" || event.type === "session.step.failed",
+      )
+      expect(stepTerminals.map((event) => event.type)).toEqual(["session.step.failed"])
+    } finally {
+      await reader.cancel()
+      controller.abort()
+    }
+  }, 15000)
+
   test("reverts only Pi conversation context, supports unrevert, and commits on the next prompt", async () => {
     const headers = { Authorization: authHeader, "Content-Type": "application/json" }
     const createRes = await fetch(`${baseUrl}/session`, {
@@ -432,6 +511,15 @@ describe("Fake Pi Integration", () => {
       .map((part) => part.text)
       .join("\n")
     expect(assistantText).toContain('Restored previous prompt: "first-context"')
+
+    const durableRes = await fetch(`${baseUrl}/api/session/${session.id}/history?after=0&limit=100`, {
+      headers: { Authorization: authHeader },
+    })
+    const durable = (await durableRes.json()) as { data: Array<{ type: string; data: Record<string, unknown> }> }
+    expect(durable.data.findLast((event) => event.type === "session.revert.committed")?.data).toMatchObject({
+      sessionID: session.id,
+      to: secondUserId,
+    })
   }, 30000)
 
   test("client-initiated compaction persists and publishes the Desktop projection", async () => {
@@ -507,6 +595,50 @@ describe("Fake Pi Integration", () => {
         ],
         finish: "stop",
       })
+    } finally {
+      await reader.cancel()
+      controller.abort()
+    }
+  }, 15000)
+
+  test("manual compaction retries publish a session retry status without an active assistant message", async () => {
+    const headers = { Authorization: authHeader, "Content-Type": "application/json" }
+    const createRes = await fetch(`${baseUrl}/session`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ title: "Compact retry", agent: "pi" }),
+    })
+    const session = (await createRes.json()) as { id: string }
+    await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ parts: [{ type: "text", text: "__compact_retry__" }] }),
+    })
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
+    const controller = new AbortController()
+    const eventRes = await fetch(`${baseUrl}/api/event`, { headers, signal: controller.signal })
+    const reader = eventRes.body!.getReader()
+    await waitForSseEvent(reader, (event) => event.type === "server.connected")
+
+    try {
+      const compactPromise = fetch(`${baseUrl}/session/${session.id}/summarize`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ providerID: "pi", modelID: "default" }),
+      })
+      const retry = await waitForSseEvent(
+        reader,
+        (event) =>
+          event.type === "session.status" &&
+          event.data?.sessionID === session.id &&
+          event.data?.status?.type === "retry",
+      )
+      expect(retry.data.status).toMatchObject({
+        type: "retry",
+        attempt: 2,
+        message: "temporary compact provider failure",
+      })
+      expect((await compactPromise).ok).toBe(true)
     } finally {
       await reader.cancel()
       controller.abort()
@@ -733,6 +865,15 @@ describe("Fake Pi Integration", () => {
         error: { message: "HTTP 500: temporary provider failure" },
       })
 
+      const resumed = await waitForSseEvent(
+        reader,
+        (event) =>
+          event.payload?.type === "session.status" &&
+          event.payload?.properties?.sessionID === session.id &&
+          event.payload?.properties?.status?.type === "busy",
+      )
+      expect(resumed.payload.properties.status).toEqual({ type: "busy" })
+
       const liveTextEvent = await waitForSseEvent(reader, (event) => {
         if (event.payload?.type === "session.error" && event.payload?.properties?.sessionID === session.id) {
           sawTerminalError = true
@@ -903,6 +1044,37 @@ describe("Fake Pi Integration", () => {
       await reader.cancel()
       controller.abort()
     }
+  }, 15000)
+
+  test("settles every sibling assistant step exactly once", async () => {
+    const headers = { Authorization: authHeader, "Content-Type": "application/json" }
+    const createRes = await fetch(`${baseUrl}/session`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ title: "Sibling lifecycle", agent: "pi" }),
+    })
+    const session = (await createRes.json()) as { id: string }
+    await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ parts: [{ type: "text", text: "reasoning response" }] }),
+    })
+    await waitForSessionIdle(baseUrl, authHeader, session.id)
+
+    const response = await fetch(`${baseUrl}/api/session/${session.id}/history?after=0&limit=100`, { headers })
+    const history = (await response.json()) as {
+      data: Array<{ type: string; data: { assistantMessageID?: string; finish?: string } }>
+    }
+    const started = history.data
+      .filter((event) => event.type === "session.step.started")
+      .map((event) => event.data.assistantMessageID)
+    const terminal = history.data.filter(
+      (event) => event.type === "session.step.ended" || event.type === "session.step.failed",
+    )
+    expect(started.length).toBeGreaterThan(1)
+    expect(terminal.map((event) => event.data.assistantMessageID)).toEqual(started)
+    expect(new Set(terminal.map((event) => event.data.assistantMessageID)).size).toBe(terminal.length)
+    expect(terminal.every((event) => ["stop", "unknown"].includes(event.data.finish ?? "unknown"))).toBe(true)
   }, 15000)
 
   test("generates a title for the first message in a new Pi session", async () => {
@@ -1092,7 +1264,12 @@ describe("Fake Pi Integration", () => {
       expect(toolProgress.some((progress) => progress.output === "hel")).toBe(true)
       expect(toolProgress.some((progress) => progress.partialOutput === "hel")).toBe(true)
       expect(terminalOutput).toBe("hello")
-      expect(lifecycle).toEqual(["session.tool.success", "session.step.ended", "session.execution.succeeded"])
+      expect(lifecycle).toEqual([
+        "session.tool.success",
+        "session.step.ended",
+        "session.step.ended",
+        "session.execution.succeeded",
+      ])
 
       // The v2 REST message projection must also carry tool metadata inside
       // `state.metadata` (not only at the top level) so the Desktop's v2
@@ -1456,7 +1633,7 @@ describe("Fake Pi Integration", () => {
     await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
       method: "POST",
       headers: { Authorization: authHeader, "Content-Type": "application/json" },
-      body: JSON.stringify({ parts: [{ type: "text", text: "abort me" }] }),
+      body: JSON.stringify({ parts: [{ type: "text", text: "abort me __slow_response__" }] }),
     })
 
     await Bun.sleep(100)
@@ -1474,5 +1651,22 @@ describe("Fake Pi Integration", () => {
     })
     const updated = (await getRes.json()) as { status: string }
     expect(updated.status).toBe("idle")
+
+    const historyRes = await fetch(`${baseUrl}/api/session/${session.id}/history?after=0&limit=100`, {
+      headers: { Authorization: authHeader },
+    })
+    const history = (await historyRes.json()) as {
+      data: Array<{ type: string; data: { reason?: string; finish?: string } }>
+    }
+    expect(history.data.findLast((event) => event.type === "session.execution.interrupted")?.data.reason).toBe("user")
+    expect(
+      history.data
+        .filter((event) => event.type === "session.step.ended")
+        .every((event) =>
+          ["stop", "length", "tool-calls", "content-filter", "error", "unknown"].includes(
+            event.data.finish ?? "unknown",
+          ),
+        ),
+    ).toBe(true)
   }, 15000)
 })

@@ -7,7 +7,17 @@ import { createEvent, type EventBus } from "./index.ts"
  */
 
 export function publishSessionIdleLegacy(events: EventBus, sessionID: string, directory?: string): void {
+  publishSessionStatusLegacy(events, sessionID, { type: "idle" }, directory)
   events.publish(createEvent("session.idle", { sessionID }), directory)
+}
+
+export function publishSessionStatusLegacy(
+  events: EventBus,
+  sessionID: string,
+  status: { type: "busy" | "idle" } | { type: "retry"; attempt: number; message: string; next: number },
+  directory?: string,
+): void {
+  events.publish(createEvent("session.status", { sessionID, status }), directory)
 }
 
 export function publishSessionErrorLegacy(

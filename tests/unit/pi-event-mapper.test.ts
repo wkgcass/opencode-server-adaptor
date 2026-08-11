@@ -250,12 +250,12 @@ describe("PiToOpenCodeEventMapper terminal reconciliation", () => {
     })
 
     expect(events).toMatchObject([
-      { type: "message_completed", finish: "error" },
       {
         type: "session_error",
         error: { type: "pi_error", message: "HTTP 500: exhausted" },
       },
     ])
+    expect(events.some((event) => event.type === "message_completed")).toBe(false)
   })
 
   test("maps Pi summarization retries onto the OpenCode retry status", () => {
@@ -359,15 +359,7 @@ describe("PiToOpenCodeEventMapper terminal reconciliation", () => {
       toolName: "edit",
       args: { path: "src/foo.ts" },
     })
-    const patch = [
-      "--- src/foo.ts",
-      "+++ src/foo.ts",
-      "@@ -1,2 +1,2 @@",
-      " line1",
-      "-old",
-      "+new",
-      " line2",
-    ].join("\n")
+    const patch = ["--- src/foo.ts", "+++ src/foo.ts", "@@ -1,2 +1,2 @@", " line1", "-old", "+new", " line2"].join("\n")
     const completed = mapper.map({
       type: "tool_execution_end",
       toolCallId: "call_edit",

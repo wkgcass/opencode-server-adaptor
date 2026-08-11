@@ -75,6 +75,20 @@ export class SessionEventStore {
     }
   }
 
+  getById(id: string): SessionDurableEvent | null {
+    const row = this.db.prepare("SELECT * FROM session_events WHERE id = ?").get(id) as SessionEventRow | null
+    return row ? rowToEvent(row) : null
+  }
+
+  listByTypes(sessionID: string, types: readonly string[]): SessionDurableEvent[] {
+    if (types.length === 0) return []
+    const placeholders = types.map(() => "?").join(", ")
+    const rows = this.db
+      .prepare(`SELECT * FROM session_events WHERE session_id = ? AND type IN (${placeholders}) ORDER BY seq ASC`)
+      .all(sessionID, ...types) as SessionEventRow[]
+    return rows.map(rowToEvent)
+  }
+
   subscribe(sessionID: string, listener: Listener): () => void {
     const listeners = this.listeners.get(sessionID) ?? new Set<Listener>()
     listeners.add(listener)

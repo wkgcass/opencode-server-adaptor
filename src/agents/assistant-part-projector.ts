@@ -98,9 +98,11 @@ export class AssistantPartProjector {
   fail(
     messageId: string,
     error: { type?: string; name?: string; message: string },
+    usage?: Parameters<MessageRepository["updateMessageUsage"]>[1],
   ): { messageIds: string[]; terminalMessageId: string } {
     const messageIds = this.messageIds(messageId)
     const terminalMessageId = this.terminalMessageId(messageId)
+    if (usage) this.messages.updateMessageUsage(terminalMessageId, usage)
     for (const id of messageIds) {
       if (id === terminalMessageId) this.messages.setMessageError(id, error)
       else this.messages.completeMessage(id)
