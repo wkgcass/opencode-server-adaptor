@@ -1,20 +1,18 @@
 import { Hono } from "hono"
-import type { AgentService } from "../../agents/agent-service.ts"
-import type { EventBus } from "../../event/index.ts"
-import { createEvent } from "../../event/index.ts"
-import type { Permission, PermissionRepository } from "../../permission/index.ts"
-import { projectIDForDirectory } from "../../project/index.ts"
 import type { SessionService } from "../../session/session-service.ts"
+import { projectIDForDirectory } from "../../project/index.ts"
 import { requestDirectory } from "../request-directory.ts"
 
 export interface V2PermissionRoutesOptions {
   sessions: SessionService
-  permissions: PermissionRepository
-  agentService: AgentService
-  events: EventBus
 }
 
-/** Routes for the complete v2 permission lifecycle. */
+/**
+ * OpenCode Desktop always bootstraps the permission endpoints, even when the
+ * connected backend has no interactive permission lifecycle. Keep these
+ * stateless responses so discovery succeeds without retaining permission
+ * requests or decisions in the adaptor.
+ */
 export function createV2PermissionRoutes(options: V2PermissionRoutesOptions): Hono {
   const app = new Hono()
   const location = (c: {
@@ -24,14 +22,7 @@ export function createV2PermissionRoutes(options: V2PermissionRoutesOptions): Ho
     return { directory, project: { id: projectIDForDirectory(directory), directory } }
   }
 
-  app.get("/api/permission/request", (c) => {
-    const current = requestDirectory(c.req)
-    return c.json({
-      location: location(c),
-      data: options.permissions.listPendingByDirectory(current).map(toV2Permission),
-    })
-  })
-
+  app.get("/api/permission/request", (c) => c.json({ location: location(c), data: [] }))
   app.get("/api/permission/saved", (c) => c.json({ data: [] }))
   app.delete("/api/permission/saved/:id", (c) => c.body(null, 204))
 
@@ -39,55 +30,20 @@ export function createV2PermissionRoutes(options: V2PermissionRoutesOptions): Ho
     const sessionID = c.req.param("sessionID")
     try {
       options.sessions.requireSession(sessionID)
-      return c.json({ data: options.permissions.listPendingBySession(sessionID).map(toV2Permission) })
+      return c.json({ data: [] })
     } catch {
       return sessionNotFound(c, sessionID)
     }
   })
 
-  app.post("/api/session/:sessionID/permission", async (c) => {
+  app.post("/api/session/:sessionID/permission", (c) => {
     const sessionID = c.req.param("sessionID")
     try {
       options.sessions.requireSession(sessionID)
     } catch {
       return sessionNotFound(c, sessionID)
     }
-    const body = await c.req.json<Record<string, unknown>>().catch(() => null)
-    if (
-      !body ||
-      typeof body.action !== "string" ||
-      !Array.isArray(body.resources) ||
-      !body.resources.every((resource) => typeof resource === "string")
-    ) {
-      return c.json({ _tag: "InvalidRequestError", message: "action and string resources are required" }, 400)
-    }
-    const id =
-      typeof body.id === "string" && body.id.trim() ? body.id : `per_${crypto.randomUUID().replaceAll("-", "")}`
-    const metadata =
-      typeof body.metadata === "object" && body.metadata ? (body.metadata as Record<string, unknown>) : {}
-    const input = {
-      ...metadata,
-      resources: body.resources,
-      save: Array.isArray(body.save) ? body.save : undefined,
-      source: body.source,
-      agent: body.agent,
-    }
-    try {
-      options.permissions.create({ id, sessionId: sessionID, tool: body.action, input })
-    } catch {
-      return c.json({ _tag: "InvalidRequestError", message: `Permission already exists: ${id}` }, 400)
-    }
-    options.events.publish(
-      createEvent("permission.asked", {
-        id,
-        sessionID,
-        permission: body.action,
-        patterns: body.resources,
-        metadata: input,
-        always: Array.isArray(body.save) ? body.save : [],
-      }),
-    )
-    return c.json({ data: { id, effect: "ask" as const } })
+    return c.json({ _tag: "InvalidRequestError", message: "Interactive permissions are not supported" }, 400)
   })
 
   app.get("/api/session/:sessionID/permission/:requestID", (c) => {
@@ -97,58 +53,20 @@ export function createV2PermissionRoutes(options: V2PermissionRoutesOptions): Ho
     } catch {
       return sessionNotFound(c, sessionID)
     }
-    const row = options.permissions.getPending(sessionID, c.req.param("requestID"))
-    if (!row) return permissionNotFound(c, sessionID, c.req.param("requestID"))
-    return c.json({ data: toV2Permission(row) })
+    return permissionNotFound(c, sessionID, c.req.param("requestID"))
   })
 
-  app.post("/api/session/:sessionID/permission/:requestID/reply", async (c) => {
-    const body = await c.req.json<Record<string, unknown>>().catch(() => null)
-    if (!body || !["once", "always", "reject"].includes(String(body.reply))) {
-      return c.json({ _tag: "InvalidRequestError", message: "Invalid permission reply" }, 400)
-    }
+  app.post("/api/session/:sessionID/permission/:requestID/reply", (c) => {
     const sessionID = c.req.param("sessionID")
-    const requestID = c.req.param("requestID")
-    const row = options.permissions.getPending(sessionID, requestID)
-    if (!row) {
-      try {
-        options.sessions.requireSession(sessionID)
-      } catch {
-        return sessionNotFound(c, sessionID)
-      }
-      return permissionNotFound(c, sessionID, requestID)
+    try {
+      options.sessions.requireSession(sessionID)
+    } catch {
+      return sessionNotFound(c, sessionID)
     }
-    const action = body.reply === "reject" ? "deny" : "allow"
-    const message = typeof body.message === "string" ? body.message : undefined
-    if (!options.permissions.resolve(row.id, action, message)) {
-      return permissionNotFound(c, sessionID, requestID)
-    }
-    await options.agentService.respondToPermission(row.sessionId, row.id, action, message)
-    options.events.publish(
-      createEvent("permission.replied", {
-        sessionID: row.sessionId,
-        requestID: row.id,
-        reply: body.reply,
-      }),
-    )
-    return c.body(null, 204)
+    return permissionNotFound(c, sessionID, c.req.param("requestID"))
   })
 
   return app
-}
-
-function toV2Permission(row: Permission) {
-  const metadata = row.input
-  const resources = Array.isArray(metadata.resources)
-    ? metadata.resources.filter((value): value is string => typeof value === "string")
-    : []
-  return {
-    id: row.id,
-    sessionID: row.sessionId,
-    action: row.tool,
-    resources,
-    metadata,
-  }
 }
 
 function sessionNotFound(c: { json(value: unknown, status?: number): Response }, sessionID: string): Response {
@@ -165,7 +83,7 @@ function permissionNotFound(
       _tag: "PermissionNotFoundError",
       sessionID,
       requestID,
-      message: `Permission not found: ${requestID}`,
+      message: `Permission request not found: ${requestID}`,
     },
     404,
   )

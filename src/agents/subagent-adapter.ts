@@ -61,12 +61,6 @@ export interface SubagentRunner {
   readonly mode: "native" | "fallback"
   listProfiles(cwd: string): SubagentProfile[]
   run(input: SubagentRunInput, callbacks?: SubagentRunCallbacks): Promise<SubagentResult>
-  respondToPermission?(
-    childSessionId: string,
-    permissionId: string,
-    action: "allow" | "deny",
-    reason?: string,
-  ): Promise<void>
   registerProfile?(profile: SubagentProfile): void
   unregisterProfile?(name: string): void
 }

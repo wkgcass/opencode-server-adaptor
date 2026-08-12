@@ -922,30 +922,6 @@ export class PiToOpenCodeEventMapper {
         ]
       }
 
-      case "extension_ui_request": {
-        const method = event.method as string
-        if (method === "select" || method === "confirm" || method === "input" || method === "editor") {
-          const requestId = event.id as string
-          return [
-            {
-              type: "permission_requested",
-              sessionId: ctx.sessionId,
-              permissionId: requestId,
-              tool: "extension",
-              input: {
-                method,
-                title: event.title,
-                message: event.message,
-                options: event.options,
-                placeholder: event.placeholder,
-                prefill: event.prefill,
-              },
-            },
-          ]
-        }
-        return []
-      }
-
       default:
         return []
     }

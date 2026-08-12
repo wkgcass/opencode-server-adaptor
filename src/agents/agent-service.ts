@@ -17,7 +17,6 @@ import { SessionQueue } from "../runtime/session-queue.ts"
 import type { SkillCatalogSnapshot, SkillService } from "../skill/skill-service.ts"
 import { SubtaskManager, type SubtaskResult } from "../agents/subtask-manager.ts"
 import { subagentSessionTitle } from "./subagents/subagent-session.ts"
-import type { PermissionRepository } from "../permission/index.ts"
 import { AssistantPartProjector } from "./assistant-part-projector.ts"
 import type { SessionEventStore } from "../event/session-event-store.ts"
 import {
@@ -96,7 +95,6 @@ export class AgentService {
   private readonly events: EventBus
   private readonly logger: Logger
   private readonly config: AppConfig
-  private readonly permissions: PermissionRepository
   private readonly skills: SkillService
   private readonly sessionEvents: SessionEventStore
   private readonly globalQueue = new SessionQueue()
@@ -136,7 +134,6 @@ export class AgentService {
     events: EventBus,
     logger: Logger,
     config: AppConfig,
-    permissions: PermissionRepository,
     skills: SkillService,
     sessionEvents: SessionEventStore,
     options?: { encapsulateMessageParts?: boolean },
@@ -147,7 +144,6 @@ export class AgentService {
     this.events = events
     this.logger = logger
     this.config = config
-    this.permissions = permissions
     this.skills = skills
     this.sessionEvents = sessionEvents
 
@@ -1014,30 +1010,6 @@ export class AgentService {
     this.releaseSessionProjection(sessionId)
   }
 
-  async respondToPermission(
-    sessionId: string,
-    permissionId: string,
-    action: "allow" | "deny",
-    reason?: string,
-  ): Promise<void> {
-    const session = this.sessions.get(sessionId)
-    if (!session) return
-
-    const pool = this.pools.get(session.agent)
-    if (pool) {
-      const runtime = await pool.get(sessionId)
-      if (runtime) {
-        await runtime.respondToPermission(
-          permissionId,
-          action === "allow" ? { type: "allow" } : { type: "deny", reason },
-        )
-        return
-      }
-    }
-
-    await this.subtaskManager.respondToPermission(sessionId, permissionId, action, reason)
-  }
-
   async closeAll(): Promise<void> {
     for (const sessionId of this.pendingStarts.keys()) this.cancelPendingStarts(sessionId)
     await Promise.allSettled(this.registry.list().map((adapter) => adapter.close?.()))
@@ -1088,13 +1060,11 @@ export class AgentService {
     } finally {
       this.suppressCurrentEventBroadcast = false
     }
-    const deniedPermissions = this.permissions.denyAllPending("Server restarted")
-    if (openMessages > 0 || orphanedTools > 0 || orphanedSessions.length > 0 || deniedPermissions > 0) {
+    if (openMessages > 0 || orphanedTools > 0 || orphanedSessions.length > 0) {
       this.logger.warn("Recovered orphaned runtime state on startup", {
         openMessages,
         openTools: orphanedTools,
         busySessions: orphanedSessions.length,
-        pendingPermissions: deniedPermissions,
       })
     }
   }
@@ -2462,32 +2432,6 @@ export class AgentService {
             const status = event.metadata?.status === "aborted" ? "aborted" : "failed"
             this.finishRuntimeSubtask(sessionId, event.callId, status, "", event.error, event.metadata)
           }
-          break
-        }
-
-        case "permission_requested": {
-          const permId = event.permissionId
-          const now = Date.now()
-          const expiresAt = now + 120_000
-          this.permissions.create({
-            id: permId,
-            sessionId,
-            tool: event.tool,
-            input: event.input,
-            createdAt: now,
-            expiresAt,
-          })
-
-          this.events.publish(
-            createEvent("permission.asked", {
-              id: permId,
-              sessionID: sessionId,
-              permission: event.tool,
-              patterns: [],
-              metadata: event.input,
-              always: [],
-            }),
-          )
           break
         }
 

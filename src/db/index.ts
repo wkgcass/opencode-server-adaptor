@@ -39,18 +39,6 @@ export interface PartRow {
   created_at: number
 }
 
-export interface PermissionRow {
-  id: string
-  session_id: string
-  tool: string
-  input: string
-  status: string
-  response: string | null
-  created_at: number
-  responded_at: number | null
-  expires_at: number | null
-}
-
 export interface SessionEventRow {
   session_id: string
   seq: number
@@ -61,6 +49,8 @@ export interface SessionEventRow {
 }
 
 const SCHEMA = `
+  DROP TABLE IF EXISTS permissions;
+
   CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     directory TEXT NOT NULL,
@@ -99,19 +89,6 @@ const SCHEMA = `
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
   );
 
-  CREATE TABLE IF NOT EXISTS permissions (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    tool TEXT NOT NULL,
-    input TEXT NOT NULL DEFAULT '{}',
-    status TEXT NOT NULL DEFAULT 'pending',
-    response TEXT,
-    created_at INTEGER NOT NULL,
-    responded_at INTEGER,
-    expires_at INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-  );
-
   CREATE TABLE IF NOT EXISTS session_events (
     session_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
@@ -128,7 +105,6 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
   CREATE INDEX IF NOT EXISTS idx_parts_session ON parts(session_id);
   CREATE INDEX IF NOT EXISTS idx_parts_message ON parts(message_id);
-  CREATE INDEX IF NOT EXISTS idx_permissions_session ON permissions(session_id);
   CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, seq);
 `
 

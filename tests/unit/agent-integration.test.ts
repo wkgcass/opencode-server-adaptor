@@ -9,7 +9,6 @@ import type {
   AgentRuntime,
   AgentRuntimeContext,
   AgentRuntimeEvent,
-  PermissionResponse,
   PromptInput,
 } from "../../src/agents/agent-adapter.ts"
 import { installAgentIntegrations, type AgentIntegrationFactory } from "../../src/agents/agent-integration.ts"
@@ -382,7 +381,6 @@ class MissingStartRuntime implements AgentRuntime {
 
   async abort(): Promise<void> {}
 
-  async respondToPermission(_requestId: string, _response: PermissionResponse): Promise<void> {}
 
   subscribe(listener: (event: AgentRuntimeEvent) => void): () => void {
     this.listeners.add(listener)
@@ -479,7 +477,6 @@ class GatedEncapsulationRuntime implements AgentRuntime {
     this.emit({ type: "session_idle", sessionId: this.sessionId })
   }
 
-  async respondToPermission(_requestId: string, _response: PermissionResponse): Promise<void> {}
 
   subscribe(listener: (event: AgentRuntimeEvent) => void): () => void {
     this.listeners.add(listener)

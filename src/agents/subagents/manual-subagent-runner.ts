@@ -17,12 +17,6 @@ export interface ManualSubagentBackendInput extends SubagentRunInput {
 export interface ManualSubagentBackend {
   listProfiles(cwd: string): SubagentProfile[]
   run(input: ManualSubagentBackendInput, callbacks?: SubagentRunCallbacks): Promise<SubagentResult>
-  respondToPermission?(
-    childSessionId: string,
-    permissionId: string,
-    action: "allow" | "deny",
-    reason?: string,
-  ): Promise<void>
 }
 
 /**
@@ -33,17 +27,9 @@ export interface ManualSubagentBackend {
  */
 export class ManualSubagentRunner implements SubagentRunner {
   readonly mode = "fallback" as const
-  readonly respondToPermission:
-    | ((childSessionId: string, permissionId: string, action: "allow" | "deny", reason?: string) => Promise<void>)
-    | undefined
   private readonly profiles = new Map<string, SubagentProfile>()
 
-  constructor(private readonly backend: ManualSubagentBackend) {
-    if (backend.respondToPermission) {
-      this.respondToPermission = (childSessionId, permissionId, action, reason) =>
-        backend.respondToPermission!(childSessionId, permissionId, action, reason)
-    }
-  }
+  constructor(private readonly backend: ManualSubagentBackend) {}
 
   listProfiles(cwd: string): SubagentProfile[] {
     const profiles = new Map<string, SubagentProfile>()

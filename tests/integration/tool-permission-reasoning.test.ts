@@ -180,154 +180,28 @@ describe("Tool Call + Permission + Reasoning (Fake Pi)", () => {
   )
 
   test.serial(
-    "permission request: write tool triggers permission, allow approves it",
+    "unsupported extension UI requests are cancelled without creating permission state",
     async () => {
       const createRes = await fetch(`${baseUrl}/session`, {
         method: "POST",
         headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Permission Test", agent: "pi" }),
+        body: JSON.stringify({ title: "Unsupported Extension UI Test", agent: "pi" }),
       })
       const session = (await createRes.json()) as { id: string }
 
       await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
         method: "POST",
         headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ parts: [{ type: "text", text: "write a file with permission" }] }),
+        body: JSON.stringify({ parts: [{ type: "text", text: "__extension_ui_request__" }] }),
       })
-
-      const perms = await waitFor(
-        async () => {
-          const response = await fetch(`${baseUrl}/session/${session.id}/permissions`, {
-            headers: { Authorization: authHeader },
-          })
-          expect(response.ok).toBe(true)
-          return (await response.json()) as Array<{
-            id: string
-            sessionId: string
-            tool: string
-            status: string
-          }>
-        },
-        (requests) => requests.some((request) => request.status === "pending"),
-        { description: `permission request for session ${session.id}` },
-      )
-
-      expect(perms.length).toBeGreaterThanOrEqual(1)
-      const pendingPerm = perms.find((p) => p.status === "pending")
-      expect(pendingPerm).toBeDefined()
-      // Permission comes from extension_ui_request, so tool is "extension"
-      expect(pendingPerm!.tool === "extension" || pendingPerm!.tool === "write").toBe(true)
-
-      // Respond to permission - allow
-      const replyRes = await fetch(`${baseUrl}/session/${session.id}/permissions/${pendingPerm!.id}`, {
-        method: "POST",
-        headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "allow" }),
-      })
-      expect(replyRes.ok).toBe(true)
 
       await waitForSessionIdle(baseUrl, authHeader, session.id)
 
-      // Verify tool completed successfully
-      const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
+      const permissionRes = await fetch(`${baseUrl}/api/session/${session.id}/permission`, {
         headers: { Authorization: authHeader },
       })
-      const messages = (await msgRes.json()) as Array<{
-        info: { role: string }
-        parts: Array<{ type: string; tool?: string; state?: { status: string; output?: string } }>
-      }>
-
-      const assistant = messages.find((m) => m.info.role === "assistant")
-      expect(assistant).toBeDefined()
-
-      const toolParts = assistant!.parts.filter((p) => p.type === "tool")
-      expect(toolParts.length).toBeGreaterThanOrEqual(1)
-
-      const writeTool = toolParts.find((p) => p.tool === "write")
-      expect(writeTool).toBeDefined()
-      expect(writeTool!.state!.status).toBe("completed")
-      expect(writeTool!.state!.output).toContain("Success")
-    },
-    20000,
-  )
-
-  test.serial(
-    "global permission list includes pending from all sessions",
-    async () => {
-      const createRes = await fetch(`${baseUrl}/session`, {
-        method: "POST",
-        headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Global Perm Test", agent: "pi" }),
-      })
-      const session = (await createRes.json()) as { id: string }
-
-      await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
-        method: "POST",
-        headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ parts: [{ type: "text", text: "write file with permission" }] }),
-      })
-
-      const globalPerms = await waitFor(
-        async () => {
-          const response = await fetch(`${baseUrl}/permission`, { headers: { Authorization: authHeader } })
-          expect(response.ok).toBe(true)
-          return (await response.json()) as Array<{ id: string; sessionID: string }>
-        },
-        (requests) => requests.some((request) => request.sessionID === session.id),
-        { description: `global permission request for session ${session.id}` },
-      )
-      expect(globalPerms.some((p) => p.sessionID === session.id)).toBe(true)
-
-      const pending = globalPerms.find((p) => p.sessionID === session.id)
-      const replyRes = await fetch(`${baseUrl}/permission/${pending!.id}/reply`, {
-        method: "POST",
-        headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ reply: "reject", message: "test cleanup" }),
-      })
-      expect(replyRes.ok).toBe(true)
-      expect(await replyRes.json()).toBe(true)
-    },
-    15000,
-  )
-
-  test.serial(
-    "permission deny results in tool error state",
-    async () => {
-      const createRes = await fetch(`${baseUrl}/session`, {
-        method: "POST",
-        headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Deny Test", agent: "pi" }),
-      })
-      const session = (await createRes.json()) as { id: string }
-
-      await fetch(`${baseUrl}/session/${session.id}/prompt_async`, {
-        method: "POST",
-        headers: { Authorization: authHeader, "Content-Type": "application/json" },
-        body: JSON.stringify({ parts: [{ type: "text", text: "write file with permission" }] }),
-      })
-
-      const perms = await waitFor(
-        async () => {
-          const response = await fetch(`${baseUrl}/session/${session.id}/permissions`, {
-            headers: { Authorization: authHeader },
-          })
-          return (await response.json()) as Array<{ id: string; status: string }>
-        },
-        (requests) => requests.some((request) => request.status === "pending"),
-        { description: `permission request for session ${session.id}` },
-      )
-
-      const pending = perms.find((p) => p.status === "pending")
-      if (pending) {
-        // Deny it
-        await fetch(`${baseUrl}/session/${session.id}/permissions/${pending.id}`, {
-          method: "POST",
-          headers: { Authorization: authHeader, "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "deny", reason: "Not allowed" }),
-        })
-      }
-
-      await waitForSessionIdle(baseUrl, authHeader, session.id)
+      expect(permissionRes.ok).toBe(true)
+      expect(await permissionRes.json()).toEqual({ data: [] })
 
       const msgRes = await fetch(`${baseUrl}/session/${session.id}/message`, {
         headers: { Authorization: authHeader },
@@ -337,16 +211,10 @@ describe("Tool Call + Permission + Reasoning (Fake Pi)", () => {
         parts: Array<{ type: string; tool?: string; state?: { status: string; error?: string } }>
       }>
 
-      const assistant = messages.find((m) => m.info.role === "assistant")
-      if (assistant) {
-        const toolParts = assistant.parts.filter((p) => p.type === "tool")
-        // If tool was denied or timed out, it should be in error state
-        const errorTool = toolParts.find((p) => p.state?.status === "error")
-        // Tool may or may not exist depending on timing
-        if (errorTool) {
-          expect(errorTool.state!.error).toBeDefined()
-        }
-      }
+      const errorTool = messages
+        .flatMap((message) => message.parts)
+        .find((part) => part.type === "tool" && part.state?.status === "error")
+      expect(errorTool?.state?.error).toBeDefined()
     },
     20000,
   )

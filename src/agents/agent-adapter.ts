@@ -14,8 +14,6 @@ export interface PromptInput {
   assistantMessageId: string
 }
 
-export type PermissionResponse = { type: "allow" } | { type: "deny"; reason?: string }
-
 export interface AgentCompactionResult {
   summary: string
   firstKeptEntryId?: string
@@ -109,13 +107,6 @@ export type AgentRuntimeEvent =
       callId: string
       input: Record<string, unknown>
       event: AgentRuntimeEvent
-    }
-  | {
-      type: "permission_requested"
-      sessionId: string
-      permissionId: string
-      tool: string
-      input: Record<string, unknown>
     }
   | { type: "session_idle"; sessionId: string }
   | { type: "session_busy"; sessionId: string }
@@ -242,7 +233,6 @@ export interface AgentRuntime {
   /** Make the current fork permanent after the client sends a new prompt. */
   commitFork?(): Promise<void>
   abort(): Promise<void>
-  respondToPermission(requestId: string, response: PermissionResponse): Promise<void>
   subscribe(listener: (event: AgentRuntimeEvent) => void): () => void
 }
 

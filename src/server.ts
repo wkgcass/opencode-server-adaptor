@@ -23,7 +23,6 @@ import { SessionService } from "./session/session-service.ts"
 import { PtyManager, type PtySocketData } from "./api/pty-manager.ts"
 import { requestDirectory } from "./api/request-directory.ts"
 import { DEFAULT_API_VERSION, type ApiVersion } from "./api/version.ts"
-import { PermissionRepository } from "./permission/index.ts"
 import { SkillService } from "./skill/skill-service.ts"
 import { CommandService } from "./skill/command-service.ts"
 
@@ -235,7 +234,6 @@ export interface ServerContext {
   db: DatabaseService
   sessions: SessionRepository
   messages: MessageRepository
-  permissions: PermissionRepository
   events: EventBus
   agentService: AgentService
   sessionService: SessionService
@@ -285,7 +283,6 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
   const providerConfig = new ProviderConfigStore(config.providerConfigPath, logger)
   const sessions = new SessionRepository(db, config.compatibilityVersion)
   const messages = new MessageRepository(db, sessions)
-  const permissions = new PermissionRepository(db)
   const startupSessionIds = new Set(sessions.list().map((session) => session.id))
   const eventSessionID = (event: { properties: Record<string, unknown> }): string | undefined => {
     const properties = event.properties as {
@@ -333,7 +330,6 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
     events,
     logger,
     config,
-    permissions,
     skills,
     sessionEvents,
     {
@@ -412,7 +408,7 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
         commands,
       }),
     )
-    app.route("/", createV2PermissionRoutes({ sessions: sessionService, permissions, agentService, events }))
+    app.route("/", createV2PermissionRoutes({ sessions: sessionService }))
     app.route("/", createEventRoutes({ events, logger }))
   }
 
@@ -423,7 +419,6 @@ export function createServerContext(config: AppConfig, logger: Logger, options?:
     db,
     sessions,
     messages,
-    permissions,
     events,
     agentService,
     sessionService,

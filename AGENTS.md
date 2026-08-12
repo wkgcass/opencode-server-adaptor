@@ -8,10 +8,10 @@
 
 ### 分层与依赖方向
 
-- `src/api/routes` 是 OpenCode 协议适配层，只做请求校验、协议对象转换和 HTTP/SSE 响应；其中会话、权限等独立生命周期
+- `src/api/routes` 是 OpenCode 协议适配层，只做请求校验、协议对象转换和 HTTP/SSE 响应；其中会话等独立生命周期
   按领域拆分路由模块。
 - `SessionService` 和 `AgentService` 是应用层。前者统一会话用例，后者统一 Runtime、事件投影与子任务编排。
-- `SessionRepository`、`MessageRepository`、`PermissionRepository` 和 `SessionEventStore` 是持久化边界。应用服务和路由
+- `SessionRepository`、`MessageRepository` 和 `SessionEventStore` 是持久化边界。应用服务和路由
   不应绕过仓库直接执行对应业务表 SQL。
 - `src/provider` 保存与 HTTP 无关的 provider/model 目录模型；`src/api/provider.ts` 只保留兼容导出。
 - `AgentIntegration` → `AgentAdapter` → `AgentRuntime` 是后端依赖方向；Pi 专属实现只允许位于 `src/agents/pi` 和明确标注的
@@ -56,18 +56,18 @@ OpenCode `unrevert` 切回原会话。
 
 默认状态目录是 `~/.local/state/opencode-server-adaptor`，其中包含：
 
-- `adaptor.db`：会话、消息和权限状态。
+- `adaptor.db`：会话、消息和持久事件状态。
 - `pi/models.json`：服务启动时生成的 Pi 模型配置。
 - `pi/auth.json` 和 `pi/opencode-adaptor-runtime/`：同步给 Pi 子进程的认证及运行扩展。
 - `pi-sessions/`：Pi 会话数据。
 
 服务启动时会读取 `~/.pi/agent/models.json`，合并 `providers.yaml` 中的 provider、model 和 API key，然后完整写入
 状态目录下的 `pi/models.json`。provider、model 和 API key 都只读取 YAML，不会从 SQLite 迁移。当前业务表只保留
-`sessions`、`messages`、`parts`、`permissions` 和 v2 断点续传使用的 `session_events`。
+`sessions`、`messages`、`parts` 和 v2 断点续传使用的 `session_events`。
 
 session metadata 还保存内部有序 ID 模式。客户端消息 ID 以 `msg-` 开头时，该 session 持久切换到由 44-bit
 逻辑毫秒时间戳和 12-bit 同毫秒计数器组成的 wide 排序格式，服务端后续生成 `msg-`、`prt-` 和 `evt-`；subtask
-子 session 继承该模式，但 `ses_`、权限、call、PTY 和 RPC ID 不切换。客户端显式提供的 message/part ID 仍原样保留。
+子 session 继承该模式，但 `ses_`、call、PTY 和 RPC ID 不切换。客户端显式提供的 message/part ID 仍原样保留。
 
 项目当前处于开发阶段，不维护数据库 migration 或 `_migrations` 表。代码只初始化最新 schema；已有数据库需要改表时，
 直接同步修改开发数据库。
@@ -296,10 +296,9 @@ export REAL_PI_SERVER_EXECUTABLE="$PWD/dist/opencode-server-adaptor"
 ```bash
 bun test tests/contract/real-pi-scenarios.test.ts -t "simple text prompt" --timeout 300000
 bun test tests/contract/real-pi-scenarios.test.ts -t "model-native subagent" --timeout 300000
-bun test tests/contract/real-pi-scenarios.test.ts -t "approve flow" --timeout 300000
 ```
 
-完整真实测试会发起实际模型请求，并覆盖正常对话、推理、工具调用、权限确认、多轮对话、连续执行、标题生成、
+完整真实测试会发起实际模型请求，并覆盖正常对话、推理、工具调用、多轮对话、连续执行、标题生成、
 子智能体、并行/链式子任务、终止和持久化等场景，可能产生模型费用，并会在临时目录中执行受测试约束的命令。
 
 全量运行（含真实 Pi 测试）并将输出重定向到文件：

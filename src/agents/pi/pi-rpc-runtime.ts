@@ -4,7 +4,6 @@ import type {
   AgentForkResult,
   AgentRuntimeContext,
   AgentRuntimeEvent,
-  PermissionResponse,
   PromptInput,
 } from "../agent-adapter.ts"
 import { PiRpcTransport } from "./pi-rpc-transport.ts"
@@ -74,15 +73,6 @@ export class PiRpcRuntime implements AgentRuntime {
   private compactionTerminalEventsSeen = 0
   private compactionTerminalOutcome: CompactionTerminalOutcome | null = null
   private readonly compactionTerminalWaiters = new Set<(outcome: CompactionTerminalOutcome) => void>()
-  private readonly pendingUiRequests = new Map<
-    string,
-    {
-      method: string
-      options?: string[]
-      placeholder?: string
-      prefill?: string
-    }
-  >()
 
   constructor(context: AgentRuntimeContext, options: PiRpcRuntimeOptions) {
     this.context = context
@@ -425,31 +415,6 @@ export class PiRpcRuntime implements AgentRuntime {
     }
   }
 
-  async respondToPermission(requestId: string, response: PermissionResponse): Promise<void> {
-    const request = this.pendingUiRequests.get(requestId)
-    const cmd: Record<string, unknown> = {
-      type: "extension_ui_response",
-      id: requestId,
-    }
-    if (response.type !== "allow") {
-      cmd.cancelled = true
-    } else if (request?.method === "confirm") {
-      cmd.confirmed = true
-    } else if (request?.method === "select") {
-      const options = request.options ?? []
-      cmd.value =
-        options.find((option) => /^(allow|yes|continue|approve|ok)$/i.test(option.trim())) ?? options[0] ?? "Allow"
-    } else if (request?.method === "input") {
-      cmd.value = request.placeholder ?? ""
-    } else if (request?.method === "editor") {
-      cmd.value = request.prefill ?? ""
-    } else {
-      cmd.value = "Allow"
-    }
-    await this.transport!.notify(cmd as { type: string; id: string })
-    this.pendingUiRequests.delete(requestId)
-  }
-
   subscribe(listener: (event: AgentRuntimeEvent) => void): () => void {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
@@ -472,6 +437,22 @@ export class PiRpcRuntime implements AgentRuntime {
   }
 
   private handlePiEvent(event: PiEvent): void {
+    if (event.type === "extension_ui_request") {
+      const id = typeof event.id === "string" ? event.id : ""
+      if (id) {
+        void this.transport
+          ?.notify({ type: "extension_ui_response", id, cancelled: true })
+          .catch((error) =>
+            this.logger.warn("Failed to cancel unsupported Pi extension UI request", {
+              sessionId: this.context.sessionId,
+              requestId: id,
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          )
+      }
+      this.warnUnprojectedPiEvent(event, "mapping", "Interactive Pi extension UI is not supported")
+      return
+    }
     if (event.type === "summarization_retry_scheduled") {
       const attempt = typeof event.attempt === "number" ? Math.max(0, Math.floor(event.attempt)) : 0
       const delayMs = typeof event.delayMs === "number" ? Math.max(0, event.delayMs) : 0
@@ -583,20 +564,6 @@ export class PiRpcRuntime implements AgentRuntime {
         this.warnUnprojectedPiEvent(event, "runtime_delivery", "Pi Runtime has no accepting event subscriber")
       }
       return
-    }
-    if (event.type === "extension_ui_request") {
-      const id = typeof event.id === "string" ? event.id : ""
-      const method = typeof event.method === "string" ? event.method : ""
-      if (id && ["select", "confirm", "input", "editor"].includes(method)) {
-        this.pendingUiRequests.set(id, {
-          method,
-          options: Array.isArray(event.options)
-            ? event.options.filter((option): option is string => typeof option === "string")
-            : undefined,
-          placeholder: typeof event.placeholder === "string" ? event.placeholder : undefined,
-          prefill: typeof event.prefill === "string" ? event.prefill : undefined,
-        })
-      }
     }
     if (!this.mapper) {
       this.warnUnprojectedPiEvent(event, "mapping", "No active OpenCode assistant message mapper")

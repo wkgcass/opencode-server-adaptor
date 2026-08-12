@@ -411,30 +411,6 @@ export class SubtaskManager {
     )
   }
 
-  async respondToPermission(
-    childSessionId: string,
-    permissionId: string,
-    action: "allow" | "deny",
-    reason?: string,
-  ): Promise<void> {
-    const sub = this.running.get(childSessionId)
-    if (!sub) {
-      this.logger.warn("Permission response for non-running subtask", { childSessionId, permissionId })
-      return
-    }
-
-    if (sub.runner.respondToPermission) {
-      await sub.runner.respondToPermission(childSessionId, permissionId, action, reason)
-      return
-    }
-    this.logger.warn("The selected subagent runner does not support interactive permissions", {
-      childSessionId,
-      permissionId,
-      action,
-      reason,
-    })
-  }
-
   async closeAll(): Promise<void> {
     const promises: Promise<void>[] = []
     for (const childSessionId of this.running.keys()) {

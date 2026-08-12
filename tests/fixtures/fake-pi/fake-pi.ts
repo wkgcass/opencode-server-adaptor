@@ -213,7 +213,8 @@ interface RpcCommand {
   [key: string]: unknown
 }
 
-let pendingPermissionId: string | null = null
+let pendingExtensionUiId: string | null = null
+let extensionUiCancelled = false
 
 function sendResponse(id: string | undefined, command: string, success: boolean, data?: unknown, error?: string): void {
   const msg: Record<string, unknown> = { type: "response", command, success }
@@ -391,7 +392,8 @@ async function handleCommand(cmd: RpcCommand): Promise<void> {
     }
 
     case "extension_ui_response": {
-      pendingPermissionId = null
+      extensionUiCancelled = cmd.cancelled === true
+      pendingExtensionUiId = null
       sendResponse(cmd.id, "extension_ui_response", true)
       break
     }
@@ -408,8 +410,9 @@ async function simulatePrompt(text: string): Promise<void> {
   persistPrompt(text)
 
   const wantsReasoning = text.includes("reasoning") || text.includes("think")
-  const wantsTool = text.includes("tool") || text.includes("bash") || text.includes("run") || text.includes("file")
-  const wantsPermission = text.includes("permission") || text.includes("approve") || text.includes("write")
+  const wantsExtensionUi = text.includes("__extension_ui_request__")
+  const wantsTool =
+    wantsExtensionUi || text.includes("tool") || text.includes("bash") || text.includes("run") || text.includes("file")
   const finalOnly = text.includes("__final_only__")
   const omitAgentEnd = text.includes("__omit_agent_end__")
   const omitAgentSettled = text.includes("__omit_agent_settled__")
@@ -736,8 +739,8 @@ async function simulatePrompt(text: string): Promise<void> {
   // Tool call
   if (wantsTool && !aborted) {
     const toolCallId = `call_${Date.now()}`
-    const toolName = wantsPermission ? "write" : "bash"
-    const toolArgs = wantsPermission ? { path: "/tmp/test.txt", content: "hello" } : { command: "echo hello" }
+    const toolName = wantsExtensionUi ? "write" : "bash"
+    const toolArgs = wantsExtensionUi ? { path: "/tmp/test.txt", content: "hello" } : { command: "echo hello" }
 
     if (toolSnapshotsOnly) {
       sendEvent({
@@ -783,26 +786,26 @@ async function simulatePrompt(text: string): Promise<void> {
       })
     }
 
-    // Permission request for dangerous tools
-    if (wantsPermission) {
-      pendingPermissionId = `perm_${Date.now()}`
+    // Simulate a third-party extension asking for unsupported interactive UI.
+    if (wantsExtensionUi) {
+      extensionUiCancelled = false
+      pendingExtensionUiId = `ui_${Date.now()}`
       sendEvent({
         type: "extension_ui_request",
-        id: pendingPermissionId,
+        id: pendingExtensionUiId,
         method: "select",
-        title: `Allow ${toolName} to ${wantsPermission ? "write file" : "run command"}?`,
+        title: `Allow ${toolName} to write file?`,
         options: ["Allow", "Block"],
         timeout: 10000,
       })
 
-      // Wait for permission response (up to 5 seconds)
+      // Wait for the adaptor to cancel the unsupported request.
       const deadline = Date.now() + 5000
-      while (pendingPermissionId && Date.now() < deadline && !aborted) {
+      while (pendingExtensionUiId && Date.now() < deadline && !aborted) {
         await Bun.sleep(50)
       }
 
-      if (pendingPermissionId) {
-        // Timeout - tool denied
+      if (pendingExtensionUiId || extensionUiCancelled) {
         sendEvent({
           type: "tool_execution_start",
           toolCallId,
@@ -813,11 +816,11 @@ async function simulatePrompt(text: string): Promise<void> {
           type: "tool_execution_end",
           toolCallId,
           toolName,
-          result: { content: [{ type: "text", text: "Permission denied (timeout)" }] },
+          result: { content: [{ type: "text", text: "Interactive extension UI is unavailable" }] },
           isError: true,
         })
       } else {
-        // Permission granted
+        // This branch lets the fixture remain usable with a runtime that implements extension UI.
         sendEvent({
           type: "tool_execution_start",
           toolCallId,
@@ -834,7 +837,7 @@ async function simulatePrompt(text: string): Promise<void> {
         })
       }
     } else {
-      // No permission needed, execute directly
+      // Normal tools execute directly.
       if (toolSnapshotsOnly) {
         sendEvent({
           type: "message_end",

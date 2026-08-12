@@ -4,7 +4,6 @@ import type {
   AgentRuntime,
   AgentRuntimeContext,
   AgentRuntimeEvent,
-  PermissionResponse,
   PromptInput,
 } from "../../src/agents/agent-adapter.ts"
 import { Logger } from "../../src/logging/index.ts"
@@ -189,7 +188,6 @@ class FakeRuntime implements AgentRuntime {
 
   async prompt(_input: PromptInput): Promise<void> {}
   async abort(): Promise<void> {}
-  async respondToPermission(_requestId: string, _response: PermissionResponse): Promise<void> {}
 
   subscribe(listener: (event: AgentRuntimeEvent) => void): () => void {
     this.listeners.add(listener)

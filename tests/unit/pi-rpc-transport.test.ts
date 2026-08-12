@@ -460,7 +460,7 @@ describe("PiRpcTransport", () => {
     await transport.start()
 
     await expect(
-      transport.notify({ type: "extension_ui_response", id: "permission-1", confirmed: true }),
+      transport.notify({ type: "extension_ui_response", id: "ui-request-1", confirmed: true }),
     ).resolves.toBeUndefined()
   })
 

@@ -407,7 +407,7 @@ describe("OpenCode v2 protocol", () => {
     expect((await request(`/api/session/${sessionID}/revert/commit`, { method: "POST" })).status).toBe(204)
   })
 
-  test("permission and question interfaces return v2 envelopes and typed errors", async () => {
+  test("permission compatibility and question interfaces return v2 envelopes", async () => {
     const [globalPermissions, sessionPermissions, questions, sessionQuestions] = await Promise.all([
       request("/api/permission/request").then((response) => response.json()),
       request(`/api/session/${sessionID}/permission`).then((response) => response.json()),
@@ -419,7 +419,7 @@ describe("OpenCode v2 protocol", () => {
     expect((questions as { data: unknown[] }).data).toEqual([])
     expect((sessionQuestions as { data: unknown[] }).data).toEqual([])
 
-    const created = await request(`/api/session/${sessionID}/permission`, {
+    const unsupported = await request(`/api/session/${sessionID}/permission`, {
       method: "POST",
       body: JSON.stringify({
         id: "per_v2_contract",
@@ -428,17 +428,9 @@ describe("OpenCode v2 protocol", () => {
         metadata: { command: "echo" },
       }),
     })
-    expect(created.ok).toBe(true)
-    expect(((await created.json()) as { data: { effect: string } }).data.effect).toBe("ask")
-    expect((await request(`/api/session/${sessionID}/permission/per_v2_contract`)).ok).toBe(true)
-    expect(
-      (
-        await request(`/api/session/${sessionID}/permission/per_v2_contract/reply`, {
-          method: "POST",
-          body: JSON.stringify({ reply: "once" }),
-        })
-      ).status,
-    ).toBe(204)
+    expect(unsupported.status).toBe(400)
+    expect(((await unsupported.json()) as { _tag: string })._tag).toBe("InvalidRequestError")
+    expect((await request(`/api/session/${sessionID}/permission/per_v2_contract`)).status).toBe(404)
 
     const missing = await request(`/api/session/${sessionID}/permission/missing/reply`, {
       method: "POST",

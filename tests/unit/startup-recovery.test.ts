@@ -63,11 +63,6 @@ describe("startup recovery", () => {
     // assistant message ended but its tool part never received a terminal event.
     first.db.prepare("UPDATE messages SET completed_at = ? WHERE id = ?").run(Date.now(), completedAssistant.id)
     first.sessions.setStatus(session.id, "busy")
-    first.db
-      .prepare(
-        "INSERT INTO permissions (id, session_id, tool, input, status, created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-      )
-      .run("perm_restart", session.id, "extension", "{}", Date.now(), Date.now() + 60_000)
     await first.agentService.closeAll()
     first.events.close()
     first.db.close()
@@ -102,12 +97,6 @@ describe("startup recovery", () => {
         metadata: { recovered: true },
       })
       expect(legacyTool?.type === "tool" ? legacyTool.state.time?.end : undefined).toBeNumber()
-      const permission = recovered.db
-        .prepare("SELECT status, responded_at FROM permissions WHERE id = ?")
-        .get("perm_restart") as { status: string; responded_at: number | null }
-      expect(permission.status).toBe("deny")
-      expect(permission.responded_at).toBeNumber()
-
       const lifecycle = recovered.sessionEvents.listByTypes(session.id, [
         "session.tool.failed",
         "session.step.started",

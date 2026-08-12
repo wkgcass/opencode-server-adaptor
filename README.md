@@ -1,7 +1,7 @@
 # opencode-server-adaptor
 
 `opencode-server-adaptor` 是一个兼容 OpenCode Server API 的 Agent 适配服务。它实现了 OpenCode Desktop
-所需的 CLI、HTTP REST API 和 SSE 事件流，并将 OpenCode 的会话、消息、工具调用、权限确认和子智能体操作转换为
+所需的 CLI、HTTP REST API 和 SSE 事件流，并将 OpenCode 的会话、消息、工具调用和子智能体操作转换为
 后端 Agent 的运行协议。
 
 目前项目只接入了 Pi coding agent，但核心实现支持扩展其他 Agent 后端。架构设计、接口分层、生命周期、子智能体方案、
@@ -13,8 +13,8 @@
 服务按“协议映射 → 应用服务 → 后端接口 → 后端实现”分层。HTTP 路由只负责 OpenCode 字段、状态码和错误 envelope；
 [`SessionService`](./src/session/session-service.ts) 统一会话用例，
 [`AgentService`](./src/agents/agent-service.ts) 负责编排 Runtime、事件投影和子任务，
-[`AgentAdapter`](./src/agents/agent-adapter.ts) / `AgentRuntime` 是后端扩展边界。SQLite 访问集中在 session、message、
-permission 和 durable event 仓库中，路由与 Agent 编排不直接执行 SQL。Pi 的进程、RPC、事件转换和模型同步全部位于
+[`AgentAdapter`](./src/agents/agent-adapter.ts) / `AgentRuntime` 是后端扩展边界。SQLite 访问集中在 session、message 和
+durable event 仓库中，路由与 Agent 编排不直接执行 SQL。Pi 的进程、RPC、事件转换和模型同步全部位于
 [`src/agents/pi`](./src/agents/pi)；新增后端不应修改 OpenCode 会话主流程。更完整的依赖方向和生命周期约定见
 [INTERFACE.md](./INTERFACE.md)。
 

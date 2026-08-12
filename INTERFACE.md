@@ -21,13 +21,11 @@ flowchart LR
     V2["OpenCode v2 路由<br/>(默认)"] --> Service["SessionService"]
     V1["OpenCode v1 路由<br/>(--api-version=v1)"] --> Service
     V2 --> Skill["SkillService"]
-    Permission["v2 权限路由"] --> PermissionRepo["PermissionRepository"]
     Service --> Server["统一会话与事件流程"]
     Service --> Repositories["Session / Message / Event 仓库"]
     Service --> Command["CommandService"]
     Service --> Skill
     Server --> Integration["AgentIntegration"]
-    Server --> PermissionRepo
     Integration --> Adapter["AgentAdapter"]
     Adapter --> Runtime["AgentRuntime<br/>每个 OpenCode 会话"]
     Adapter --> Subagent["SubagentRunner"]
@@ -45,7 +43,7 @@ flowchart LR
 
 - [`src/api/routes/v2-session.ts`](src/api/routes/v2-session.ts)：v2 会话协议映射。
 - [`src/api/routes/v2.ts`](src/api/routes/v2.ts)：Agent、provider、项目、文件系统和 PTY 等 v2 HTTP 接口。
-- [`src/api/routes/v2-permission.ts`](src/api/routes/v2-permission.ts)：v2 权限请求、查询和回复生命周期。
+- [`src/api/routes/v2-permission.ts`](src/api/routes/v2-permission.ts)：Desktop 固定探测的无状态 v2 permission 兼容端点。
 - [`src/api/routes/v1-legacy.ts`](src/api/routes/v1-legacy.ts)：v1 专属路由（配置与检查层）。
 - [`src/api/routes/v1-compatible-legacy.ts`](src/api/routes/v1-compatible-legacy.ts)：两种模式都挂载的兼容路由（配置、会话删除和 Desktop 文件树）。
 - [`src/event/session-events-legacy.ts`](src/event/session-events-legacy.ts)：尚无 current 等价物的 Desktop 通知事件。
@@ -61,13 +59,14 @@ flowchart LR
 `/global/health` 不注册并返回 404，以匹配 OpenCode 的协议探测顺序。v1 模式下挂载
 `v1-legacy.ts` 和 `v1-compatible-legacy.ts`；v2 模式下挂载 `v2.ts`、`v2-session.ts`、`v2-permission.ts`、`event.ts` 和
 `v1-compatible-legacy.ts`。`v1-compatible-legacy.ts`（`GET /config`、`DELETE /session/:id`）在两种模式下都挂载。
+Desktop 启动时固定探测 permission API，因此 `v2-permission.ts` 保留无状态兼容响应：列表恒为空，创建请求返回不支持，
+读取或回复不存在的请求返回 404。适配器不保存 permission 请求或选择，也不把 Pi extension UI 映射成 OpenCode permission。
 
 ### 应用层与持久化边界
 
 `src/server.ts` 是唯一组合根。它创建 repository、应用服务、integration 和路由，并通过构造参数显式连接依赖。
-`SessionRepository`、`MessageRepository`、`PermissionRepository` 和 `SessionEventStore` 分别拥有自己的业务表查询；
-路由和 `AgentService` 不直接执行这些表的 SQL。这样运行时事件产生的权限请求、HTTP 创建的权限请求和启动恢复共享同一套
-pending/reply 语义，项目目录查询也不会在 v1/v2 路由中各复制一份。
+`SessionRepository`、`MessageRepository` 和 `SessionEventStore` 分别拥有自己的业务表查询；路由和 `AgentService`
+不直接执行这些表的 SQL。项目目录查询也不会在 v1/v2 路由中各复制一份。
 
 provider/model 的通用目录模型与构建逻辑位于 [`src/provider/index.ts`](src/provider/index.ts)。后端 integration 可以贡献
 内置 provider，但不需要依赖 HTTP 路由模块；`src/api/provider.ts` 仅作为旧导入路径的兼容导出。
@@ -79,7 +78,7 @@ provider/model 的通用目录模型与构建逻辑位于 [`src/provider/index.t
 durable version 2，其余当前边界使用 version 1。尚无 current 等价物的 `session.idle`、`session.error`、
 `message.removed` 和 `session.compacted` 集中在 `session-events-legacy.ts`，并继续由 `EventBus` 发送。其中
 `session.idle` 和 `session.error` 承担 Desktop 的完成唤醒与错误通知。标准的 `session.created`、
-`session.updated`、`session.deleted`、`session.forked`、权限和 PTY 事件仍属于 current 全局事件，不归入 legacy 文件。
+`session.updated`、`session.deleted`、`session.forked` 和 PTY 事件仍属于 current 全局事件，不归入 legacy 文件。
 
 持久事件订阅先注册实时监听，再回放数据库历史并按 sequence 去重，避免回放与实时切换窗口内丢失事件。客户端重连也可
 直接重新读取 `/api/session/:sessionID/message` 获取消息快照；持久事件主要用于有游标的增量恢复。日志优化器处理 current
@@ -467,7 +466,6 @@ export interface AgentRuntime {
   restoreFork?(): Promise<AgentForkResult>
   commitFork?(): Promise<void>
   abort(): Promise<void>
-  respondToPermission(requestId: string, response: PermissionResponse): Promise<void>
   subscribe(listener: (event: AgentRuntimeEvent) => void): () => void
 }
 ```
@@ -564,8 +562,7 @@ export interface AgentForkResult {
 `backendSessionId` 是不透明结果。主流程不解析它；后端负责持久化真正用于重启恢复的 session ID、session file 或其他
 游标。
 
-`abort()` 应尽快终止当前运行，并最终使会话回到非 busy 状态。`respondToPermission()` 将 OpenCode 的允许或拒绝结果
-传回后端。
+`abort()` 应尽快终止当前运行，并最终使会话回到非 busy 状态。
 
 ### PromptInput
 
@@ -590,7 +587,6 @@ Runtime 使用统一事件联合类型向主流程发送状态。当前事件分
 - 工具：`tool_call_started`、`tool_call_delta`、`tool_call_running`、`tool_call_progress`、
   `tool_call_completed`、`tool_call_error`。
 - 子任务：`subtask_event`，内部携带另一个 `AgentRuntimeEvent`。
-- 权限：`permission_requested`。
 - 压缩：`compaction_started`、`compaction_completed`、`compaction_failed`。`reason` 统一为 `manual` 或
   `auto`，后端更细的原因保留在 `backendReason`；完成事件携带 summary、压缩前后 token 估计和 usage。
 - 会话：`session_started`、`session_busy`、`session_retry`、`session_title_changed`、`session_idle`、`session_error`、
@@ -658,12 +654,6 @@ export interface SubagentRunner {
   readonly mode: "native" | "fallback"
   listProfiles(cwd: string): SubagentProfile[]
   run(input: SubagentRunInput, callbacks?: SubagentRunCallbacks): Promise<SubagentResult>
-  respondToPermission?(
-    childSessionId: string,
-    permissionId: string,
-    action: "allow" | "deny",
-    reason?: string,
-  ): Promise<void>
   registerProfile?(profile: SubagentProfile): void
   unregisterProfile?(name: string): void
 }
@@ -749,7 +739,6 @@ export interface ManualSubagentBackend {
     input: ManualSubagentBackendInput,
     callbacks?: SubagentRunCallbacks,
   ): Promise<SubagentResult>
-  respondToPermission?(...): Promise<void>
 }
 ```
 
@@ -758,7 +747,7 @@ export interface ManualSubagentBackend {
 - 合并后端发现的 profile 和运行时注册的 profile。
 - 根据 `input.agent` 选择 profile。
 - 对未知 profile 生成统一错误结果。
-- 转发执行更新、终止信号和权限回复。
+- 转发执行更新和终止信号。
 
 `ManualSubagentBackend` 只负责：
 
@@ -838,7 +827,6 @@ class MyRuntime implements AgentRuntime {
     return { summary: "" }
   }
   async abort() {}
-  async respondToPermission(requestId: string, response: PermissionResponse) {}
   subscribe(listener: (event: AgentRuntimeEvent) => void) {
     // 注册 listener，并返回取消函数。
     return () => {}

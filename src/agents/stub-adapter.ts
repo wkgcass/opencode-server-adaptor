@@ -4,7 +4,6 @@ import type {
   AgentRuntime,
   AgentRuntimeContext,
   AgentRuntimeEvent,
-  PermissionResponse,
   PromptInput,
 } from "./agent-adapter.ts"
 
@@ -80,10 +79,6 @@ export class StubAgentRuntime implements AgentRuntime {
   async createSessionFork(input: { targetSessionId: string }): Promise<{ backendSessionId: string }> {
     if (!this.running) throw new Error("Runtime not started")
     return { backendSessionId: `stub:${input.targetSessionId}` }
-  }
-
-  async respondToPermission(_requestId: string, _response: PermissionResponse): Promise<void> {
-    // stub
   }
 
   subscribe(listener: (event: AgentRuntimeEvent) => void): () => void {

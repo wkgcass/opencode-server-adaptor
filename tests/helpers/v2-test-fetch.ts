@@ -10,8 +10,6 @@ type JsonRecord = Record<string, any>
  * back into the assertion-friendly shape used by those scenarios.
  */
 export function createV2TestFetch(nativeFetch: Fetch = globalThis.fetch): Fetch {
-  const permissionSessions = new Map<string, string>()
-
   return (async (input: Parameters<Fetch>[0], init?: RequestInit) => {
     const original = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url)
     const path = original.pathname
@@ -165,55 +163,6 @@ export function createV2TestFetch(nativeFetch: Fetch = globalThis.fetch): Fetch 
         const session = await nativeFetch(apiURL(original, `/api/session/${sessionID}`), { headers })
         return jsonResponse(legacySession((await session.json() as { data: JsonRecord }).data), session)
       }
-      if (suffix === "/permissions") {
-        const response = await nativeFetch(apiURL(original, `/api/session/${sessionID}/permission`), {
-          ...init,
-          headers,
-        })
-        const body = await response.json() as { data: JsonRecord[] }
-        for (const row of body.data) permissionSessions.set(row.id, sessionID)
-        return jsonResponse(body.data.map(legacyPermission), response)
-      }
-      const permissionMatch = suffix.match(/^\/permissions\/([^/]+)$/)
-      if (permissionMatch) {
-        if (init?.method === "POST") {
-          const response = await nativeFetch(
-            apiURL(original, `/api/session/${sessionID}/permission/${permissionMatch[1]}/reply`),
-            jsonInit({ method: "POST" }, headers, {
-              reply: json?.action === "deny" ? "reject" : "once",
-              message: json?.reason,
-            }),
-          )
-          return response.ok ? jsonResponse(true, response) : response
-        }
-        const response = await nativeFetch(
-          apiURL(original, `/api/session/${sessionID}/permission/${permissionMatch[1]}`),
-          { ...init, headers },
-        )
-        const body = await response.json() as { data: JsonRecord }
-        permissionSessions.set(body.data.id, sessionID)
-        return jsonResponse(legacyPermission(body.data), response)
-      }
-    }
-
-    if (path === "/permission") {
-      const response = await nativeFetch(apiURL(original, "/api/permission/request"), { ...init, headers })
-      const body = await response.json() as { data: JsonRecord[] }
-      for (const row of body.data) permissionSessions.set(row.id, row.sessionID)
-      return jsonResponse(body.data.map(legacyPermission), response)
-    }
-
-    const permissionReply = path.match(/^\/permission\/([^/]+)\/reply$/)
-    if (permissionReply) {
-      const requestID = permissionReply[1]!
-      const sessionID = permissionSessions.get(requestID)
-      if (!sessionID) return jsonResponse({ error: "Permission session is unknown" }, undefined, 404)
-      const reply = json?.response === "deny" || json?.reply === "reject" ? "reject" : "once"
-      const response = await nativeFetch(
-        apiURL(original, `/api/session/${sessionID}/permission/${requestID}/reply`),
-        jsonInit({ method: "POST" }, headers, { reply, message: json?.message }),
-      )
-      return response.ok ? jsonResponse(true, response) : response
     }
 
     if (path === "/agent" && (!init?.method || init.method === "GET")) {
@@ -399,16 +348,6 @@ function legacyMessage(message: JsonRecord, sessionID: string) {
         },
       }
     }),
-  }
-}
-
-function legacyPermission(permission: JsonRecord) {
-  return {
-    ...permission,
-    permission: permission.action,
-    tool: permission.action,
-    patterns: permission.resources,
-    status: permission.status ?? "pending",
   }
 }
 

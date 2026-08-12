@@ -25,11 +25,27 @@ describe("session schema", () => {
     expect(tables.map((table) => table.name).sort()).toEqual([
       "messages",
       "parts",
-      "permissions",
       "session_events",
       "sessions",
     ])
 
     db.close()
+  })
+
+  test("removes the obsolete permissions table from an existing database", () => {
+    const directory = mkdtempSync(join(tmpdir(), "session-schema-legacy-permissions-"))
+    cleanup.push(directory)
+    const path = join(directory, "adaptor.db")
+    const logger = new Logger({ minLevel: "ERROR" })
+    const original = new DatabaseService(path, logger)
+    original.exec("CREATE TABLE permissions (id TEXT PRIMARY KEY, session_id TEXT NOT NULL)")
+    original.close()
+
+    const reopened = new DatabaseService(path, logger)
+    const table = reopened
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'permissions'")
+      .get()
+    expect(table).toBeNull()
+    reopened.close()
   })
 })

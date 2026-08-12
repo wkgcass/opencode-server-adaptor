@@ -17,7 +17,6 @@ const REAL_PI_SERVER_EXECUTABLE = process.env.REAL_PI_SERVER_EXECUTABLE?.trim()
 const BUN_BIN = join(homedir(), ".bun", "bin", "bun")
 const PI_BIN = join(homedir(), ".bun", "bin", "pi")
 const PI_MODELS_PATH = join(homedir(), ".pi", "agent", "models.json")
-const APPROVAL_EXTENSION = join(import.meta.dir, "..", "fixtures", "real-pi", "approval-gate.ts")
 
 const RUN_REAL_PI = process.env.RUN_REAL_PI_TESTS === "1"
 
@@ -989,93 +988,6 @@ describe.skipIf(!RUN_REAL_PI)("Real Pi Scenarios (model from ~/.pi/agent/models.
     expect(partDeltas.length).toBeGreaterThan(0)
     expect(partDeltas.every((event) => (event.data?.delta as string).length > 0)).toBe(true)
   }, 120000)
-
-  // ===== 权限审批 =====
-
-  test("approve flow: real PI blocks a tool until the global permission reply allows it", async () => {
-    const agentName = "approval-agent"
-    const registerRes = await fetch(`${baseUrl}/agent`, {
-      method: "POST",
-      headers: { Authorization: authHeader, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: agentName,
-        description: "Real PI approval bridge test agent",
-        cliPath: `${BUN_BIN} ${PI_BIN} --extension ${APPROVAL_EXTENSION}`,
-        provider: realPiModel.provider,
-        model: realPiModel.model,
-        systemPrompt:
-          "When asked to run the approval marker, you must use the bash tool exactly once. Do not simulate tool output.",
-      }),
-    })
-    expect(registerRes.status).toBe(201)
-
-    const createRes = await fetch(`${baseUrl}/session`, {
-      method: "POST",
-      headers: { Authorization: authHeader, "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "Real PI Approval Test", agent: agentName }),
-    })
-    expect(createRes.ok).toBe(true)
-    const session = (await createRes.json()) as { id: string }
-
-    await sendPrompt(
-      session.id,
-      "Use the bash tool to run `printf REAL_PI_APPROVAL_OK`. You MUST execute the tool and report its output.",
-    )
-
-    const deadline = Date.now() + 120000
-    type PendingPermission = {
-      id: string
-      status: string
-      permission: string
-      metadata: { method?: string; title?: string }
-    }
-    let pending: PendingPermission | undefined
-    while (Date.now() < deadline && !pending) {
-      const res = await fetch(`${baseUrl}/session/${session.id}/permissions`, {
-        headers: { Authorization: authHeader },
-      })
-      const permissions = (await res.json()) as PendingPermission[]
-      pending = permissions.find((permission) => permission.status === "pending")
-      if (!pending) await Bun.sleep(250)
-    }
-
-    expect(pending, "PI did not emit an extension_ui_request for approval").toBeDefined()
-    expect(pending!.permission).toBe("extension")
-    expect(pending!.metadata.method).toBe("confirm")
-
-    const globalRes = await fetch(`${baseUrl}/permission`, { headers: { Authorization: authHeader } })
-    const globalPending = (await globalRes.json()) as Array<{ id: string; sessionID: string }>
-    expect(
-      globalPending.some((permission) => permission.id === pending!.id && permission.sessionID === session.id),
-    ).toBe(true)
-
-    const replyRes = await fetch(`${baseUrl}/permission/${pending!.id}/reply`, {
-      method: "POST",
-      headers: { Authorization: authHeader, "Content-Type": "application/json" },
-      body: JSON.stringify({ reply: "once" }),
-    })
-    expect(replyRes.ok).toBe(true)
-
-    await waitForIdle(session.id, 120000)
-
-    const permissionRes = await fetch(`${baseUrl}/session/${session.id}/permissions`, {
-      headers: { Authorization: authHeader },
-    })
-    const permissions = (await permissionRes.json()) as Array<{ id: string; status: string }>
-    // After the reply the permission leaves the pending list (v2 only exposes pending entries).
-    expect(permissions.find((permission) => permission.id === pending!.id)).toBeUndefined()
-
-    const messages = await getMessages(session.id)
-    const bashTool = messages
-      .flatMap((message) => message.parts)
-      .find((part) => part.type === "tool" && part.tool === "bash")
-    expect(bashTool).toBeDefined()
-    expect(bashTool!.state?.status).toBe("completed")
-    expect(bashTool!.state?.output).toContain("REAL_PI_APPROVAL_OK")
-    console.log("  Approved permission:", pending!.id, "tool output:", bashTool!.state?.output)
-
-    await fetch(`${baseUrl}/agent/${agentName}`, { method: "DELETE", headers: { Authorization: authHeader } })
-  }, 240000)
 
   // ===== 自定义 Agent =====
 
