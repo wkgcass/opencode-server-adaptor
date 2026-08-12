@@ -2513,6 +2513,10 @@ export class AgentService {
         }
 
         case "session_busy": {
+          // A backend can flush an already-buffered busy/retry event after its
+          // abort acknowledgement. The user-visible interrupt owns the
+          // terminal state until another prompt explicitly clears this flag.
+          if (this.abortedSessions.has(sessionId)) break
           this.sessions.setStatus(sessionId, "busy")
           // A retry resumes inside the same execution, so startExecution() is
           // intentionally idempotent and cannot clear Desktop's retry status.
@@ -2523,6 +2527,7 @@ export class AgentService {
         }
 
         case "session_retry": {
+          if (this.abortedSessions.has(sessionId)) break
           this.sessions.setStatus(sessionId, "busy")
           this.startExecution(sessionId)
           publishSessionStatusLegacy(this.events, sessionId, {
